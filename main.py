@@ -1,0 +1,163 @@
+"""Main entry-point that ties together the GPU tokenizer components."""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import sys
+from pathlib import Path
+from typing import Iterable, Sequence
+
+import torch
+
+from gpu_tokenizer import (
+    AutoScaler,
+    BytePacker,
+    GPUBPETrainer,
+    GPUUnigramTrainer,
+    PackedBatcher,
+    utils,
+)
+
+__all__ = [
+    "AutoScaler",
+    "BytePacker",
+    "GPUBPETrainer",
+    "GPUUnigramTrainer",
+    "PackedBatcher",
+    "utils",
+    "main",
+]
+
+
+def _expand_data_patterns(patterns: Sequence[str]) -> list[Path]:
+    files: list[Path] = []
+    for pattern in patterns:
+        for path in glob.glob(pattern, recursive=True):
+            p = Path(path)
+            if p.is_file():
+                files.append(p)
+    if not files:
+        raise SystemExit("No input files matched the provided --data globs")
+    return files
+
+
+def _load_sequences(paths: Iterable[Path], bos: int | None, eos: int | None) -> list[list[int]]:
+    packer = BytePacker(bos=bos, eos=eos)
+    return [packer.encode_file(str(path)) for path in paths]
+
+
+def _build_packed_batches(
+    sequences: list[list[int]],
+    batch_size: int,
+    seed: int,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    return list(PackedBatcher(sequences, batch_size=batch_size, seed=seed))
+
+
+def _build_unigram_batches(
+    sequences: list[list[int]],
+    batch_size: int,
+    seed: int,
+) -> list[torch.Tensor]:
+    packed = PackedBatcher(sequences, batch_size=batch_size, seed=seed)
+    return [x for (x, _mask) in packed]
+
+
+def _cmd_train_bpe(args: argparse.Namespace) -> None:
+    data_files = _expand_data_patterns(args.data)
+    sequences = _load_sequences(data_files, bos=args.bos, eos=args.eos)
+
+    autoscaler = AutoScaler(
+        target_util=args.target_util,
+        min_bs=args.min_batch,
+        max_bs=args.max_batch,
+    )
+    suggestion = autoscaler.suggest(token_bytes_per_example=args.token_bytes)
+    batch_size = min(args.max_batch, max(args.min_batch, suggestion.batch_size))
+    batches = _build_packed_batches(sequences, batch_size=batch_size, seed=args.seed)
+
+    trainer = GPUBPETrainer(
+        base_vocab=args.base_vocab,
+        merges=args.merges,
+        device=args.device,
+        autoscaler=autoscaler,
+    )
+    meta = trainer.fit(batches, log_every=args.log_every)
+    if args.out_dir:
+        trainer.save(args.out_dir)
+    print(meta)
+
+
+def _cmd_train_unigram(args: argparse.Namespace) -> None:
+    data_files = _expand_data_patterns(args.data)
+    sequences = _load_sequences(data_files, bos=args.bos, eos=args.eos)
+
+    batches = _build_unigram_batches(sequences, batch_size=args.batch_size, seed=args.seed)
+    trainer = GPUUnigramTrainer(
+        base_vocab=args.base_vocab,
+        vocab_size=args.vocab_size,
+        max_subword_len=args.max_subword_len,
+        device=args.device,
+    )
+    for epoch in range(args.epochs):
+        stats = trainer.fit_epoch(batches)
+        print(f"epoch {epoch + 1}: {stats}")
+    if args.out_dir:
+        out_path = Path(args.out_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+        vocab_file = out_path / "unigram_vocab.txt"
+        with vocab_file.open("w", encoding="utf-8") as f:
+            for idx, piece in trainer.id2piece.items():
+                f.write(f"{idx}\t{piece.hex()}\n")
+        print(f"Saved unigram vocab → {vocab_file}")
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="GPU tokenizer toolkit")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--data", nargs="+", required=True, help="Input glob patterns")
+    common.add_argument("--bos", type=int, default=None, help="Optional BOS token id")
+    common.add_argument("--eos", type=int, default=None, help="Optional EOS token id")
+    common.add_argument("--seed", type=int, default=1337, help="Shuffle seed")
+    common.add_argument("--device", type=str, default=None, help="Torch device override")
+
+    train_bpe = subparsers.add_parser("train-bpe", parents=[common], help="Train a BPE model")
+    train_bpe.set_defaults(func=_cmd_train_bpe)
+    train_bpe.add_argument("--merges", type=int, default=50_000)
+    train_bpe.add_argument("--base-vocab", type=int, default=256)
+    train_bpe.add_argument("--target-util", type=float, default=0.80)
+    train_bpe.add_argument("--min-batch", type=int, default=512)
+    train_bpe.add_argument("--max-batch", type=int, default=4096)
+    train_bpe.add_argument("--token-bytes", type=int, default=8 * 1024)
+    train_bpe.add_argument("--log-every", type=int, default=100)
+    train_bpe.add_argument("--out-dir", type=str, default="./bpe_out")
+
+    train_unigram = subparsers.add_parser(
+        "train-unigram", parents=[common], help="Train a unigram model"
+    )
+    train_unigram.set_defaults(func=_cmd_train_unigram)
+    train_unigram.add_argument("--vocab-size", type=int, default=50_000)
+    train_unigram.add_argument("--base-vocab", type=int, default=256)
+    train_unigram.add_argument("--max-subword-len", type=int, default=8)
+    train_unigram.add_argument("--batch-size", type=int, default=1024)
+    train_unigram.add_argument("--epochs", type=int, default=1)
+    train_unigram.add_argument("--out-dir", type=str, default="./unigram_out")
+
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = _parser()
+    args = parser.parse_args(argv)
+    func = getattr(args, "func", None)
+    if func is None:
+        parser.print_help()
+        raise SystemExit(1)
+    func(args)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
