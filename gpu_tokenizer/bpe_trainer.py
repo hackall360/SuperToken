@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 
@@ -70,9 +70,12 @@ class GPUBPETrainer:
         self.autoscaler = autoscaler or AutoScaler()
 
     def fit(
-        self, batches: List[Tuple[torch.Tensor, torch.Tensor]], log_every: int = 100
+        self,
+        batches: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        log_every: int = 100,
     ) -> dict[str, object]:
         step = 0
+        current_batches: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = batches
         # Outer loop over the number of merges
         while step < self.target_merges:
             # Query autoscaler to refresh internal state.  The suggested batch
@@ -82,24 +85,29 @@ class GPUBPETrainer:
             # We accumulate packed pair keys and their local counts across batches.
             global_keys: Optional[torch.Tensor] = None
             global_counts: Optional[torch.Tensor] = None
-            for (x_cpu, v_cpu) in batches:
-                # Transfer batch to device with non‑blocking copies; handle OOM
+            consumed_batches: list[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+            for (x_cpu, v_cpu, lengths_cpu) in current_batches:
+                x_snapshot = x_cpu.clone().pin_memory()
+                v_snapshot = v_cpu.clone().pin_memory()
+                lengths_snapshot = lengths_cpu.clone()
+                consumed_batches.append((x_snapshot, v_snapshot, lengths_snapshot))
+                # Transfer batch to device with non-blocking copies; handle OOM
                 try:
-                    x = x_cpu.to(self.device, non_blocking=True)
+                    x = x_snapshot.to(self.device, non_blocking=True)
                 except RuntimeError as exc:
                     if "CUDA out of memory" in str(exc):
                         # Notify autoscaler and skip this batch
                         self.autoscaler.feedback(oom=True)
                         continue
                     raise
-                v = v_cpu.to(self.device, non_blocking=True)
+                v = v_snapshot.to(self.device, non_blocking=True)
                 # Count unique adjacent pairs per batch using existing util
                 pairs, counts = count_pairs(x, v)
                 # Skip if no valid pairs in this batch
                 if pairs.numel() == 0:
                     continue
-                # Pack the pair ids into 64‑bit keys for more efficient aggregation
-                # Format: key = (a_id << 32) | b_id, using 64‑bit integer type
+                # Pack the pair ids into 64-bit keys for more efficient aggregation
+                # Format: key = (a_id << 32) | b_id, using 64-bit integer type
                 a_ids = pairs[:, 0].to(torch.long)
                 b_ids = pairs[:, 1].to(torch.long)
                 keys = (a_ids << 32) | b_ids
@@ -114,6 +122,7 @@ class GPUBPETrainer:
             if global_keys is None or global_keys.numel() == 0:
                 print("No pairs left to merge.")
                 break
+            current_batches = consumed_batches
             # Aggregate duplicate keys by summing their counts
             agg_keys, agg_counts = _aggregate_pair_keys(global_keys, global_counts)
             # Select the most frequent pair
@@ -134,9 +143,9 @@ class GPUBPETrainer:
             self.merges.append((a_id, b_id))
             self.vocab_size += 1
             # Apply the merge to each batch and build the next round of batches
-            new_batches: list[Tuple[torch.Tensor, torch.Tensor]] = []
+            new_batches: list[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
             oom_seen = False
-            for (x_cpu, v_cpu) in batches:
+            for (x_cpu, v_cpu, lengths_cpu) in current_batches:
                 try:
                     # Move batch to device
                     x = x_cpu.to(self.device, non_blocking=True)
@@ -146,16 +155,17 @@ class GPUBPETrainer:
                     # Transfer back to CPU (pinned) to free GPU memory
                     x2_cpu = x2.to("cpu", non_blocking=True, copy=True).pin_memory()
                     v2_cpu = v2.to("cpu", non_blocking=True, copy=True).pin_memory()
-                    new_batches.append((x2_cpu, v2_cpu))
+                    lengths2_cpu = v2_cpu.sum(dim=-1)
+                    new_batches.append((x2_cpu, v2_cpu, lengths2_cpu))
                 except RuntimeError as exc:
                     if "CUDA out of memory" in str(exc):
                         # On OOM, free GPU memory and keep the unmodified batch
                         oom_seen = True
                         torch.cuda.empty_cache()
-                        new_batches.append((x_cpu, v_cpu))
+                        new_batches.append((x_cpu, v_cpu, lengths_cpu))
                     else:
                         raise
-            batches = new_batches
+            current_batches = new_batches
             step += 1
             # Provide feedback to the autoscaler about iteration time and OOM status
             self.autoscaler.feedback(step_time_s=time.time() - t0, oom=oom_seen)

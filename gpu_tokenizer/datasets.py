@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterator, List, Tuple
+from typing import Iterator, List, Sequence, Tuple
 
 import random
 
@@ -10,22 +10,59 @@ import torch
 
 
 class PackedBatcher:
-    """Stream padded batches of integer token sequences using pinned memory."""
+    """Stream padded batches of integer token sequences using double buffers."""
 
-    def __init__(self, sequences: List[list[int]], batch_size: int = 1024, seed: int = 1337):
-        self.sequences = sequences
+    def __init__(self, sequences: Sequence[Sequence[int]], batch_size: int = 1024, seed: int = 1337):
+        self.sequences: List[List[int]] = [list(seq) for seq in sequences]
         self.bs = batch_size
         rng = random.Random(seed)
         rng.shuffle(self.sequences)
 
-    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
-        for i in range(0, len(self.sequences), self.bs):
-            chunk = self.sequences[i : i + self.bs]
-            max_len = max(len(x) for x in chunk)
-            x = torch.full((len(chunk), max_len), -1, dtype=torch.long, pin_memory=True)
-            v = torch.zeros((len(chunk), max_len), dtype=torch.long, pin_memory=True)
-            for r, seq in enumerate(chunk):
+        max_len = max((len(seq) for seq in self.sequences), default=0)
+        # Allocate storage width of at least 1 to keep tensor shapes valid even when empty.
+        self._storage_width = max(1, max_len)
+        self._buffers = [self._allocate_buffer() for _ in range(2)]
+
+    def _allocate_buffer(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        tokens = torch.full(
+            (self.bs, self._storage_width), -1, dtype=torch.long, pin_memory=True
+        )
+        valid = torch.zeros((self.bs, self._storage_width), dtype=torch.long, pin_memory=True)
+        lengths = torch.zeros((self.bs,), dtype=torch.long)
+        return tokens, valid, lengths
+
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if not self.sequences:
+            return
+
+        buf_idx = 0
+        for start in range(0, len(self.sequences), self.bs):
+            chunk = self.sequences[start : start + self.bs]
+            if not chunk:
+                break
+
+            tokens, valid, lengths = self._buffers[buf_idx]
+            rows = len(chunk)
+            tokens[:rows].fill_(-1)
+            valid[:rows].zero_()
+            lengths[:rows].zero_()
+
+            max_len = 0
+            for row, seq in enumerate(chunk):
                 L = len(seq)
-                x[r, :L] = torch.tensor(seq, dtype=torch.long)
-                v[r, :L] = 1
-            yield x, v
+                if L == 0:
+                    lengths[row] = 0
+                    continue
+                max_len = max(max_len, L)
+                lengths[row] = L
+                tokens[row, :L] = torch.as_tensor(seq, dtype=torch.long)
+                valid[row, :L] = 1
+
+            # Ensure we always provide a view with at least one column to avoid zero-width tensors
+            width = max(1, max_len)
+            yield (
+                tokens[:rows, :width],
+                valid[:rows, :width],
+                lengths[:rows],
+            )
+            buf_idx = 1 - buf_idx
