@@ -190,6 +190,62 @@ class GPUBPETrainer:
         self.merges: List[Tuple[int, int]] = []
         self.autoscaler = autoscaler or AutoScaler()
         self.sync_every = max(sync_every, 1)
+        # Host↔device transfer accounting, populated during ``fit``.
+        self.bytes_h2d: int = 0
+        self.bytes_d2h: int = 0
+        self.h2d_events: int = 0
+        self.d2h_events: int = 0
+        self.merge_transfer_log: list[dict[str, object]] = []
+        self.sync_intervals: list[dict[str, object]] = []
+        self._interval_merges: int = 0
+
+    # ------------------------------------------------------------------
+    # Transfer accounting helpers
+    def _reset_transfer_counters(self) -> None:
+        self.bytes_h2d = 0
+        self.bytes_d2h = 0
+        self.h2d_events = 0
+        self.d2h_events = 0
+        self.merge_transfer_log = []
+        self.sync_intervals = []
+        self._interval_merges = 0
+
+    def _record_h2d(self, *tensors: torch.Tensor) -> None:
+        if not tensors:
+            return
+        total = sum(int(t.nbytes) for t in tensors)
+        self.bytes_h2d += total
+        self.h2d_events += 1
+
+    def _record_d2h(self, *tensors: torch.Tensor) -> int:
+        if not tensors:
+            return 0
+        total = sum(int(t.nbytes) for t in tensors)
+        self.bytes_d2h += total
+        self.d2h_events += 1
+        return total
+
+    def _record_merge_snapshot(self, merge_idx: int) -> None:
+        self.merge_transfer_log.append(
+            {
+                "merge": merge_idx,
+                "bytes_h2d_cumulative": self.bytes_h2d,
+                "bytes_d2h_cumulative": self.bytes_d2h,
+            }
+        )
+
+    def _close_sync_interval(self, merge_idx: int, copied_bytes: int) -> None:
+        merges_in_interval = self._interval_merges
+        avg = copied_bytes / merges_in_interval if merges_in_interval else 0.0
+        self.sync_intervals.append(
+            {
+                "completed_merge": merge_idx,
+                "merges_in_interval": merges_in_interval,
+                "bytes_d2h": copied_bytes,
+                "avg_bytes_per_merge": avg,
+            }
+        )
+        self._interval_merges = 0
 
     def fit(
         self,
@@ -199,6 +255,7 @@ class GPUBPETrainer:
     ) -> dict[str, object]:
         """Train merges using a pipelined GPU workflow when possible."""
 
+        self._reset_transfer_counters()
         device = torch.device(self.device)
         step = 0
         current_batches: Iterable[Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], GPUBatchRecord]] = batches
@@ -236,7 +293,7 @@ class GPUBPETrainer:
             a_id: int,
             b_id: int,
             new_id: int,
-        ) -> tuple[list[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]], bool]:
+        ) -> tuple[list[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]], bool, dict[str, object]]:
             new_batches: list[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
             oom_seen = False
             pair_workspace: Optional[torch.Tensor] = None
@@ -267,17 +324,19 @@ class GPUBPETrainer:
                         new_batches.append((x_cpu, v_cpu, lengths_cpu))
                     else:
                         raise
-            return new_batches, oom_seen
+            return new_batches, oom_seen, {"sync": True, "bytes": 0}
 
         use_cuda = device.type == "cuda" and torch.cuda.is_available()
         if use_cuda:
             torch.cuda.set_device(device)
             copy_stream = torch.cuda.Stream(device=device)
             compute_stream = torch.cuda.Stream(device=device)
-            def _finalize_host_sync(records: list[GPUBatchRecord]) -> None:
+            def _finalize_host_sync(records: list[GPUBatchRecord]) -> int:
                 pending_copy = False
+                copied_bytes = 0
                 for record in records:
                     if record.host_dirty:
+                        copied_bytes += self._record_d2h(record.tokens, record.valid)
                         record.schedule_host_sync(copy_stream)
                         pending_copy = True
                     elif record.host_event is not None:
@@ -288,6 +347,7 @@ class GPUBPETrainer:
                     assert copy_stream.query(), "copy stream did not drain"
                 for record in records:
                     record.resolve_host()
+                return copied_bytes
 
             def _count_pairs_gpu(
                 batch_iter: Iterable[Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], GPUBatchRecord]]
@@ -302,6 +362,7 @@ class GPUBPETrainer:
                         record = batch
                     else:
                         record = GPUBatchRecord.from_cpu(batch[0], batch[1], batch[2], device)
+                        self._record_h2d(record.tokens, record.valid, record.lengths)
                     consumed.append(record)
                     try:
                         with torch.cuda.stream(compute_stream):
@@ -340,12 +401,13 @@ class GPUBPETrainer:
                 new_id: int,
                 merge_idx: int,
                 force_sync: bool = False,
-            ) -> tuple[list[GPUBatchRecord], bool]:
+            ) -> tuple[list[GPUBatchRecord], bool, dict[str, object]]:
                 records = list(batch_iter)
                 oom_seen = False
                 need_sync = force_sync or (merge_idx % self.sync_every == 0)
                 pending_copy = False
                 pending_compute = False
+                copied_bytes = 0
                 for record in records:
                     try:
                         with torch.cuda.stream(compute_stream):
@@ -366,6 +428,7 @@ class GPUBPETrainer:
                         record.mark_device_event(compute_event)
                         pending_compute = True
                         if need_sync:
+                            copied_bytes += self._record_d2h(record.tokens, record.valid)
                             record.schedule_host_sync(copy_stream)
                             pending_copy = True
                     except RuntimeError as exc:
@@ -385,7 +448,7 @@ class GPUBPETrainer:
                         assert copy_stream.query(), "copy stream did not drain"
                     if pending_compute:
                         assert compute_stream.query(), "compute stream did not drain"
-                return records, oom_seen
+                return records, oom_seen, {"sync": need_sync and copied_bytes > 0, "bytes": copied_bytes}
 
         while step < self.target_merges:
             _ = self.autoscaler.suggest(token_bytes_per_example=int(8 * 1024))
@@ -414,20 +477,41 @@ class GPUBPETrainer:
             self.merges.append((a_id, b_id))
             self.vocab_size += 1
             if use_cuda:
-                current_batches, oom_seen = _apply_merge_gpu(
+                current_batches, oom_seen, sync_report = _apply_merge_gpu(
                     current_batches, a_id, b_id, new_id, step + 1
                 )
                 gpu_batches = list(current_batches)
+                self._interval_merges += 1
+                if sync_report.get("sync"):
+                    self._close_sync_interval(step + 1, sync_report.get("bytes", 0))
             else:
-                current_batches, oom_seen = _apply_merge_cpu(current_batches, a_id, b_id, new_id)
+                current_batches, oom_seen, _ = _apply_merge_cpu(current_batches, a_id, b_id, new_id)
             step += 1
+            if not use_cuda:
+                self._interval_merges = 0
+            self._record_merge_snapshot(step)
             self.autoscaler.feedback(step_time_s=time.time() - t0, oom=oom_seen)
         if use_cuda and gpu_batches is not None:
-            _finalize_host_sync(gpu_batches)
+            final_bytes = _finalize_host_sync(gpu_batches)
+            if self._interval_merges > 0:
+                self._close_sync_interval(step, final_bytes)
         return {
             "base_vocab": self.base_vocab,
             "vocab_size": self.vocab_size,
             "merges": self.merges,
+            "transfer_metrics": {
+                "bytes_h2d": self.bytes_h2d,
+                "bytes_d2h": self.bytes_d2h,
+                "h2d_events": self.h2d_events,
+                "d2h_events": self.d2h_events,
+                "merge_stats": self.merge_transfer_log,
+                "sync_intervals": self.sync_intervals,
+                "avg_d2h_bytes_per_merge": (
+                    self.bytes_d2h / len(self.merge_transfer_log)
+                    if self.merge_transfer_log
+                    else 0.0
+                ),
+            },
         }
 
     def save(self, out_dir: str) -> None:
