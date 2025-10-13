@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 
 
@@ -12,58 +14,101 @@ def device_of(x: torch.Tensor) -> torch.device:
 
 
 @torch.jit.script
-def prefix_sum_int(mask: torch.Tensor) -> torch.Tensor:
-    """Inclusive prefix sum over the last dimension of ``mask``."""
+def compact_tokens_inplace(
+    tokens: torch.Tensor,
+    valid: torch.Tensor,
+    lengths: torch.Tensor,
+    prefix_workspace: torch.Tensor,
+) -> None:
+    """Compact ``tokens``/``valid`` in place using ``prefix_workspace``.
 
-    return torch.cumsum(mask, dim=-1)
+    The helper performs a stable compaction along the last dimension.  For
+    every valid position the token value is written to the index recorded by
+    the running prefix sum stored in ``prefix_workspace``.  Surplus capacity is
+    zero‑filled to preserve the original buffer shapes.
+    """
 
+    B, L = tokens.shape
+    if B == 0 or L == 0:
+        lengths.zero_()
+        return
 
-@torch.jit.script
-def compact_by_mask(vals: torch.Tensor, keep: torch.Tensor, max_len: int) -> torch.Tensor:
-    """Compact ``vals`` along the last dim using ``keep`` as a mask."""
+    rows = torch.arange(B, device=tokens.device)
+    prefix_workspace.zero_()
 
-    B, L = vals.shape
-    idx = prefix_sum_int(keep) - 1
-    out = vals.new_full((B, max_len), -1)
-    b_ids = torch.arange(B, device=vals.device).unsqueeze(1).expand(B, L)
-    take = keep.to(torch.bool)
-    if take.any():
-        out[b_ids[take], idx[take]] = vals[take]
-    return out
+    for col in range(L):
+        keep_col = valid[:, col].to(torch.bool)
+        src_vals = tokens[:, col]
+        tokens[:, col] = 0
+        valid[:, col] = 0
+        if keep_col.any():
+            row_ids = rows[keep_col]
+            dst = prefix_workspace[row_ids]
+            tokens[row_ids, dst] = src_vals[keep_col]
+            valid[row_ids, dst] = 1
+            prefix_workspace[row_ids] = dst + 1
+
+    if lengths.dtype == prefix_workspace.dtype:
+        lengths.copy_(prefix_workspace)
+    else:
+        lengths.copy_(prefix_workspace.to(lengths.dtype))
 
 
 @torch.jit.script
 def apply_merge_once(
     seqs: torch.Tensor,
     valid: torch.Tensor,
+    lengths: torch.Tensor,
     a_id: int,
     b_id: int,
     new_id: int,
+    pair_workspace: Optional[torch.Tensor] = None,
+    prefix_workspace: Optional[torch.Tensor] = None,
 ):
-    """Apply a single BPE merge on ``seqs`` and return the compacted tensors."""
+    """Apply a single BPE merge directly within ``seqs`` and ``valid``.
+
+    The tensors are updated in place; ``pair_workspace`` and ``prefix_workspace``
+    are optional reusable scratch buffers used to avoid reallocation during
+    repeated merges.  ``lengths`` is mutated to reflect the number of valid
+    tokens remaining per sequence while preserving the original capacity of the
+    buffers.
+    """
 
     B, L = seqs.shape
+    device = seqs.device
+
+    if B == 0:
+        return seqs, valid, lengths
+
+    if L <= 1:
+        if lengths.numel() == B:
+            lengths.copy_(valid.sum(dim=-1, dtype=lengths.dtype))
+        return seqs, valid, lengths
+
+    if pair_workspace is None or pair_workspace.size(0) != B or pair_workspace.size(1) != L - 1:
+        pair_workspace = torch.zeros((B, L - 1), dtype=torch.bool, device=device)
+    else:
+        pair_workspace.zero_()
+
     lhs = seqs[:, :-1]
     rhs = seqs[:, 1:]
     v_l = valid[:, :-1]
     v_r = valid[:, 1:]
-    pair_match = (lhs == a_id) & (rhs == b_id) & v_l.to(torch.bool) & v_r.to(torch.bool)
 
-    keep = valid.clone()
-    keep[:, 1:] = keep[:, 1:] & (~pair_match)
+    pair_workspace.copy_(lhs == a_id)
+    pair_workspace &= rhs == b_id
+    pair_workspace &= v_l.to(torch.bool)
+    pair_workspace &= v_r.to(torch.bool)
 
-    seqs = seqs.clone()
-    seqs[:, :-1] = torch.where(
-        pair_match,
-        torch.as_tensor(new_id, device=seqs.device, dtype=seqs.dtype),
-        lhs,
-    )
+    lhs.masked_fill_(pair_workspace, torch.as_tensor(new_id, device=device, dtype=seqs.dtype))
+    valid[:, 1:].masked_fill_(pair_workspace, 0)
+    seqs[:, 1:].masked_fill_(pair_workspace, 0)
 
-    new_lens = keep.sum(dim=-1)
-    max_new = int(new_lens.max().item())
-    new_seqs = compact_by_mask(seqs, keep, max_new)
-    new_valid = (new_seqs != -1).long()
-    return new_seqs, new_valid
+    if prefix_workspace is None or prefix_workspace.size(0) != B:
+        prefix_workspace = torch.zeros((B,), dtype=torch.long, device=device)
+
+    compact_tokens_inplace(seqs, valid, lengths, prefix_workspace)
+    return seqs, valid, lengths
 
 
 @torch.jit.script
