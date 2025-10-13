@@ -18,3 +18,37 @@ The packed-key approach is ~67× faster on the 10M token synthetic corpus while 
 The previous implementation materialized a `(num_pairs, 2)` tensor in the active dtype (typically `torch.long`), requiring roughly `num_pairs × 16` bytes. By contrast, the packed-key path stores a single `torch.long` vector before run-length encoding, requiring `num_pairs × 8` bytes. For the 9,999,999 adjacent pairs in the 10M token benchmark, this reduces intermediate activation memory from ~160 MB to ~80 MB before accounting for allocator overhead.
 
 Although no CUDA device was available in this environment, the reduction in intermediate tensor size directly translates to lower VRAM pressure during GPU execution because no additional host-only allocations are introduced.
+
+## Multi-GPU execution
+
+The `GPUBPETrainer` can aggregate pair histograms across multiple NCCL-backed
+workers. To launch on multiple GPUs you must initialize
+`torch.distributed` *before* constructing the trainer:
+
+```python
+import torch.distributed as dist
+
+dist.init_process_group("nccl")
+trainer = GPUBPETrainer(devices=[f"cuda:{dist.get_rank()}"])
+```
+
+When launching with `torchrun`, the required environment variables are set
+automatically. Manual launches must export the following variables consistently
+across processes:
+
+* `MASTER_ADDR` and `MASTER_PORT` – the rendezvous host/port.
+* `WORLD_SIZE` – total number of ranks in the job.
+* `RANK` – the global rank of the current process.
+* `LOCAL_RANK` – the device index on the local node (used to select the GPU).
+
+Example invocation on a single node with four GPUs:
+
+```bash
+MASTER_ADDR=127.0.0.1 MASTER_PORT=29500 \
+WORLD_SIZE=4 torchrun --nproc_per_node=4 \
+    python -m gpu_tokenizer.cli_train_bpe --merges 10000 --devices cuda
+```
+
+Each rank must contribute identically shaped tensors to the reduction; the
+trainer handles padding internally, so no additional user code is required
+beyond the distributed initialization.
