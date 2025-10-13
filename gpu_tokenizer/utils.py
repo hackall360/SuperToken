@@ -65,29 +65,34 @@ def apply_merge_once(
     new_id: int,
     pair_workspace: Optional[torch.Tensor] = None,
     prefix_workspace: Optional[torch.Tensor] = None,
+    span_workspace: Optional[torch.Tensor] = None,
 ):
     """Apply a single BPE merge directly within ``seqs`` and ``valid``.
 
     The tensors are updated in place; ``pair_workspace`` and ``prefix_workspace``
     are optional reusable scratch buffers used to avoid reallocation during
-    repeated merges.  ``lengths`` is mutated to reflect the number of valid
-    tokens remaining per sequence while preserving the original capacity of the
-    buffers.
+    repeated merges.  ``span_workspace`` may be provided to capture the active
+    left indices of merged pairs prior to compaction.  ``lengths`` is mutated to
+    reflect the number of valid tokens remaining per sequence while preserving
+    the original capacity of the buffers.  The function returns the mutated
+    tensors along with the boolean mask identifying merged left indices.
     """
 
     B, L = seqs.shape
     device = seqs.device
+    width = max(L - 1, 0)
+    empty_span = seqs.new_zeros((B, width), dtype=torch.bool)
 
     if B == 0:
-        return seqs, valid, lengths
+        return seqs, valid, lengths, empty_span
 
     if L <= 1:
         if lengths.numel() == B:
             lengths.copy_(valid.sum(dim=-1, dtype=lengths.dtype))
-        return seqs, valid, lengths
+        return seqs, valid, lengths, empty_span
 
-    if pair_workspace is None or pair_workspace.size(0) != B or pair_workspace.size(1) != L - 1:
-        pair_workspace = torch.zeros((B, L - 1), dtype=torch.bool, device=device)
+    if pair_workspace is None or pair_workspace.size(0) != B or pair_workspace.size(1) != width:
+        pair_workspace = torch.zeros((B, width), dtype=torch.bool, device=device)
     else:
         pair_workspace.zero_()
 
@@ -105,11 +110,19 @@ def apply_merge_once(
     valid[:, 1:].masked_fill_(pair_workspace, 0)
     seqs[:, 1:].masked_fill_(pair_workspace, 0)
 
+    spans = pair_workspace
+    if span_workspace is not None and span_workspace.shape == pair_workspace.shape:
+        if span_workspace.dtype != torch.bool:
+            span_workspace.copy_(pair_workspace.to(span_workspace.dtype))
+        else:
+            span_workspace.copy_(pair_workspace)
+        spans = span_workspace
+
     if prefix_workspace is None or prefix_workspace.size(0) != B:
         prefix_workspace = torch.zeros((B,), dtype=torch.long, device=device)
 
     compact_tokens_inplace(seqs, valid, lengths, prefix_workspace)
-    return seqs, valid, lengths
+    return seqs, valid, lengths, spans
 
 
 @torch.jit.script

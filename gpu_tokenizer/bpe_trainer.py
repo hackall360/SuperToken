@@ -29,6 +29,8 @@ class GPUBatchRecord:
     host_event: Optional[torch.cuda.Event] = None
     pair_workspace: Optional[torch.Tensor] = None
     prefix_workspace: Optional[torch.Tensor] = None
+    span_workspace: Optional[torch.Tensor] = None
+    span_history: list[torch.Tensor] = field(default_factory=list)
 
 
     @classmethod
@@ -66,8 +68,12 @@ class GPUBatchRecord:
         if width == 0:
             if self.pair_workspace is None or self.pair_workspace.shape != (B, 0):
                 self.pair_workspace = torch.empty((B, 0), dtype=torch.bool, device=device)
+            if self.span_workspace is None or self.span_workspace.shape != (B, 0):
+                self.span_workspace = torch.empty((B, 0), dtype=torch.bool, device=device)
         elif self.pair_workspace is None or self.pair_workspace.shape != (B, width):
             self.pair_workspace = torch.zeros((B, width), dtype=torch.bool, device=device)
+        if width > 0 and (self.span_workspace is None or self.span_workspace.shape != (B, width)):
+            self.span_workspace = torch.zeros((B, width), dtype=torch.bool, device=device)
         if self.prefix_workspace is None or self.prefix_workspace.shape[0] != B:
             self.prefix_workspace = torch.zeros((B,), dtype=torch.long, device=device)
 
@@ -339,18 +345,46 @@ class GPUBPETrainer:
         self._active_batch_size = None
         step = 0
         current_batches: Iterable[
-            Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], MultiDeviceBatch]
+            Union[
+                Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]],
+                MultiDeviceBatch,
+            ]
         ] = batches
         gpu_batches: Optional[list[MultiDeviceBatch]] = None
         scale_state = None
 
         cpu_device = torch.device("cpu")
 
+        def _unpack_cpu_batch(
+            batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+            | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]],
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+            tokens_cpu = batch[0]
+            valid_cpu = batch[1]
+            lengths_cpu = batch[2]
+            spans = batch[3] if len(batch) > 3 else []
+            if not isinstance(spans, list):
+                spans = list(spans)
+            return tokens_cpu, valid_cpu, lengths_cpu, spans
+
+        def _pack_cpu_batch(
+            tokens_cpu: torch.Tensor,
+            valid_cpu: torch.Tensor,
+            lengths_cpu: torch.Tensor,
+            spans: list[torch.Tensor] | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+            return tokens_cpu, valid_cpu, lengths_cpu, [] if spans is None else spans
+
         def _extract_sequences_from_cpu(
-            cpu_batches: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+            cpu_batches: Iterable[
+                Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+                | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+            ]
         ) -> list[list[int]]:
             sequences: list[list[int]] = []
-            for tokens_cpu, _valid_cpu, lengths_cpu in cpu_batches:
+            for batch in cpu_batches:
+                tokens_cpu, _valid_cpu, lengths_cpu, _ = _unpack_cpu_batch(batch)
                 rows = int(tokens_cpu.shape[0])
                 for row in range(rows):
                     length = int(lengths_cpu[row].item())
@@ -373,7 +407,7 @@ class GPUBPETrainer:
             sequences: list[list[int]],
             batch_size: int,
             pin: bool,
-        ) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]]:
             if batch_size <= 0:
                 return
             for start in range(0, len(sequences), batch_size):
@@ -396,15 +430,22 @@ class GPUBPETrainer:
                 if pin:
                     tokens = tokens.pin_memory()
                     valid = valid.pin_memory()
-                yield tokens, valid, lengths
+                yield tokens, valid, lengths, []
 
         def _collect_sequences_from_mixed(
             batches_iter: Iterable[
-                Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], MultiDeviceBatch]
+                Union[
+                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]],
+                    MultiDeviceBatch,
+                ]
             ]
         ) -> list[list[int]]:
             sequences: list[list[int]] = []
-            cpu_batches: list[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+            cpu_batches: list[
+                Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+                | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+            ] = []
             gpu_records: list[MultiDeviceBatch] = []
             for batch in batches_iter:
                 if isinstance(batch, MultiDeviceBatch):
@@ -463,9 +504,10 @@ class GPUBPETrainer:
             new_records: list[MultiDeviceBatch] = []
             if batch_size <= 0 or not sequences or not use_cuda:
                 return new_records
-            for tokens_cpu, valid_cpu, lengths_cpu in _iter_cpu_batches_from_sequences(
+            for cpu_batch in _iter_cpu_batches_from_sequences(
                 sequences, batch_size, pin=True
             ):
+                tokens_cpu, valid_cpu, lengths_cpu, _ = _unpack_cpu_batch(cpu_batch)
                 multi_batch = MultiDeviceBatch.from_cpu_batch(
                     tokens_cpu, valid_cpu, lengths_cpu, device_contexts, _record_new_batch
                 )
@@ -490,7 +532,10 @@ class GPUBPETrainer:
                 gpu_batches = new_records
                 current_batches = new_records
             else:
-                cpu_batches: list[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+                cpu_batches: list[
+                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+                    | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+                ] = []
                 if not isinstance(current_batches, list):
                     current_batches = list(current_batches)
                 sequences = _extract_sequences_from_cpu(current_batches)
@@ -503,16 +548,26 @@ class GPUBPETrainer:
                 on_batch_size_change(batch_size)
 
         def _count_pairs_cpu(
-            batch_iter: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
-        ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], list[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+            batch_iter: Iterable[
+                Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+                | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+            ]
+        ) -> tuple[
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+            list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]],
+        ]:
             global_keys: Optional[torch.Tensor] = None
             global_counts: Optional[torch.Tensor] = None
-            consumed: list[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-            for (x_cpu, v_cpu, lengths_cpu) in batch_iter:
+            consumed: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]] = []
+            for batch in batch_iter:
+                x_cpu, v_cpu, lengths_cpu, spans = _unpack_cpu_batch(batch)
                 x_snapshot = x_cpu.clone()
                 v_snapshot = v_cpu.clone()
                 lengths_snapshot = lengths_cpu.clone()
-                consumed.append((x_snapshot, v_snapshot, lengths_snapshot))
+                consumed.append(
+                    _pack_cpu_batch(x_snapshot, v_snapshot, lengths_snapshot, list(spans))
+                )
                 pairs, counts = count_pairs(x_snapshot.to(cpu_device), v_snapshot.to(cpu_device))
                 if pairs.numel() == 0:
                     continue
@@ -528,16 +583,27 @@ class GPUBPETrainer:
             return global_keys, global_counts, consumed
 
         def _apply_merge_cpu(
-            batch_iter: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+            batch_iter: Iterable[
+                Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+                | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+            ],
             a_id: int,
             b_id: int,
             new_id: int,
-        ) -> tuple[list[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]], bool, dict[str, object]]:
-            new_batches: list[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        ) -> tuple[
+            list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]],
+            bool,
+            dict[str, object],
+        ]:
+            new_batches: list[
+                tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+            ] = []
             oom_seen = False
             pair_workspace: Optional[torch.Tensor] = None
             prefix_workspace: Optional[torch.Tensor] = None
-            for (x_cpu, v_cpu, lengths_cpu) in batch_iter:
+            span_workspace: Optional[torch.Tensor] = None
+            for batch in batch_iter:
+                x_cpu, v_cpu, lengths_cpu, spans = _unpack_cpu_batch(batch)
                 try:
                     B, L = x_cpu.shape
                     width = max(L - 1, 0)
@@ -545,7 +611,9 @@ class GPUBPETrainer:
                         pair_workspace = torch.zeros((B, width), dtype=torch.bool, device=cpu_device)
                     if prefix_workspace is None or prefix_workspace.shape[0] != B:
                         prefix_workspace = torch.zeros((B,), dtype=torch.long, device=cpu_device)
-                    apply_merge_once(
+                    if span_workspace is None or span_workspace.shape != (B, width):
+                        span_workspace = torch.zeros((B, width), dtype=torch.bool, device=cpu_device)
+                    _, _, _, span_mask = apply_merge_once(
                         x_cpu,
                         v_cpu,
                         lengths_cpu,
@@ -554,13 +622,18 @@ class GPUBPETrainer:
                         new_id,
                         pair_workspace,
                         prefix_workspace,
+                        span_workspace,
                     )
-                    new_batches.append((x_cpu.clone(), v_cpu.clone(), lengths_cpu.clone()))
+                    updated_spans = list(spans)
+                    updated_spans.append(span_mask.to(torch.bool).clone())
+                    new_batches.append(
+                        _pack_cpu_batch(x_cpu.clone(), v_cpu.clone(), lengths_cpu.clone(), updated_spans)
+                    )
                 except RuntimeError as exc:
                     if "CUDA out of memory" in str(exc):
                         oom_seen = True
                         torch.cuda.empty_cache()
-                        new_batches.append((x_cpu, v_cpu, lengths_cpu))
+                        new_batches.append(_pack_cpu_batch(x_cpu, v_cpu, lengths_cpu, list(spans)))
                     else:
                         raise
             return new_batches, oom_seen, {"sync": True, "bytes": 0}
@@ -737,7 +810,7 @@ class GPUBPETrainer:
                                 with torch.cuda.device(dev), torch.cuda.stream(ctx.compute_stream):
                                     shard.wait_for_device(ctx.compute_stream)
                                     shard.ensure_workspaces()
-                                    apply_merge_once(
+                                    _, _, _, span_mask = apply_merge_once(
                                         shard.tokens,
                                         shard.valid,
                                         shard.lengths,
@@ -746,7 +819,9 @@ class GPUBPETrainer:
                                         new_id,
                                         shard.pair_workspace,
                                         shard.prefix_workspace,
+                                        shard.span_workspace,
                                     )
+                                    shard.span_history.append(span_mask.to(torch.bool).clone())
                                     compute_event = torch.cuda.Event(blocking=False)
                                     compute_event.record(ctx.compute_stream)
                                 shard.mark_device_event(compute_event)
