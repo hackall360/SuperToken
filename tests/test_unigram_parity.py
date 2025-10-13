@@ -25,6 +25,8 @@ import pytest
 sentencepiece = pytest.importorskip("sentencepiece")
 torch = pytest.importorskip("torch")
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for GPU parity tests")
+
 try:  # NumPy is optional, but we seed it when available for completeness.
     import numpy as _np
 except ModuleNotFoundError:  # pragma: no cover - exercised only when NumPy is absent.
@@ -209,13 +211,13 @@ def _train_gpu_unigram(
     target_vocab: int,
     max_subword_len: int,
     seed: int,
-) -> tuple[List[bytes], List[float], List[List[int]]]:
+) -> tuple[GPUUnigramTrainer, List[bytes], List[float], List[List[int]]]:
     _seed_everything(seed)
     trainer = GPUUnigramTrainer(
         base_vocab=base_vocab,
         vocab_size=target_vocab,
         max_subword_len=max_subword_len,
-        device="cuda" if torch.cuda.is_available() else "cpu",
+        device="cuda",
     )
 
     batches = _build_gpu_batches(training_sequences)
@@ -224,7 +226,7 @@ def _train_gpu_unigram(
 
     vocab, log_probs = _gpu_vocab_and_log_probs(trainer)
     encoded = [_viterbi_decode(trainer, list(seq)) for seq in eval_sequences]
-    return vocab, log_probs, encoded
+    return trainer, vocab, log_probs, encoded
 
 
 @pytest.mark.parametrize(
@@ -250,7 +252,7 @@ def test_gpu_unigram_matches_sentencepiece(corpus: AdversarialCorpus) -> None:
         seed=GLOBAL_SEED,
     )
 
-    vocab_a, logp_a, encoded_a = _train_gpu_unigram(
+    gpu_trainer, vocab_a, logp_a, encoded_a = _train_gpu_unigram(
         training_bytes,
         corpus_bytes,
         base_vocab=BASE_VOCAB,
@@ -259,7 +261,7 @@ def test_gpu_unigram_matches_sentencepiece(corpus: AdversarialCorpus) -> None:
         seed=GLOBAL_SEED,
     )
 
-    vocab_b, logp_b, _ = _train_gpu_unigram(
+    gpu_trainer_b, vocab_b, logp_b, _ = _train_gpu_unigram(
         training_bytes,
         corpus_bytes,
         base_vocab=BASE_VOCAB,
@@ -270,6 +272,31 @@ def test_gpu_unigram_matches_sentencepiece(corpus: AdversarialCorpus) -> None:
 
     assert vocab_a == vocab_b
     assert logp_a == pytest.approx(logp_b, abs=1e-7, rel=1e-7)
+
+    cpu_trainer = GPUUnigramTrainer(
+        base_vocab=BASE_VOCAB,
+        vocab_size=TARGET_VOCAB,
+        max_subword_len=MAX_SUBWORD_LEN,
+        device="cpu",
+    )
+    cpu_trainer.id2piece = dict(gpu_trainer.id2piece)
+    cpu_trainer.piece2id = dict(gpu_trainer.piece2id)
+    cpu_trainer.logp = gpu_trainer.logp.detach().cpu()
+    cpu_trainer._trie_dirty = True
+
+    encoded_cpu = [_viterbi_decode(cpu_trainer, list(seq)) for seq in corpus_bytes]
+
+    eval_batch = _build_gpu_batches(corpus_bytes)[0]
+    gpu_batch = eval_batch.to(gpu_trainer.device)
+    gpu_valid = (eval_batch >= 0).to(gpu_trainer.device)
+    cpu_valid = eval_batch >= 0
+    gpu_logZ, _ = gpu_trainer._forward_backward_batch(gpu_batch, gpu_valid)
+    cpu_logZ, _ = cpu_trainer._forward_backward_batch(eval_batch, cpu_valid)
+
+    assert torch.allclose(gpu_logZ.cpu(), cpu_logZ, atol=1e-5, rtol=1e-5)
+    assert vocab_a == [cpu_trainer.id2piece[idx] for idx in range(len(cpu_trainer.id2piece))]
+    assert logp_a == pytest.approx(cpu_trainer.logp.tolist(), abs=1e-5, rel=1e-5)
+    assert encoded_a == encoded_cpu
 
     assert vocab_a == reference.vocab
     assert logp_a == pytest.approx(reference.log_probs, abs=1e-5, rel=1e-5)
@@ -294,7 +321,7 @@ def test_gpu_unigram_seed_reproducibility() -> None:
             base_vocab=BASE_VOCAB,
             vocab_size=BASE_VOCAB + 128,
             max_subword_len=MAX_SUBWORD_LEN,
-            device="cuda" if torch.cuda.is_available() else "cpu",
+            device="cuda",
             seed=seed,
         )
 

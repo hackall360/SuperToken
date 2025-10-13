@@ -33,6 +33,10 @@ class GPUUnigramTrainer:
         self._rng_template_state: torch.Tensor | None = None
         self._rng_template_device: torch.device | None = None
         self._base_powers: torch.Tensor | None = None
+        self._trie_dirty = True
+        self._vocab_trie_next: torch.Tensor | None = None
+        self._vocab_trie_terminal: torch.Tensor | None = None
+        self._piece_lens_tensor: torch.Tensor | None = None
         self.reset_rng(seed=seed, generator=generator)
 
     def _clone_generator(self, generator: torch.Generator) -> torch.Generator:
@@ -84,6 +88,12 @@ class GPUUnigramTrainer:
                     torch.arange(self.max_len, device=self.device, dtype=torch.int64),
                 )
             )
+
+    def _mark_vocab_dirty(self) -> None:
+        self._trie_dirty = True
+        self._vocab_trie_next = None
+        self._vocab_trie_terminal = None
+        self._piece_lens_tensor = None
 
     def _extend_candidates(self, sequences: torch.Tensor) -> None:
         if self.device != "cuda" or not torch.cuda.is_available():
@@ -195,17 +205,58 @@ class GPUUnigramTrainer:
                 break
         V = len(self.id2piece)
         self.logp = torch.full((V,), -math.log(V), device=self.device)
+        self._mark_vocab_dirty()
 
-    def _forward_backward(self, seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        ids = torch.arange(len(self.id2piece), device=self.device)
+    def _ensure_vocab_trie(self) -> None:
+        if self.device != "cuda":
+            return
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is required for GPU vocab trie construction")
+        if not self._trie_dirty and self._vocab_trie_next is not None:
+            return
+        trie_children: List[dict[int, int]] = [dict()]
+        terminal_ids: List[int] = [-1]
+        for pid in range(len(self.id2piece)):
+            piece = self.id2piece[pid]
+            state = 0
+            for byte in piece:
+                nxt = trie_children[state].get(byte)
+                if nxt is None:
+                    nxt = len(trie_children)
+                    trie_children[state][byte] = nxt
+                    trie_children.append(dict())
+                    terminal_ids.append(-1)
+                state = nxt
+            terminal_ids[state] = pid
+        num_states = len(trie_children)
+        next_state = torch.full((num_states, 256), -1, dtype=torch.int32, device=self.device)
+        for state, mapping in enumerate(trie_children):
+            if not mapping:
+                continue
+            keys = torch.tensor(list(mapping.keys()), dtype=torch.long, device=self.device)
+            values = torch.tensor(list(mapping.values()), dtype=torch.int32, device=self.device)
+            next_state[state, keys] = values
+        terminal_tensor = torch.tensor(terminal_ids, dtype=torch.int32, device=self.device)
+        piece_lens = torch.tensor(
+            [len(self.id2piece[idx]) for idx in range(len(self.id2piece))],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._vocab_trie_next = next_state
+        self._vocab_trie_terminal = terminal_tensor
+        self._piece_lens_tensor = piece_lens
+        self._trie_dirty = False
+
+    def _forward_backward_cpu(self, seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         L = seq.size(0)
         starts: list[list[int]] = [[] for _ in range(L)]
         for pid, piece in self.id2piece.items():
             plen = len(piece)
             if plen == 0 or plen > self.max_len or plen > L:
                 continue
+            piece_tensor = torch.tensor(list(piece), dtype=torch.long, device=self.device)
             for i in range(0, L - plen + 1):
-                if torch.all(seq[i : i + plen].cpu() == torch.tensor(list(piece), dtype=torch.long)):
+                if torch.all(seq[i : i + plen] == piece_tensor):
                     starts[i].append(pid)
         logZ = torch.full((L + 1,), -1e9, device=self.device)
         logZ[0] = 0.0
@@ -236,18 +287,111 @@ class GPUUnigramTrainer:
             exp[pid] += post
         return logZL, exp
 
+    def _forward_backward_batch(
+        self, sequences: torch.Tensor, valid: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        sequences = sequences.to(self.device)
+        valid = valid.to(self.device)
+        B, L = sequences.shape
+        V = len(self.id2piece)
+        if B == 0:
+            return torch.empty((0,), device=self.device), torch.zeros((0, V), device=self.device)
+        if self.device != "cuda":
+            logZ_list: List[torch.Tensor] = []
+            exp_list: List[torch.Tensor] = []
+            for row in range(B):
+                length = int(valid[row].sum().item())
+                if length == 0:
+                    logZ_list.append(torch.tensor(float("-inf"), device=self.device))
+                    exp_list.append(torch.zeros((V,), device=self.device))
+                    continue
+                seq = sequences[row, :length]
+                logZ, exp = self._forward_backward_cpu(seq)
+                exp_full = torch.zeros((V,), device=self.device)
+                exp_full[: exp.numel()] = exp
+                logZ_list.append(logZ)
+                exp_list.append(exp_full)
+            return torch.stack(logZ_list), torch.stack(exp_list)
+        self._ensure_vocab_trie()
+        assert self._vocab_trie_next is not None
+        assert self._vocab_trie_terminal is not None
+        assert self._piece_lens_tensor is not None
+        sequences_i32 = sequences.to(torch.int32)
+        valid_u8 = valid.to(torch.uint8)
+        logp = self.logp.to(torch.float32)
+        forward = cuda_kernels.forward_logz(
+            sequences_i32,
+            valid_u8,
+            self.max_len,
+            self._vocab_trie_next,
+            self._vocab_trie_terminal,
+            logp,
+            self._piece_lens_tensor,
+        )
+        backward = cuda_kernels.backward_logz(
+            sequences_i32,
+            valid_u8,
+            self.max_len,
+            self._vocab_trie_next,
+            self._vocab_trie_terminal,
+            logp,
+            self._piece_lens_tensor,
+        )
+        logZ = forward[:, -1]
+        expectations = torch.zeros((B, V), device=self.device, dtype=torch.float32)
+        cuda_kernels.accumulate_expectations(
+            sequences_i32,
+            valid_u8,
+            self.max_len,
+            self._vocab_trie_next,
+            self._vocab_trie_terminal,
+            logp,
+            self._piece_lens_tensor,
+            forward,
+            backward,
+            logZ,
+            expectations,
+        )
+        fallback = logZ <= -1e29
+        if fallback.any():
+            rows = fallback.nonzero(as_tuple=False).squeeze(-1)
+            for idx in rows.tolist():
+                mask = valid[idx]
+                tokens = sequences[idx][mask]
+                if tokens.numel() == 0:
+                    continue
+                counts = torch.bincount(
+                    tokens.to(torch.long), minlength=V
+                ).to(expectations.dtype)
+                expectations[idx].zero_()
+                expectations[idx, : counts.numel()] = counts
+        return logZ, expectations
+
+    def _forward_backward(self, seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        seq = seq.to(self.device)
+        if seq.ndim != 1:
+            raise ValueError("_forward_backward expects a 1D tensor")
+        if seq.numel() == 0:
+            return torch.tensor(float("-inf"), device=self.device), torch.zeros(
+                (len(self.id2piece),), device=self.device
+            )
+        batch_seq = seq.unsqueeze(0)
+        valid = torch.ones_like(batch_seq, dtype=torch.bool)
+        logZ, exp = self._forward_backward_batch(batch_seq, valid)
+        return logZ[0], exp[0]
+
     def fit_epoch(self, batches: List[torch.Tensor]) -> dict[str, int]:
         if len(self.id2piece) < self.target_vocab:
             self._extend_candidates(batches[0])
         V = len(self.id2piece)
-        exp_counts = torch.zeros((V,), device=self.device)
+        exp_counts = torch.zeros((V,), device=self.device, dtype=torch.float32)
         for x in batches:
             x = x.to(self.device)
             valid = x >= 0
-            for row in range(x.size(0)):
-                seq = x[row][valid[row]].to(self.device)
-                _, exp = self._forward_backward(seq)
-                exp_counts[: exp.numel()] += exp
+            if x.numel() == 0:
+                continue
+            _, exp = self._forward_backward_batch(x, valid)
+            exp_counts += exp.sum(dim=0)
         smoothed = exp_counts + 1e-6
         logp = (smoothed / smoothed.sum()).clamp_min(1e-12).log()
         self.logp = logp
