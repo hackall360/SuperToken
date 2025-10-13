@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Any, Iterable, List, Optional, Tuple, cast
+from dataclasses import dataclass
+from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 
@@ -52,6 +53,107 @@ def _aggregate_pair_keys(
     return aggregated_keys, aggregated_counts
 
 
+@dataclass
+class GPUBatchRecord:
+    """Container for GPU-resident batch state with optional host mirrors."""
+
+    tokens: torch.Tensor
+    valid: torch.Tensor
+    lengths: torch.Tensor
+    host_tokens: Optional[torch.Tensor] = None
+    host_valid: Optional[torch.Tensor] = None
+    host_lengths: Optional[torch.Tensor] = None
+    host_dirty: bool = False
+    device_event: Optional[torch.cuda.Event] = None
+    host_event: Optional[torch.cuda.Event] = None
+
+    @classmethod
+    def from_cpu(
+        cls,
+        tokens_cpu: torch.Tensor,
+        valid_cpu: torch.Tensor,
+        lengths_cpu: torch.Tensor,
+        device: torch.device,
+    ) -> "GPUBatchRecord":
+        tokens_host = tokens_cpu.clone().pin_memory()
+        valid_host = valid_cpu.clone().pin_memory()
+        lengths_host = lengths_cpu.clone().pin_memory()
+        tokens_dev = tokens_host.to(device=device, non_blocking=True)
+        valid_dev = valid_host.to(device=device, non_blocking=True)
+        lengths_dev = lengths_host.to(device=device, non_blocking=True)
+        return cls(
+            tokens=tokens_dev,
+            valid=valid_dev,
+            lengths=lengths_dev,
+            host_tokens=tokens_host,
+            host_valid=valid_host,
+            host_lengths=lengths_host,
+            host_dirty=False,
+        )
+
+    def ensure_host_buffers(self) -> None:
+        """Allocate pinned host mirrors if absent or stale."""
+
+        if self.host_tokens is None or self.host_tokens.shape != self.tokens.shape:
+            self.host_tokens = torch.empty_like(self.tokens, device="cpu").pin_memory()
+        if self.host_valid is None or self.host_valid.shape != self.valid.shape:
+            self.host_valid = torch.empty_like(self.valid, device="cpu").pin_memory()
+        if (
+            self.host_lengths is None
+            or self.host_lengths.shape != self.lengths.shape
+            or self.host_lengths.dtype != self.lengths.dtype
+        ):
+            self.host_lengths = torch.empty_like(self.lengths, device="cpu").pin_memory()
+
+    def wait_for_device(self, stream: torch.cuda.Stream) -> None:
+        """Ensure device computations affecting this batch are completed."""
+
+        if self.device_event is not None:
+            stream.wait_event(self.device_event)
+            self.device_event = None
+
+    def schedule_host_sync(self, copy_stream: torch.cuda.Stream) -> None:
+        """Schedule an asynchronous copy of device data back to host."""
+
+        self.ensure_host_buffers()
+        event = torch.cuda.Event(blocking=False)
+        with torch.cuda.stream(copy_stream):
+            self.wait_for_device(copy_stream)
+            assert self.host_tokens is not None
+            assert self.host_valid is not None
+            self.host_tokens.copy_(self.tokens, non_blocking=True)
+            self.host_valid.copy_(self.valid, non_blocking=True)
+            event.record(copy_stream)
+        self.host_event = event
+
+    def wait_for_host(self) -> None:
+        """Block until any pending host copy for this batch completes."""
+
+        if self.host_event is not None:
+            self.host_event.synchronize()
+            self.host_event = None
+
+    def resolve_host(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return up-to-date host buffers for this batch."""
+
+        assert self.host_tokens is not None
+        assert self.host_valid is not None
+        self.wait_for_host()
+        lengths_cpu = self.host_valid.sum(dim=-1, dtype=self.lengths.dtype)
+        if self.host_lengths is None or self.host_lengths.shape != lengths_cpu.shape:
+            self.host_lengths = lengths_cpu.pin_memory()
+        else:
+            self.host_lengths.copy_(lengths_cpu)
+        self.host_dirty = False
+        return self.host_tokens, self.host_valid, self.host_lengths
+
+    def mark_device_event(self, event: torch.cuda.Event) -> None:
+        """Record the latest device-side event for downstream synchronization."""
+
+        self.device_event = event
+        self.host_dirty = True
+
+
 class GPUBPETrainer:
     """Train byte-pair encodings on the GPU."""
 
@@ -61,6 +163,7 @@ class GPUBPETrainer:
         merges: int = 50_000,
         device: str | None = None,
         autoscaler: Optional[AutoScaler] = None,
+        sync_every: int = 1,
     ) -> None:
         self.base_vocab = base_vocab
         self.target_merges = merges
@@ -68,6 +171,7 @@ class GPUBPETrainer:
         self.vocab_size = base_vocab
         self.merges: List[Tuple[int, int]] = []
         self.autoscaler = autoscaler or AutoScaler()
+        self.sync_every = max(sync_every, 1)
 
     def fit(
         self,
@@ -79,17 +183,8 @@ class GPUBPETrainer:
 
         device = torch.device(self.device)
         step = 0
-        current_batches: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = batches
-
-        def _ensure_workspace(
-            workspace: dict[str, Optional[torch.Tensor]],
-            x_src: torch.Tensor,
-            v_src: torch.Tensor,
-        ) -> None:
-            if workspace["x"] is None or workspace["x"].shape != x_src.shape or workspace["x"].dtype != x_src.dtype:
-                workspace["x"] = torch.empty_like(x_src, device=device)
-            if workspace["v"] is None or workspace["v"].shape != v_src.shape or workspace["v"].dtype != v_src.dtype:
-                workspace["v"] = torch.empty_like(v_src, device=device)
+        current_batches: Iterable[Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], GPUBatchRecord]] = batches
+        gpu_batches: Optional[list[GPUBatchRecord]] = None
 
         cpu_device = torch.device("cpu")
 
@@ -149,60 +244,50 @@ class GPUBPETrainer:
             torch.cuda.set_device(device)
             copy_stream = torch.cuda.Stream(device=device)
             compute_stream = torch.cuda.Stream(device=device)
-            workspaces = [
-                {"x": None, "v": None},
-                {"x": None, "v": None},
-            ]
-            copy_events = [torch.cuda.Event(blocking=False) for _ in range(2)]
-            compute_events = [torch.cuda.Event(blocking=False) for _ in range(2)]
+            def _finalize_host_sync(records: list[GPUBatchRecord]) -> None:
+                pending_copy = False
+                for record in records:
+                    if record.host_dirty:
+                        record.schedule_host_sync(copy_stream)
+                        pending_copy = True
+                    elif record.host_event is not None:
+                        pending_copy = True
+                torch.cuda.current_stream(device).wait_stream(copy_stream)
+                if profile_streams and pending_copy:
+                    torch.cuda.synchronize(device)
+                    assert copy_stream.query(), "copy stream did not drain"
+                for record in records:
+                    record.resolve_host()
 
             def _count_pairs_gpu(
-                batch_iter: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
-            ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], list[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+                batch_iter: Iterable[Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], GPUBatchRecord]]
+            ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], list[GPUBatchRecord]]:
                 global_keys: Optional[torch.Tensor] = None
                 global_counts: Optional[torch.Tensor] = None
-                consumed: list[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-                buffer_idx = 0
-                compute_recorded = [False, False]
-                pending_copy = False
-                pending_compute = False
+                consumed: list[GPUBatchRecord] = []
                 pair_results: list[tuple[torch.Tensor, torch.Tensor]] = []
-                for (x_cpu, v_cpu, lengths_cpu) in batch_iter:
-                    x_snapshot = x_cpu.clone().pin_memory()
-                    v_snapshot = v_cpu.clone().pin_memory()
-                    lengths_snapshot = lengths_cpu.clone()
-                    consumed.append((x_snapshot, v_snapshot, lengths_snapshot))
-                    workspace = workspaces[buffer_idx]
-                    _ensure_workspace(workspace, x_snapshot, v_snapshot)
-                    with torch.cuda.stream(copy_stream):
-                        if compute_recorded[buffer_idx]:
-                            copy_stream.wait_event(compute_events[buffer_idx])
-                        workspace["x"].copy_(x_snapshot, non_blocking=True)
-                        workspace["v"].copy_(v_snapshot, non_blocking=True)
-                    copy_events[buffer_idx].record(copy_stream)
-                    pending_copy = True
+                pending_compute = False
+                for batch in batch_iter:
+                    if isinstance(batch, GPUBatchRecord):
+                        record = batch
+                    else:
+                        record = GPUBatchRecord.from_cpu(batch[0], batch[1], batch[2], device)
+                    consumed.append(record)
                     try:
                         with torch.cuda.stream(compute_stream):
-                            compute_stream.wait_event(copy_events[buffer_idx])
-                            pairs, counts = count_pairs(workspace["x"], workspace["v"])
-                        compute_events[buffer_idx].record(compute_stream)
-                        compute_recorded[buffer_idx] = True
+                            record.wait_for_device(compute_stream)
+                            pairs, counts = count_pairs(record.tokens, record.valid)
                         pending_compute = True
                         pair_results.append((pairs, counts))
                     except RuntimeError as exc:
-                        compute_recorded[buffer_idx] = False
                         if "CUDA out of memory" in str(exc):
                             self.autoscaler.feedback(oom=True)
                             torch.cuda.empty_cache()
-                            buffer_idx = 1 - buffer_idx
                             continue
                         raise
-                    buffer_idx = 1 - buffer_idx
                 torch.cuda.current_stream(device).wait_stream(compute_stream)
-                torch.cuda.current_stream(device).wait_stream(copy_stream)
-                if profile_streams and (pending_copy or pending_compute):
+                if profile_streams and pending_compute:
                     torch.cuda.synchronize(device)
-                    assert copy_stream.query(), "copy stream did not drain"
                     assert compute_stream.query(), "compute stream did not drain"
                 for pairs, counts in pair_results:
                     if pairs.numel() == 0:
@@ -219,80 +304,61 @@ class GPUBPETrainer:
                 return global_keys, global_counts, consumed
 
             def _apply_merge_gpu(
-                batch_iter: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+                batch_iter: Iterable[GPUBatchRecord],
                 a_id: int,
                 b_id: int,
                 new_id: int,
-            ) -> tuple[list[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]], bool]:
-                new_batches: list[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-                batch_results: list[tuple[str, Any]] = []
+                merge_idx: int,
+                force_sync: bool = False,
+            ) -> tuple[list[GPUBatchRecord], bool]:
+                records = list(batch_iter)
                 oom_seen = False
-                buffer_idx = 0
-                compute_recorded = [False, False]
+                need_sync = force_sync or (merge_idx % self.sync_every == 0)
                 pending_copy = False
                 pending_compute = False
-                for (x_cpu, v_cpu, lengths_cpu) in batch_iter:
-                    workspace = workspaces[buffer_idx]
-                    _ensure_workspace(workspace, x_cpu, v_cpu)
-                    with torch.cuda.stream(copy_stream):
-                        if compute_recorded[buffer_idx]:
-                            copy_stream.wait_event(compute_events[buffer_idx])
-                        workspace["x"].copy_(x_cpu, non_blocking=True)
-                        workspace["v"].copy_(v_cpu, non_blocking=True)
-                    copy_events[buffer_idx].record(copy_stream)
-                    pending_copy = True
+                for record in records:
                     try:
                         with torch.cuda.stream(compute_stream):
-                            compute_stream.wait_event(copy_events[buffer_idx])
-                            x_dev, v_dev = apply_merge_once(
-                                workspace["x"], workspace["v"], a_id, b_id, new_id
+                            record.wait_for_device(compute_stream)
+                            tokens_dev, valid_dev = apply_merge_once(
+                                record.tokens, record.valid, a_id, b_id, new_id
                             )
-                        compute_events[buffer_idx].record(compute_stream)
-                        compute_recorded[buffer_idx] = True
+                            lengths_dev = valid_dev.sum(dim=-1)
+                            record.tokens = tokens_dev
+                            record.valid = valid_dev
+                            record.lengths = lengths_dev
+                            compute_event = torch.cuda.Event(blocking=False)
+                            compute_event.record(compute_stream)
+                        record.mark_device_event(compute_event)
                         pending_compute = True
+                        if need_sync:
+                            record.schedule_host_sync(copy_stream)
+                            pending_copy = True
                     except RuntimeError as exc:
-                        compute_recorded[buffer_idx] = False
                         if "CUDA out of memory" in str(exc):
                             oom_seen = True
                             torch.cuda.empty_cache()
-                            batch_results.append(("oom", (x_cpu, v_cpu, lengths_cpu)))
-                            buffer_idx = 1 - buffer_idx
-                            continue
-                        raise
-                    finish_event = torch.cuda.Event(blocking=False)
-                    with torch.cuda.stream(copy_stream):
-                        copy_stream.wait_event(compute_events[buffer_idx])
-                        x_cpu_out = x_dev.to("cpu", non_blocking=True, copy=True).pin_memory()
-                        v_cpu_out = v_dev.to("cpu", non_blocking=True, copy=True).pin_memory()
-                        finish_event.record(copy_stream)
-                    batch_results.append(("ready", (x_cpu_out, v_cpu_out, finish_event)))
-                    buffer_idx = 1 - buffer_idx
-                torch.cuda.current_stream(device).wait_stream(copy_stream)
+                        else:
+                            raise
                 torch.cuda.current_stream(device).wait_stream(compute_stream)
+                if need_sync:
+                    torch.cuda.current_stream(device).wait_stream(copy_stream)
+                    for record in records:
+                        record.resolve_host()
                 if profile_streams and (pending_copy or pending_compute):
                     torch.cuda.synchronize(device)
-                    assert copy_stream.query(), "copy stream did not drain"
-                    assert compute_stream.query(), "compute stream did not drain"
-                for tag, payload in batch_results:
-                    if tag == "oom":
-                        x_keep, v_keep, lengths_keep = cast(
-                            Tuple[torch.Tensor, torch.Tensor, torch.Tensor], payload
-                        )
-                        new_batches.append((x_keep, v_keep, lengths_keep))
-                    else:
-                        x_cpu_out, v_cpu_out, finish_event = cast(
-                            Tuple[torch.Tensor, torch.Tensor, torch.cuda.Event], payload
-                        )
-                        finish_event.synchronize()
-                        lengths_cpu_out = v_cpu_out.sum(dim=-1)
-                        new_batches.append((x_cpu_out, v_cpu_out, lengths_cpu_out))
-                return new_batches, oom_seen
+                    if pending_copy:
+                        assert copy_stream.query(), "copy stream did not drain"
+                    if pending_compute:
+                        assert compute_stream.query(), "compute stream did not drain"
+                return records, oom_seen
 
         while step < self.target_merges:
             _ = self.autoscaler.suggest(token_bytes_per_example=int(8 * 1024))
             t0 = time.time()
             if use_cuda:
                 global_keys, global_counts, consumed_batches = _count_pairs_gpu(current_batches)
+                gpu_batches = consumed_batches
             else:
                 global_keys, global_counts, consumed_batches = _count_pairs_cpu(current_batches)
             if global_keys is None or global_keys.numel() == 0:
@@ -314,11 +380,16 @@ class GPUBPETrainer:
             self.merges.append((a_id, b_id))
             self.vocab_size += 1
             if use_cuda:
-                current_batches, oom_seen = _apply_merge_gpu(current_batches, a_id, b_id, new_id)
+                current_batches, oom_seen = _apply_merge_gpu(
+                    current_batches, a_id, b_id, new_id, step + 1
+                )
+                gpu_batches = list(current_batches)
             else:
                 current_batches, oom_seen = _apply_merge_cpu(current_batches, a_id, b_id, new_id)
             step += 1
             self.autoscaler.feedback(step_time_s=time.time() - t0, oom=oom_seen)
+        if use_cuda and gpu_batches is not None:
+            _finalize_host_sync(gpu_batches)
         return {
             "base_vocab": self.base_vocab,
             "vocab_size": self.vocab_size,
