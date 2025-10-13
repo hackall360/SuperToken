@@ -274,3 +274,52 @@ def test_gpu_unigram_matches_sentencepiece(corpus: AdversarialCorpus) -> None:
     assert vocab_a == reference.vocab
     assert logp_a == pytest.approx(reference.log_probs, abs=1e-5, rel=1e-5)
     assert encoded_a == reference.encoded
+
+
+def test_gpu_unigram_seed_reproducibility() -> None:
+    """Multiple runs with the same seed should stay in lock-step across epochs."""
+
+    seed = GLOBAL_SEED
+    training_sequences = [
+        b"banana bandana",
+        b"bandana banana",
+        b"ananas banana",
+        bytes(range(32)),
+    ]
+    eval_sequences = training_sequences[:-1]
+    batches = _build_gpu_batches(training_sequences)
+
+    def _run() -> tuple[list[list[bytes]], list[bytes], dict[bytes, int], list[list[int]]]:
+        trainer = GPUUnigramTrainer(
+            base_vocab=BASE_VOCAB,
+            vocab_size=BASE_VOCAB + 128,
+            max_subword_len=MAX_SUBWORD_LEN,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            seed=seed,
+        )
+
+        candidate_history: list[list[bytes]] = []
+        vocab_history: list[dict[bytes, int]] = []
+        epoch_seeds = [None, seed + 1, None]
+        for epoch_seed in epoch_seeds:
+            if epoch_seed is None:
+                trainer.reset_rng()
+            else:
+                trainer.reset_rng(seed=epoch_seed)
+            trainer.fit_epoch(batches)
+            candidate_history.append(
+                [trainer.id2piece[idx] for idx in range(BASE_VOCAB, len(trainer.id2piece))]
+            )
+            vocab_history.append(dict(trainer.piece2id))
+
+        vocab = [trainer.id2piece[idx] for idx in range(len(trainer.id2piece))]
+        encoded = [_viterbi_decode(trainer, list(seq)) for seq in eval_sequences]
+        return candidate_history, vocab, vocab_history[-1], encoded
+
+    history_a, vocab_a, table_a, encoded_a = _run()
+    history_b, vocab_b, table_b, encoded_b = _run()
+
+    assert history_a == history_b
+    assert vocab_a == vocab_b
+    assert table_a == table_b
+    assert encoded_a == encoded_b
