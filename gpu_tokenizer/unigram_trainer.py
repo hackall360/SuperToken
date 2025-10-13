@@ -7,6 +7,8 @@ from typing import Dict, List, Tuple
 
 import torch
 
+from . import cuda_kernels
+
 
 class GPUUnigramTrainer:
     """Minimal unigram trainer using GPU-accelerated forward/backward passes."""
@@ -30,6 +32,7 @@ class GPUUnigramTrainer:
         self.logp = torch.full((base_vocab,), -math.log(base_vocab), device=self.device)
         self._rng_template_state: torch.Tensor | None = None
         self._rng_template_device: torch.device | None = None
+        self._base_powers: torch.Tensor | None = None
         self.reset_rng(seed=seed, generator=generator)
 
     def _clone_generator(self, generator: torch.Generator) -> torch.Generator:
@@ -73,42 +76,123 @@ class GPUUnigramTrainer:
             self._rng = torch.Generator(device=self._rng_template_device)
             self._rng.set_state(self._rng_template_state.clone())
 
+    def _ensure_base_powers(self) -> None:
+        if self._base_powers is None or self._base_powers.device != torch.device(self.device):
+            self._base_powers = (
+                torch.pow(
+                    torch.full((self.max_len,), 256, device=self.device, dtype=torch.int64),
+                    torch.arange(self.max_len, device=self.device, dtype=torch.int64),
+                )
+            )
+
     def _extend_candidates(self, sequences: torch.Tensor) -> None:
+        if self.device != "cuda" or not torch.cuda.is_available():
+            raise RuntimeError("GPU candidate extension requires CUDA availability")
+        sequences = sequences.to(self.device)
         B, L = sequences.shape
         valid = sequences >= 0
-        grams: List[Tuple[bytes, int]] = []
+        self._ensure_base_powers()
+        assert self._base_powers is not None  # mypy guard
+        all_keys: List[torch.Tensor] = []
+        max_candidates = 1_000_000
         for n in range(2, self.max_len + 1):
             if L < n:
                 break
-            spans_valid = torch.ones((B, L - n + 1), dtype=torch.bool, device=sequences.device)
+            span_len = L - n + 1
+            spans_valid = torch.ones((B, span_len), dtype=torch.bool, device=self.device)
             for k in range(n):
-                spans_valid &= valid[:, k : L - n + 1 + k]
+                spans_valid &= valid[:, k : k + span_len]
             if not spans_valid.any():
                 continue
             idx = torch.nonzero(spans_valid, as_tuple=False)
             if idx.numel() == 0:
                 continue
-            take = min(idx.size(0), 1_000_000)
-            idx_cpu = idx.to("cpu")
-            perm = torch.randperm(idx_cpu.size(0), device=torch.device("cpu"), generator=self._rng)
-            idx_cpu = idx_cpu[perm[:take]]
-            idx = idx_cpu.to(idx.device)
+            if idx.size(0) > max_candidates:
+                perm = torch.randperm(
+                    idx.size(0), device=torch.device("cpu"), generator=self._rng
+                ).to(self.device)
+                idx = idx[perm[:max_candidates]]
             rows = idx[:, 0]
             cols = idx[:, 1]
-            ng = torch.stack([sequences[rows, cols + k] for k in range(n)], dim=1).to("cpu")
-            from collections import Counter
-
-            counts = Counter(map(tuple, ng.tolist()))
-            for key, cnt in counts.items():
-                grams.append((bytes(key), cnt))
-        grams.sort(key=lambda x: -x[1])
-        for piece, _ in grams:
-            if piece not in self.piece2id:
-                new_id = len(self.id2piece)
-                self.id2piece[new_id] = piece
-                self.piece2id[piece] = new_id
-                if len(self.id2piece) >= self.target_vocab:
-                    break
+            windows = torch.stack([sequences[rows, cols + k] for k in range(n)], dim=1)
+            encoded = (windows.to(torch.int64) * self._base_powers[:n]).sum(dim=1)
+            key = encoded * (self.max_len + 1) + n
+            all_keys.append(key)
+        if not all_keys:
+            return
+        key_tensor = torch.cat(all_keys)
+        unique_keys = torch.unique(key_tensor, sorted=True)
+        unique_lengths = (unique_keys % (self.max_len + 1)).to(torch.int32)
+        unique_encoded = (unique_keys // (self.max_len + 1)).to(torch.int64)
+        candidate_pieces: List[bytes] = []
+        candidate_indices: List[int] = []
+        for idx, (enc, length) in enumerate(zip(unique_encoded, unique_lengths)):
+            length_int = int(length.item())
+            if length_int < 2:
+                continue
+            value = int(enc.item())
+            buf = [0] * length_int
+            for pos in range(length_int - 1, -1, -1):
+                buf[pos] = value & 0xFF
+                value >>= 8
+            piece = bytes(buf)
+            if piece in self.piece2id:
+                continue
+            candidate_indices.append(idx)
+            candidate_pieces.append(piece)
+        if not candidate_pieces:
+            return
+        trie_children: List[dict[int, int]] = [dict()]
+        terminal_ids: List[int] = [-1]
+        terminal_pieces: List[bytes] = []
+        for term_idx, (cand_idx, piece) in enumerate(zip(candidate_indices, candidate_pieces)):
+            state = 0
+            for byte in piece:
+                nxt = trie_children[state].get(byte)
+                if nxt is None:
+                    nxt = len(trie_children)
+                    trie_children[state][byte] = nxt
+                    trie_children.append(dict())
+                    terminal_ids.append(-1)
+                state = nxt
+            terminal_ids[state] = term_idx
+            terminal_pieces.append(piece)
+        num_states = len(trie_children)
+        next_state = torch.full((num_states, 256), -1, dtype=torch.int32, device=self.device)
+        for state, mapping in enumerate(trie_children):
+            if not mapping:
+                continue
+            bytes_tensor = torch.tensor(list(mapping.keys()), dtype=torch.long, device=self.device)
+            next_ids = torch.tensor(list(mapping.values()), dtype=torch.int32, device=self.device)
+            next_state[state, bytes_tensor] = next_ids
+        terminal_tensor = torch.tensor(terminal_ids, dtype=torch.int32, device=self.device)
+        counts = torch.zeros((len(terminal_pieces),), dtype=torch.int32, device=self.device)
+        if counts.numel() > 0:
+            cuda_kernels.traverse_trie(
+                sequences.to(torch.int32),
+                valid.to(torch.uint8),
+                next_state,
+                terminal_tensor,
+                counts,
+                int(B),
+                int(L),
+                int(self.max_len),
+            )
+        if counts.numel() == 0:
+            return
+        order = torch.argsort(counts, descending=True)
+        for idx in order.tolist():
+            cnt = int(counts[idx].item())
+            if cnt <= 0:
+                break
+            piece = terminal_pieces[idx]
+            if piece in self.piece2id:
+                continue
+            new_id = len(self.id2piece)
+            self.id2piece[new_id] = piece
+            self.piece2id[piece] = new_id
+            if len(self.id2piece) >= self.target_vocab:
+                break
         V = len(self.id2piece)
         self.logp = torch.full((V,), -math.log(V), device=self.device)
 
