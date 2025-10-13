@@ -66,6 +66,8 @@ class GPUBatchRecord:
     host_dirty: bool = False
     device_event: Optional[torch.cuda.Event] = None
     host_event: Optional[torch.cuda.Event] = None
+    pair_workspace: Optional[torch.Tensor] = None
+    prefix_workspace: Optional[torch.Tensor] = None
 
     @classmethod
     def from_cpu(
@@ -81,7 +83,7 @@ class GPUBatchRecord:
         tokens_dev = tokens_host.to(device=device, non_blocking=True)
         valid_dev = valid_host.to(device=device, non_blocking=True)
         lengths_dev = lengths_host.to(device=device, non_blocking=True)
-        return cls(
+        record = cls(
             tokens=tokens_dev,
             valid=valid_dev,
             lengths=lengths_dev,
@@ -90,6 +92,22 @@ class GPUBatchRecord:
             host_lengths=lengths_host,
             host_dirty=False,
         )
+        record.ensure_workspaces()
+        return record
+
+    def ensure_workspaces(self) -> None:
+        """Allocate or resize device workspaces for merges."""
+
+        B, L = self.tokens.shape
+        device = self.tokens.device
+        width = max(L - 1, 0)
+        if width == 0:
+            if self.pair_workspace is None or self.pair_workspace.shape != (B, 0):
+                self.pair_workspace = torch.empty((B, 0), dtype=torch.bool, device=device)
+        elif self.pair_workspace is None or self.pair_workspace.shape != (B, width):
+            self.pair_workspace = torch.zeros((B, width), dtype=torch.bool, device=device)
+        if self.prefix_workspace is None or self.prefix_workspace.shape[0] != B:
+            self.prefix_workspace = torch.zeros((B,), dtype=torch.long, device=device)
 
     def ensure_host_buffers(self) -> None:
         """Allocate pinned host mirrors if absent or stale."""
@@ -221,15 +239,27 @@ class GPUBPETrainer:
         ) -> tuple[list[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]], bool]:
             new_batches: list[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
             oom_seen = False
+            pair_workspace: Optional[torch.Tensor] = None
+            prefix_workspace: Optional[torch.Tensor] = None
             for (x_cpu, v_cpu, lengths_cpu) in batch_iter:
                 try:
-                    x = x_cpu.to(cpu_device)
-                    v = v_cpu.to(cpu_device)
-                    x2, v2 = apply_merge_once(x, v, a_id, b_id, new_id)
-                    x2_cpu = x2.to("cpu", copy=True)
-                    v2_cpu = v2.to("cpu", copy=True)
-                    lengths2_cpu = v2_cpu.sum(dim=-1)
-                    new_batches.append((x2_cpu, v2_cpu, lengths2_cpu))
+                    B, L = x_cpu.shape
+                    width = max(L - 1, 0)
+                    if pair_workspace is None or pair_workspace.shape != (B, width):
+                        pair_workspace = torch.zeros((B, width), dtype=torch.bool, device=cpu_device)
+                    if prefix_workspace is None or prefix_workspace.shape[0] != B:
+                        prefix_workspace = torch.zeros((B,), dtype=torch.long, device=cpu_device)
+                    apply_merge_once(
+                        x_cpu,
+                        v_cpu,
+                        lengths_cpu,
+                        a_id,
+                        b_id,
+                        new_id,
+                        pair_workspace,
+                        prefix_workspace,
+                    )
+                    new_batches.append((x_cpu.clone(), v_cpu.clone(), lengths_cpu.clone()))
                 except RuntimeError as exc:
                     if "CUDA out of memory" in str(exc):
                         oom_seen = True
@@ -320,13 +350,17 @@ class GPUBPETrainer:
                     try:
                         with torch.cuda.stream(compute_stream):
                             record.wait_for_device(compute_stream)
-                            tokens_dev, valid_dev = apply_merge_once(
-                                record.tokens, record.valid, a_id, b_id, new_id
+                            record.ensure_workspaces()
+                            apply_merge_once(
+                                record.tokens,
+                                record.valid,
+                                record.lengths,
+                                a_id,
+                                b_id,
+                                new_id,
+                                record.pair_workspace,
+                                record.prefix_workspace,
                             )
-                            lengths_dev = valid_dev.sum(dim=-1)
-                            record.tokens = tokens_dev
-                            record.valid = valid_dev
-                            record.lengths = lengths_dev
                             compute_event = torch.cuda.Event(blocking=False)
                             compute_event.record(compute_stream)
                         record.mark_device_event(compute_event)
