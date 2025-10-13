@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import pytest
 
 
@@ -40,9 +42,13 @@ def test_apply_merge_inplace_matches_cpu_multi_step():
     width = max(L - 1, 0)
     pair_workspace_cpu = torch.zeros((B, width), dtype=torch.bool)
     prefix_workspace_cpu = torch.zeros((B,), dtype=torch.long)
+    span_workspace_cpu = torch.zeros((B, width), dtype=torch.bool)
+    cpu_spans: list[torch.Tensor] = []
 
     for a_id, b_id, new_id in merges:
-        apply_merge_once(
+        prev_tokens = tokens_ref.clone()
+        prev_valid = valid_ref.clone()
+        _, _, _, span_mask = apply_merge_once(
             tokens_ref,
             valid_ref,
             lengths_ref,
@@ -51,16 +57,29 @@ def test_apply_merge_inplace_matches_cpu_multi_step():
             new_id,
             pair_workspace_cpu,
             prefix_workspace_cpu,
+            span_workspace_cpu,
         )
+        expected_mask = (
+            (prev_tokens[:, :-1] == a_id)
+            & (prev_tokens[:, 1:] == b_id)
+            & prev_valid[:, :-1].to(torch.bool)
+            & prev_valid[:, 1:].to(torch.bool)
+        )
+        assert torch.equal(span_mask.to(torch.bool), expected_mask)
+        cpu_spans.append(span_mask.to(torch.bool).clone())
 
     tokens_gpu = tokens_cpu.to("cuda")
     valid_gpu = valid_cpu.to("cuda")
     lengths_gpu = lengths_cpu.to("cuda")
     pair_workspace_gpu = torch.zeros((B, width), dtype=torch.bool, device="cuda")
     prefix_workspace_gpu = torch.zeros((B,), dtype=torch.long, device="cuda")
+    span_workspace_gpu = torch.zeros((B, width), dtype=torch.bool, device="cuda")
+    gpu_spans: list[torch.Tensor] = []
 
     for a_id, b_id, new_id in merges:
-        apply_merge_once(
+        prev_tokens = tokens_gpu.clone()
+        prev_valid = valid_gpu.clone()
+        _, _, _, span_mask = apply_merge_once(
             tokens_gpu,
             valid_gpu,
             lengths_gpu,
@@ -69,11 +88,24 @@ def test_apply_merge_inplace_matches_cpu_multi_step():
             new_id,
             pair_workspace_gpu,
             prefix_workspace_gpu,
+            span_workspace_gpu,
         )
+        expected_mask = (
+            (prev_tokens[:, :-1] == a_id)
+            & (prev_tokens[:, 1:] == b_id)
+            & prev_valid[:, :-1].to(torch.bool)
+            & prev_valid[:, 1:].to(torch.bool)
+        )
+        assert torch.equal(span_mask.to(torch.bool), expected_mask)
+        gpu_spans.append(span_mask.to(torch.bool).clone())
 
     assert torch.equal(tokens_ref, tokens_gpu.cpu())
     assert torch.equal(valid_ref, valid_gpu.cpu())
     assert torch.equal(lengths_ref, lengths_gpu.cpu())
+
+    assert len(cpu_spans) == len(gpu_spans) == len(merges)
+    for idx, (cpu_mask, gpu_mask) in enumerate(zip(cpu_spans, gpu_spans)):
+        assert torch.equal(cpu_mask, gpu_mask.cpu()), f"Mismatch in span mask for merge {idx}"
 
     for row in range(B):
         keep = int(lengths_ref[row].item())
