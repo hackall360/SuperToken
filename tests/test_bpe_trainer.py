@@ -225,3 +225,83 @@ def test_gpu_apply_merge_retries_after_oom(monkeypatch):
     assert trainer._active_batch_size == 2
     assert apply_calls["count"] >= 2
     assert rows_seen and all(row <= 2 for row in rows_seen)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires >=2 CUDA devices")
+def test_multi_gpu_merges_match_single_gpu():
+    seqs = [
+        [1, 2, 1, 2, 3],
+        [1, 2, 4, 2, 4],
+        [1, 3, 1, 3, 4],
+        [1, 2, 1, 2, 4],
+    ]
+    single_batch = _make_batch(seqs)
+    multi_batch = _make_batch(seqs)
+
+    single_trainer = GPUBPETrainer(base_vocab=256, merges=3, device="cuda:0", sync_every=1)
+    single_trainer.fit([single_batch], log_every=10)
+
+    multi_trainer = GPUBPETrainer(
+        base_vocab=256,
+        merges=3,
+        devices=("cuda:0", "cuda:1"),
+        sync_every=1,
+    )
+    result_multi = multi_trainer.fit([multi_batch], log_every=10)
+
+    assert multi_trainer.merges == single_trainer.merges
+    assert multi_trainer.vocab_size == single_trainer.vocab_size
+    per_device = result_multi["transfer_metrics"]["per_device"]
+    assert set(per_device.keys()) == {"cuda:0", "cuda:1"}
+    total_h2d = sum(metrics["bytes_h2d"] for metrics in per_device.values())
+    assert total_h2d == result_multi["transfer_metrics"]["bytes_h2d"]
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires >=2 CUDA devices")
+def test_multi_gpu_autoscaler_updates_contexts(monkeypatch):
+    class ShrinkingAutoScaler:
+        def __init__(self) -> None:
+            self.state = ScaleState(batch_size=4, cpu_workers=2, h2d_mb=512)
+
+        def suggest(self, token_bytes_per_example: int = 0) -> ScaleState:  # pragma: no cover - simple stub
+            return self.state
+
+        def feedback(self, step_time_s: float | None = None, oom: bool = False) -> None:
+            if oom:
+                self.state = ScaleState(batch_size=2, cpu_workers=2, h2d_mb=512)
+
+    seqs = [
+        [1, 2, 3, 4, 5],
+        [1, 2, 3, 4, 6],
+        [1, 2, 3, 4, 7],
+        [1, 2, 3, 4, 8],
+    ]
+    batcher = PackedBatcher(seqs, batch_size=4, seed=999)
+
+    trainer = GPUBPETrainer(
+        base_vocab=256,
+        merges=2,
+        devices=("cuda:0", "cuda:1"),
+        autoscaler=ShrinkingAutoScaler(),
+        sync_every=1,
+    )
+
+    original_count = bt.count_pairs
+    call_order: list[int] = []
+
+    def _oom_then_count(tokens, valid):
+        call_order.append(int(tokens.shape[0]))
+        if len(call_order) == 1:
+            raise RuntimeError("CUDA out of memory")
+        return original_count(tokens, valid)
+
+    monkeypatch.setattr(bt, "count_pairs", _oom_then_count)
+
+    result = trainer.fit(batcher, log_every=10)
+
+    assert trainer._active_batch_size == 2
+    assert len(call_order) >= 2
+    assert all(rows <= 2 for rows in call_order[1:])
+    per_device = result["transfer_metrics"]["per_device"]
+    assert set(per_device.keys()) == {"cuda:0", "cuda:1"}
+    assert all(metrics["bytes_h2d"] > 0 for metrics in per_device.values())
