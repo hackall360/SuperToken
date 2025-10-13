@@ -139,3 +139,89 @@ def test_autoscaler_reduces_batch_after_oom(monkeypatch):
 
     assert trainer._active_batch_size == 2
     assert calls["rows"] and all(row <= 2 for row in calls["rows"])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_gpu_count_pairs_retries_after_oom(monkeypatch):
+    class ShrinkingAutoScaler:
+        def __init__(self) -> None:
+            self.state = ScaleState(batch_size=4, cpu_workers=2, h2d_mb=512)
+
+        def suggest(self, token_bytes_per_example: int = 0) -> ScaleState:  # pragma: no cover - simple stub
+            return self.state
+
+        def feedback(self, step_time_s: float | None = None, oom: bool = False) -> None:
+            if oom:
+                self.state = ScaleState(batch_size=2, cpu_workers=2, h2d_mb=512)
+
+    seqs = [
+        [1, 2, 1, 2, 3, 4],
+        [1, 2, 1, 2, 3, 4],
+        [1, 2, 1, 2, 3, 4],
+        [1, 2, 1, 2, 3, 4],
+    ]
+    batcher = PackedBatcher(seqs, batch_size=4, seed=123)
+
+    trainer = GPUBPETrainer(base_vocab=256, merges=1, device="cuda", autoscaler=ShrinkingAutoScaler())
+
+    original_count = bt.count_pairs
+    call_rows: list[int] = []
+    call_count = {"count": 0}
+
+    def _oom_then_count(tokens, valid):
+        call_count["count"] += 1
+        if call_count["count"] == 1:
+            raise RuntimeError("CUDA out of memory")
+        call_rows.append(int(tokens.shape[0]))
+        return original_count(tokens, valid)
+
+    monkeypatch.setattr(bt, "count_pairs", _oom_then_count)
+
+    trainer.fit(batcher, log_every=10)
+
+    assert trainer._active_batch_size == 2
+    assert call_count["count"] >= 2
+    assert call_rows and all(row <= 2 for row in call_rows)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_gpu_apply_merge_retries_after_oom(monkeypatch):
+    class ShrinkingAutoScaler:
+        def __init__(self) -> None:
+            self.state = ScaleState(batch_size=4, cpu_workers=2, h2d_mb=512)
+
+        def suggest(self, token_bytes_per_example: int = 0) -> ScaleState:  # pragma: no cover - simple stub
+            return self.state
+
+        def feedback(self, step_time_s: float | None = None, oom: bool = False) -> None:
+            if oom:
+                self.state = ScaleState(batch_size=2, cpu_workers=2, h2d_mb=512)
+
+    seqs = [
+        [1, 2, 1, 2, 3, 4],
+        [1, 2, 1, 2, 3, 4],
+        [1, 2, 1, 2, 3, 4],
+        [1, 2, 1, 2, 3, 4],
+    ]
+    batcher = PackedBatcher(seqs, batch_size=4, seed=321)
+
+    trainer = GPUBPETrainer(base_vocab=256, merges=2, device="cuda", autoscaler=ShrinkingAutoScaler())
+
+    original_apply = bt.apply_merge_once
+    rows_seen: list[int] = []
+    apply_calls = {"count": 0}
+
+    def _oom_then_apply(tokens, valid, lengths, *args, **kwargs):
+        apply_calls["count"] += 1
+        if apply_calls["count"] == 1:
+            raise RuntimeError("CUDA out of memory")
+        rows_seen.append(int(tokens.shape[0]))
+        return original_apply(tokens, valid, lengths, *args, **kwargs)
+
+    monkeypatch.setattr(bt, "apply_merge_once", _oom_then_apply)
+
+    trainer.fit(batcher, log_every=10)
+
+    assert trainer._active_batch_size == 2
+    assert apply_calls["count"] >= 2
+    assert rows_seen and all(row <= 2 for row in rows_seen)

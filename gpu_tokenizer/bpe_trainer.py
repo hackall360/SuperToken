@@ -265,6 +265,7 @@ class GPUBPETrainer:
             Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], GPUBatchRecord]
         ] = batches
         gpu_batches: Optional[list[GPUBatchRecord]] = None
+        scale_state = None
 
         cpu_device = torch.device("cpu")
 
@@ -327,21 +328,51 @@ class GPUBPETrainer:
                     valid = valid.pin_memory()
                 yield tokens, valid, lengths
 
+        def _collect_sequences_from_mixed(
+            batches: Iterable[Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], GPUBatchRecord]]
+        ) -> list[list[int]]:
+            sequences: list[list[int]] = []
+            cpu_batches: list[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+            gpu_records: list[GPUBatchRecord] = []
+            for batch in batches:
+                if isinstance(batch, GPUBatchRecord):
+                    gpu_records.append(batch)
+                else:
+                    cpu_batches.append(batch)
+            if gpu_records:
+                sequences.extend(_extract_sequences_from_gpu(gpu_records))
+            if cpu_batches:
+                sequences.extend(_extract_sequences_from_cpu(cpu_batches))
+            return sequences
+
+        def _build_gpu_batches_from_sequences(
+            sequences: list[list[int]], batch_size: int
+        ) -> list[GPUBatchRecord]:
+            new_records: list[GPUBatchRecord] = []
+            if batch_size <= 0 or not sequences:
+                return new_records
+            for tokens_cpu, valid_cpu, lengths_cpu in _iter_cpu_batches_from_sequences(
+                sequences, batch_size, pin=True
+            ):
+                record = GPUBatchRecord.from_cpu(tokens_cpu, valid_cpu, lengths_cpu, device)
+                self._record_h2d(record.tokens, record.valid, record.lengths)
+                new_records.append(record)
+            return new_records
+
         def _reconfigure_batches(batch_size: int) -> None:
             nonlocal current_batches, gpu_batches
             if batch_size <= 0:
                 return
             if use_cuda:
-                if gpu_batches is None:
-                    return
-                sequences = _extract_sequences_from_gpu(gpu_batches)
-                new_records: list[GPUBatchRecord] = []
-                for tokens_cpu, valid_cpu, lengths_cpu in _iter_cpu_batches_from_sequences(
-                    sequences, batch_size, pin=True
-                ):
-                    record = GPUBatchRecord.from_cpu(tokens_cpu, valid_cpu, lengths_cpu, device)
-                    self._record_h2d(record.tokens, record.valid, record.lengths)
-                    new_records.append(record)
+                source_batches: Iterable[
+                    Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], GPUBatchRecord]
+                ]
+                if gpu_batches is not None:
+                    source_batches = gpu_batches
+                else:
+                    source_batches = current_batches
+                sequences = _collect_sequences_from_mixed(source_batches)
+                new_records = _build_gpu_batches_from_sequences(sequences, batch_size)
                 gpu_batches = new_records
                 current_batches = new_records
             else:
@@ -447,47 +478,83 @@ class GPUBPETrainer:
             def _count_pairs_gpu(
                 batch_iter: Iterable[Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], GPUBatchRecord]]
             ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], list[GPUBatchRecord]]:
-                global_keys: Optional[torch.Tensor] = None
-                global_counts: Optional[torch.Tensor] = None
-                consumed: list[GPUBatchRecord] = []
-                pair_results: list[tuple[torch.Tensor, torch.Tensor]] = []
-                pending_compute = False
-                for batch in batch_iter:
-                    if isinstance(batch, GPUBatchRecord):
-                        record = batch
-                    else:
-                        record = GPUBatchRecord.from_cpu(batch[0], batch[1], batch[2], device)
-                        self._record_h2d(record.tokens, record.valid, record.lengths)
-                    consumed.append(record)
-                    try:
-                        with torch.cuda.stream(compute_stream):
-                            record.wait_for_device(compute_stream)
-                            pairs, counts = count_pairs(record.tokens, record.valid)
-                        pending_compute = True
-                        pair_results.append((pairs, counts))
-                    except RuntimeError as exc:
-                        if "CUDA out of memory" in str(exc):
-                            self.autoscaler.feedback(oom=True)
-                            torch.cuda.empty_cache()
-                            continue
-                        raise
-                torch.cuda.current_stream(device).wait_stream(compute_stream)
-                if profile_streams and pending_compute:
-                    torch.cuda.synchronize(device)
-                    assert compute_stream.query(), "compute stream did not drain"
-                for pairs, counts in pair_results:
-                    if pairs.numel() == 0:
+                nonlocal current_batches, gpu_batches, scale_state
+                while True:
+                    global_keys: Optional[torch.Tensor] = None
+                    global_counts: Optional[torch.Tensor] = None
+                    consumed: list[GPUBatchRecord] = []
+                    pair_results: list[tuple[torch.Tensor, torch.Tensor]] = []
+                    pending_compute = False
+                    oom_triggered = False
+                    failed_cpu_batch: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+                    iterator = iter(batch_iter)
+                    for batch in iterator:
+                        record: Optional[GPUBatchRecord] = None
+                        try:
+                            if isinstance(batch, GPUBatchRecord):
+                                record = batch
+                            else:
+                                record = GPUBatchRecord.from_cpu(batch[0], batch[1], batch[2], device)
+                                self._record_h2d(record.tokens, record.valid, record.lengths)
+                            consumed.append(record)
+                            with torch.cuda.stream(compute_stream):
+                                record.wait_for_device(compute_stream)
+                                pairs, counts = count_pairs(record.tokens, record.valid)
+                            pending_compute = True
+                            pair_results.append((pairs, counts))
+                        except RuntimeError as exc:
+                            if "CUDA out of memory" in str(exc):
+                                oom_triggered = True
+                                if not isinstance(batch, GPUBatchRecord):
+                                    failed_cpu_batch = batch
+                                torch.cuda.empty_cache()
+                                break
+                            raise
+                    if oom_triggered:
+                        tail_batches: list[
+                            Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], GPUBatchRecord]
+                        ] = list(iterator)
+                        sequences = _extract_sequences_from_gpu(consumed) if consumed else []
+                        if failed_cpu_batch is not None:
+                            sequences.extend(_extract_sequences_from_cpu([failed_cpu_batch]))
+                        if tail_batches:
+                            sequences.extend(_collect_sequences_from_mixed(tail_batches))
+                        prev_bs = scale_state.batch_size if scale_state is not None else None
+                        self.autoscaler.feedback(oom=True)
+                        scale_state = self.autoscaler.state or scale_state
+                        if scale_state is None:
+                            raise RuntimeError("Autoscaler did not provide a state after OOM")
+                        new_bs = scale_state.batch_size
+                        if prev_bs is not None and new_bs >= prev_bs:
+                            raise RuntimeError(
+                                "CUDA OOM could not be resolved by autoscaler batch size reduction"
+                            )
+                        new_gpu_batches = _build_gpu_batches_from_sequences(sequences, new_bs)
+                        gpu_batches = new_gpu_batches
+                        current_batches = new_gpu_batches
+                        batch_iter = current_batches
+                        if on_batch_size_change is not None:
+                            on_batch_size_change(new_bs)
+                        self._active_batch_size = new_bs
                         continue
-                    a_ids = pairs[:, 0].to(torch.long)
-                    b_ids = pairs[:, 1].to(torch.long)
-                    keys = (a_ids << 32) | b_ids
-                    if global_keys is None:
-                        global_keys = keys
-                        global_counts = counts.to(torch.long)
-                    else:
-                        global_keys = torch.cat([global_keys, keys], dim=0)
-                        global_counts = torch.cat([global_counts, counts.to(torch.long)], dim=0)
-                return global_keys, global_counts, consumed
+                    torch.cuda.current_stream(device).wait_stream(compute_stream)
+                    if profile_streams and pending_compute:
+                        torch.cuda.synchronize(device)
+                        assert compute_stream.query(), "compute stream did not drain"
+                    for pairs, counts in pair_results:
+                        if pairs.numel() == 0:
+                            continue
+                        a_ids = pairs[:, 0].to(torch.long)
+                        b_ids = pairs[:, 1].to(torch.long)
+                        keys = (a_ids << 32) | b_ids
+                        if global_keys is None:
+                            global_keys = keys
+                            global_counts = counts.to(torch.long)
+                        else:
+                            global_keys = torch.cat([global_keys, keys], dim=0)
+                            global_counts = torch.cat([global_counts, counts.to(torch.long)], dim=0)
+                    gpu_batches = consumed
+                    return global_keys, global_counts, consumed
 
             def _apply_merge_gpu(
                 batch_iter: Iterable[GPUBatchRecord],
@@ -497,53 +564,77 @@ class GPUBPETrainer:
                 merge_idx: int,
                 force_sync: bool = False,
             ) -> tuple[list[GPUBatchRecord], bool, dict[str, object]]:
-                records = list(batch_iter)
+                nonlocal current_batches, gpu_batches, scale_state
                 oom_seen = False
-                need_sync = force_sync or (merge_idx % self.sync_every == 0)
-                pending_copy = False
-                pending_compute = False
-                copied_bytes = 0
-                for record in records:
-                    try:
-                        with torch.cuda.stream(compute_stream):
-                            record.wait_for_device(compute_stream)
-                            record.ensure_workspaces()
-                            apply_merge_once(
-                                record.tokens,
-                                record.valid,
-                                record.lengths,
-                                a_id,
-                                b_id,
-                                new_id,
-                                record.pair_workspace,
-                                record.prefix_workspace,
-                            )
-                            compute_event = torch.cuda.Event(blocking=False)
-                            compute_event.record(compute_stream)
-                        record.mark_device_event(compute_event)
-                        pending_compute = True
-                        if need_sync:
-                            copied_bytes += self._record_d2h(record.tokens, record.valid)
-                            record.schedule_host_sync(copy_stream)
-                            pending_copy = True
-                    except RuntimeError as exc:
-                        if "CUDA out of memory" in str(exc):
-                            oom_seen = True
-                            torch.cuda.empty_cache()
-                        else:
-                            raise
-                torch.cuda.current_stream(device).wait_stream(compute_stream)
-                if need_sync:
-                    torch.cuda.current_stream(device).wait_stream(copy_stream)
+                while True:
+                    records = list(batch_iter)
+                    need_sync = force_sync or (merge_idx % self.sync_every == 0)
+                    pending_copy = False
+                    pending_compute = False
+                    copied_bytes = 0
+                    retry_required = False
                     for record in records:
-                        record.resolve_host()
-                if profile_streams and (pending_copy or pending_compute):
-                    torch.cuda.synchronize(device)
-                    if pending_copy:
-                        assert copy_stream.query(), "copy stream did not drain"
-                    if pending_compute:
-                        assert compute_stream.query(), "compute stream did not drain"
-                return records, oom_seen, {"sync": need_sync and copied_bytes > 0, "bytes": copied_bytes}
+                        try:
+                            with torch.cuda.stream(compute_stream):
+                                record.wait_for_device(compute_stream)
+                                record.ensure_workspaces()
+                                apply_merge_once(
+                                    record.tokens,
+                                    record.valid,
+                                    record.lengths,
+                                    a_id,
+                                    b_id,
+                                    new_id,
+                                    record.pair_workspace,
+                                    record.prefix_workspace,
+                                )
+                                compute_event = torch.cuda.Event(blocking=False)
+                                compute_event.record(compute_stream)
+                            record.mark_device_event(compute_event)
+                            pending_compute = True
+                            if need_sync:
+                                copied_bytes += self._record_d2h(record.tokens, record.valid)
+                                record.schedule_host_sync(copy_stream)
+                                pending_copy = True
+                        except RuntimeError as exc:
+                            if "CUDA out of memory" in str(exc):
+                                oom_seen = True
+                                retry_required = True
+                                torch.cuda.empty_cache()
+                                break
+                            raise
+                    if retry_required:
+                        sequences = _extract_sequences_from_gpu(records)
+                        prev_bs = scale_state.batch_size if scale_state is not None else None
+                        self.autoscaler.feedback(oom=True)
+                        scale_state = self.autoscaler.state or scale_state
+                        if scale_state is None:
+                            raise RuntimeError("Autoscaler did not provide a state after OOM")
+                        new_bs = scale_state.batch_size
+                        if prev_bs is not None and new_bs >= prev_bs:
+                            raise RuntimeError(
+                                "CUDA OOM could not be resolved by autoscaler batch size reduction"
+                            )
+                        new_gpu_batches = _build_gpu_batches_from_sequences(sequences, new_bs)
+                        gpu_batches = new_gpu_batches
+                        current_batches = new_gpu_batches
+                        batch_iter = current_batches
+                        if on_batch_size_change is not None:
+                            on_batch_size_change(new_bs)
+                        self._active_batch_size = new_bs
+                        continue
+                    torch.cuda.current_stream(device).wait_stream(compute_stream)
+                    if need_sync:
+                        torch.cuda.current_stream(device).wait_stream(copy_stream)
+                        for record in records:
+                            record.resolve_host()
+                    if profile_streams and (pending_copy or pending_compute):
+                        torch.cuda.synchronize(device)
+                        if pending_copy:
+                            assert copy_stream.query(), "copy stream did not drain"
+                        if pending_compute:
+                            assert compute_stream.query(), "compute stream did not drain"
+                    return records, oom_seen, {"sync": need_sync and copied_bytes > 0, "bytes": copied_bytes}
 
         while step < self.target_merges:
             scale_state = self.autoscaler.suggest(token_bytes_per_example=int(8 * 1024))
