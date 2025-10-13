@@ -82,6 +82,72 @@ def test_fit_supports_streaming_iterator():
     assert metrics["merge_stats"]
 
 
+def test_histogram_cache_matches_baseline():
+    seqs = [
+        [1, 2, 3, 1, 2, 4],
+        [1, 2, 3, 1, 2, 3],
+        [1, 2, 4, 2, 4],
+    ]
+    baseline_batch = _make_batch(seqs)
+    delta_batch = _make_batch(seqs)
+
+    baseline_trainer = GPUBPETrainer(base_vocab=256, merges=3, device="cpu")
+    baseline_trainer._enable_histogram_cache = False
+    baseline_trainer.fit([baseline_batch], log_every=10)
+
+    delta_trainer = GPUBPETrainer(base_vocab=256, merges=3, device="cpu")
+    delta_trainer.fit([delta_batch], log_every=10)
+
+    assert baseline_trainer.merges == delta_trainer.merges
+    assert baseline_trainer.vocab_size == delta_trainer.vocab_size
+
+
+def test_histogram_delta_recounts_expected_spans(monkeypatch):
+    seqs = [
+        [1, 2, 3, 1, 2, 4],
+        [1, 2, 3, 1, 2, 3],
+    ]
+    batch = _make_batch(seqs)
+    trainer = GPUBPETrainer(base_vocab=256, merges=2, device="cpu")
+
+    original_compute = GPUBPETrainer._compute_histogram_deltas
+    calls: list[dict[str, int]] = []
+
+    def _wrapped(self, span_mask, pre_lhs, pre_rhs, pre_mask, post_lhs, post_rhs, post_mask):
+        remove_keys, remove_counts, add_keys, add_counts = original_compute(
+            self, span_mask, pre_lhs, pre_rhs, pre_mask, post_lhs, post_rhs, post_mask
+        )
+        span_bool = span_mask.to(torch.bool)
+        affected = self._expand_recount_spans(span_bool)
+        expected_remove = int((affected & pre_mask.to(torch.bool)).sum().item())
+        expected_add = int((affected & post_mask.to(torch.bool)).sum().item())
+        actual_remove = int(remove_counts.sum().item()) if remove_counts.numel() else 0
+        actual_add = int(add_counts.sum().item()) if add_counts.numel() else 0
+        calls.append(
+            {
+                "span": int(span_bool.sum().item()),
+                "affected": int(affected.sum().item()),
+                "expected_remove": expected_remove,
+                "actual_remove": actual_remove,
+                "expected_add": expected_add,
+                "actual_add": actual_add,
+            }
+        )
+        assert actual_remove == expected_remove
+        assert actual_add == expected_add
+        return remove_keys, remove_counts, add_keys, add_counts
+
+    monkeypatch.setattr(GPUBPETrainer, "_compute_histogram_deltas", _wrapped)
+
+    trainer.fit([batch], log_every=10)
+
+    assert calls, "delta recounts should be recorded"
+    assert any(entry["span"] > 0 for entry in calls)
+    for entry in calls:
+        assert entry["actual_remove"] == entry["expected_remove"]
+        assert entry["actual_add"] == entry["expected_add"]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_gpu_transfer_counters_accumulate():
     seqs = [

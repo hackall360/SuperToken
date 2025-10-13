@@ -31,6 +31,8 @@ class GPUBatchRecord:
     prefix_workspace: Optional[torch.Tensor] = None
     span_workspace: Optional[torch.Tensor] = None
     span_history: list[torch.Tensor] = field(default_factory=list)
+    pair_keys: Optional[torch.Tensor] = None
+    pair_counts: Optional[torch.Tensor] = None
 
 
     @classmethod
@@ -263,6 +265,11 @@ class GPUBPETrainer:
         self._interval_merges: int = 0
         self._active_batch_size: int | None = None
         self._device_contexts: Dict[torch.device, DeviceContext] = {}
+        self._enable_histogram_cache: bool = True
+        self._cached_pair_keys: torch.Tensor = torch.empty((0,), dtype=torch.long)
+        self._cached_pair_counts: torch.Tensor = torch.empty((0,), dtype=torch.long)
+        self._hist_cache_valid: bool = False
+        self._force_recount: bool = True
 
     # ------------------------------------------------------------------
     # Transfer accounting helpers
@@ -332,6 +339,130 @@ class GPUBPETrainer:
         )
         self._interval_merges = 0
 
+    def _reset_histogram_cache(self) -> None:
+        self._cached_pair_keys = torch.empty((0,), dtype=torch.long)
+        self._cached_pair_counts = torch.empty((0,), dtype=torch.long)
+        self._hist_cache_valid = False
+        self._force_recount = True
+
+    def _invalidate_hist_cache(self) -> None:
+        self._hist_cache_valid = False
+        self._force_recount = True
+
+    def _expand_recount_spans(self, span_mask: torch.Tensor) -> torch.Tensor:
+        if span_mask.numel() == 0:
+            return span_mask
+        prev = torch.zeros_like(span_mask, dtype=torch.bool)
+        if span_mask.shape[-1] > 0:
+            prev[:, :-1] = span_mask[:, 1:].to(torch.bool)
+        return span_mask.to(torch.bool) | prev
+
+    def _compute_histogram_deltas(
+        self,
+        span_mask: torch.Tensor,
+        pre_lhs: torch.Tensor,
+        pre_rhs: torch.Tensor,
+        pre_mask: torch.Tensor,
+        post_lhs: torch.Tensor,
+        post_rhs: torch.Tensor,
+        post_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if span_mask.numel() == 0:
+            empty_keys = torch.empty((0,), dtype=torch.long)
+            empty_counts = torch.empty((0,), dtype=torch.long)
+            return (
+                empty_keys,
+                empty_counts,
+                torch.empty((0,), dtype=torch.long),
+                torch.empty((0,), dtype=torch.long),
+            )
+
+        affected = self._expand_recount_spans(span_mask)
+        pre_mask_bool = pre_mask.to(torch.bool)
+        post_mask_bool = post_mask.to(torch.bool)
+
+        remove_mask = affected & pre_mask_bool
+        add_mask = affected & post_mask_bool
+
+        device = torch.device("cpu")
+
+        if remove_mask.any():
+            remove_keys = (pre_lhs[remove_mask].to(torch.long) << 32) | pre_rhs[remove_mask].to(torch.long)
+            remove_keys = remove_keys.to(device=device)
+            remove_counts = torch.ones((remove_keys.numel(),), dtype=torch.long, device=device)
+            remove_keys, remove_counts = aggregate_pair_keys(remove_keys, remove_counts)
+        else:
+            remove_keys = torch.empty((0,), dtype=torch.long, device=device)
+            remove_counts = torch.empty((0,), dtype=torch.long, device=device)
+
+        if add_mask.any():
+            add_keys = (post_lhs[add_mask].to(torch.long) << 32) | post_rhs[add_mask].to(torch.long)
+            add_keys = add_keys.to(device=device)
+            add_counts = torch.ones((add_keys.numel(),), dtype=torch.long, device=device)
+            add_keys, add_counts = aggregate_pair_keys(add_keys, add_counts)
+        else:
+            add_keys = torch.empty((0,), dtype=torch.long, device=device)
+            add_counts = torch.empty((0,), dtype=torch.long, device=device)
+
+        return remove_keys, remove_counts, add_keys, add_counts
+
+    @staticmethod
+    def _merge_histogram(
+        base_keys: torch.Tensor,
+        base_counts: torch.Tensor,
+        delta_keys: torch.Tensor,
+        delta_counts: torch.Tensor,
+        sign: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if delta_keys.numel() == 0:
+            return base_keys, base_counts
+        if base_keys.numel() == 0 and sign < 0:
+            return base_keys, base_counts
+        if base_keys.numel() == 0:
+            return delta_keys.clone(), delta_counts.clone()
+        signed_delta = delta_counts.clone()
+        if sign < 0:
+            signed_delta = -signed_delta
+        combined_keys = torch.cat([base_keys, delta_keys], dim=0)
+        combined_counts = torch.cat([base_counts, signed_delta], dim=0)
+        merged_keys, merged_counts = aggregate_pair_keys(combined_keys, combined_counts)
+        if merged_keys.numel() == 0:
+            return merged_keys, merged_counts
+        mask = merged_counts > 0
+        if mask.all():
+            return merged_keys, merged_counts
+        return merged_keys[mask], merged_counts[mask]
+
+    @classmethod
+    def _apply_histogram_delta(
+        cls,
+        base_keys: torch.Tensor,
+        base_counts: torch.Tensor,
+        remove_keys: torch.Tensor,
+        remove_counts: torch.Tensor,
+        add_keys: torch.Tensor,
+        add_counts: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        keys, counts = cls._merge_histogram(base_keys, base_counts, remove_keys, remove_counts, -1)
+        keys, counts = cls._merge_histogram(keys, counts, add_keys, add_counts, 1)
+        return keys, counts
+
+    def _update_global_histogram(
+        self,
+        remove_keys: torch.Tensor,
+        remove_counts: torch.Tensor,
+        add_keys: torch.Tensor,
+        add_counts: torch.Tensor,
+    ) -> None:
+        self._cached_pair_keys, self._cached_pair_counts = self._apply_histogram_delta(
+            self._cached_pair_keys,
+            self._cached_pair_counts,
+            remove_keys,
+            remove_counts,
+            add_keys,
+            add_counts,
+        )
+
     def fit(
         self,
         batches: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
@@ -342,12 +473,20 @@ class GPUBPETrainer:
         """Train merges using a pipelined GPU workflow when possible."""
 
         self._reset_transfer_counters()
+        self._reset_histogram_cache()
         self._active_batch_size = None
         step = 0
         current_batches: Iterable[
             Union[
                 Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
                 Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]],
+                Tuple[
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                    list[torch.Tensor],
+                    Optional[tuple[torch.Tensor, torch.Tensor]],
+                ],
                 MultiDeviceBatch,
             ]
         ] = batches
@@ -358,23 +497,52 @@ class GPUBPETrainer:
 
         def _unpack_cpu_batch(
             batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-            | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]],
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+            | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+            | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor], tuple[torch.Tensor, torch.Tensor] | None],
+        ) -> tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            list[torch.Tensor],
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+        ]:
             tokens_cpu = batch[0]
             valid_cpu = batch[1]
             lengths_cpu = batch[2]
             spans = batch[3] if len(batch) > 3 else []
             if not isinstance(spans, list):
                 spans = list(spans)
-            return tokens_cpu, valid_cpu, lengths_cpu, spans
+            pair_keys: Optional[torch.Tensor] = None
+            pair_counts: Optional[torch.Tensor] = None
+            if len(batch) > 4 and batch[4] is not None:
+                pair_keys, pair_counts = batch[4]
+            return tokens_cpu, valid_cpu, lengths_cpu, spans, pair_keys, pair_counts
 
         def _pack_cpu_batch(
             tokens_cpu: torch.Tensor,
             valid_cpu: torch.Tensor,
             lengths_cpu: torch.Tensor,
             spans: list[torch.Tensor] | None = None,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]:
-            return tokens_cpu, valid_cpu, lengths_cpu, [] if spans is None else spans
+            pair_keys: Optional[torch.Tensor] = None,
+            pair_counts: Optional[torch.Tensor] = None,
+        ) -> tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            list[torch.Tensor],
+            Optional[tuple[torch.Tensor, torch.Tensor]],
+        ]:
+            pair_tuple: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+            if pair_keys is not None and pair_counts is not None:
+                pair_tuple = (pair_keys, pair_counts)
+            return (
+                tokens_cpu,
+                valid_cpu,
+                lengths_cpu,
+                [] if spans is None else spans,
+                pair_tuple,
+            )
 
         def _extract_sequences_from_cpu(
             cpu_batches: Iterable[
@@ -384,7 +552,7 @@ class GPUBPETrainer:
         ) -> list[list[int]]:
             sequences: list[list[int]] = []
             for batch in cpu_batches:
-                tokens_cpu, _valid_cpu, lengths_cpu, _ = _unpack_cpu_batch(batch)
+                tokens_cpu, _valid_cpu, lengths_cpu, _, _, _ = _unpack_cpu_batch(batch)
                 rows = int(tokens_cpu.shape[0])
                 for row in range(rows):
                     length = int(lengths_cpu[row].item())
@@ -407,7 +575,15 @@ class GPUBPETrainer:
             sequences: list[list[int]],
             batch_size: int,
             pin: bool,
-        ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]]:
+        ) -> Iterator[
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                list[torch.Tensor],
+                Optional[tuple[torch.Tensor, torch.Tensor]],
+            ]
+        ]:
             if batch_size <= 0:
                 return
             for start in range(0, len(sequences), batch_size):
@@ -430,7 +606,7 @@ class GPUBPETrainer:
                 if pin:
                     tokens = tokens.pin_memory()
                     valid = valid.pin_memory()
-                yield tokens, valid, lengths, []
+                yield tokens, valid, lengths, [], None
 
         def _collect_sequences_from_mixed(
             batches_iter: Iterable[
@@ -544,6 +720,7 @@ class GPUBPETrainer:
                 ):
                     cpu_batches.append(cpu_batch)
                 current_batches = cpu_batches
+            self._invalidate_hist_cache()
             if on_batch_size_change is not None:
                 on_batch_size_change(batch_size)
 
@@ -551,36 +728,95 @@ class GPUBPETrainer:
             batch_iter: Iterable[
                 Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
                 | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+                | Tuple[
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                    list[torch.Tensor],
+                    Optional[tuple[torch.Tensor, torch.Tensor]],
+                ]
             ]
         ) -> tuple[
             Optional[torch.Tensor],
             Optional[torch.Tensor],
-            list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]],
+            list[
+                tuple[
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                    list[torch.Tensor],
+                    Optional[tuple[torch.Tensor, torch.Tensor]],
+                ]
+            ],
         ]:
-            global_keys: Optional[torch.Tensor] = None
-            global_counts: Optional[torch.Tensor] = None
-            consumed: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]] = []
-            for batch in batch_iter:
-                x_cpu, v_cpu, lengths_cpu, spans = _unpack_cpu_batch(batch)
+            batches = list(batch_iter)
+            if (
+                self._enable_histogram_cache
+                and self._hist_cache_valid
+                and not self._force_recount
+            ):
+                return (
+                    self._cached_pair_keys.clone(),
+                    self._cached_pair_counts.clone(),
+                    batches,
+                )
+
+            global_keys: list[torch.Tensor] = []
+            global_counts: list[torch.Tensor] = []
+            consumed: list[
+                tuple[
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                    list[torch.Tensor],
+                    Optional[tuple[torch.Tensor, torch.Tensor]],
+                ]
+            ] = []
+            for batch in batches:
+                x_cpu, v_cpu, lengths_cpu, spans, _, _ = _unpack_cpu_batch(batch)
                 x_snapshot = x_cpu.clone()
                 v_snapshot = v_cpu.clone()
                 lengths_snapshot = lengths_cpu.clone()
-                consumed.append(
-                    _pack_cpu_batch(x_snapshot, v_snapshot, lengths_snapshot, list(spans))
-                )
                 pairs, counts = count_pairs(x_snapshot.to(cpu_device), v_snapshot.to(cpu_device))
-                if pairs.numel() == 0:
-                    continue
-                a_ids = pairs[:, 0].to(torch.long)
-                b_ids = pairs[:, 1].to(torch.long)
-                keys = (a_ids << 32) | b_ids
-                if global_keys is None:
-                    global_keys = keys
-                    global_counts = counts.to(torch.long)
+                if pairs.numel() > 0:
+                    a_ids = pairs[:, 0].to(torch.long)
+                    b_ids = pairs[:, 1].to(torch.long)
+                    keys = ((a_ids << 32) | b_ids).to(torch.long).to("cpu")
+                    counts_cpu = counts.to(torch.long).to("cpu")
                 else:
-                    global_keys = torch.cat([global_keys, keys], dim=0)
-                    global_counts = torch.cat([global_counts, counts.to(torch.long)], dim=0)
-            return global_keys, global_counts, consumed
+                    keys = torch.empty((0,), dtype=torch.long)
+                    counts_cpu = torch.empty((0,), dtype=torch.long)
+                consumed.append(
+                    _pack_cpu_batch(
+                        x_snapshot,
+                        v_snapshot,
+                        lengths_snapshot,
+                        list(spans),
+                        keys,
+                        counts_cpu,
+                    )
+                )
+                if keys.numel() > 0:
+                    global_keys.append(keys)
+                    global_counts.append(counts_cpu)
+
+            if global_keys:
+                combined_keys = torch.cat(global_keys, dim=0)
+                combined_counts = torch.cat(global_counts, dim=0)
+                reduced_keys, reduced_counts = aggregate_pair_keys(
+                    combined_keys, combined_counts
+                )
+            else:
+                reduced_keys = torch.empty((0,), dtype=torch.long)
+                reduced_counts = torch.empty((0,), dtype=torch.long)
+
+            self._cached_pair_keys = reduced_keys.clone()
+            self._cached_pair_counts = reduced_counts.clone()
+            self._hist_cache_valid = True
+            self._force_recount = False
+            if not self._enable_histogram_cache:
+                self._invalidate_hist_cache()
+            return reduced_keys.clone(), reduced_counts.clone(), consumed
 
         def _apply_merge_cpu(
             batch_iter: Iterable[
@@ -603,7 +839,14 @@ class GPUBPETrainer:
             prefix_workspace: Optional[torch.Tensor] = None
             span_workspace: Optional[torch.Tensor] = None
             for batch in batch_iter:
-                x_cpu, v_cpu, lengths_cpu, spans = _unpack_cpu_batch(batch)
+                (
+                    x_cpu,
+                    v_cpu,
+                    lengths_cpu,
+                    spans,
+                    pair_keys,
+                    pair_counts,
+                ) = _unpack_cpu_batch(batch)
                 try:
                     B, L = x_cpu.shape
                     width = max(L - 1, 0)
@@ -613,6 +856,19 @@ class GPUBPETrainer:
                         prefix_workspace = torch.zeros((B,), dtype=torch.long, device=cpu_device)
                     if span_workspace is None or span_workspace.shape != (B, width):
                         span_workspace = torch.zeros((B, width), dtype=torch.bool, device=cpu_device)
+                    if (
+                        self._enable_histogram_cache
+                        and self._hist_cache_valid
+                        and width > 0
+                    ):
+                        pre_lhs = x_cpu[:, :-1].clone()
+                        pre_rhs = x_cpu[:, 1:].clone()
+                        pre_mask = (
+                            v_cpu[:, :-1].to(torch.bool).clone()
+                            & v_cpu[:, 1:].to(torch.bool).clone()
+                        )
+                    else:
+                        pre_lhs = pre_rhs = pre_mask = None
                     _, _, _, span_mask = apply_merge_once(
                         x_cpu,
                         v_cpu,
@@ -624,18 +880,76 @@ class GPUBPETrainer:
                         prefix_workspace,
                         span_workspace,
                     )
+                    span_bool = span_mask.to(torch.bool).clone()
                     updated_spans = list(spans)
-                    updated_spans.append(span_mask.to(torch.bool).clone())
+                    updated_spans.append(span_bool)
+                    if (
+                        self._enable_histogram_cache
+                        and self._hist_cache_valid
+                        and width > 0
+                        and pre_lhs is not None
+                        and pre_rhs is not None
+                        and pre_mask is not None
+                    ):
+                        post_lhs = x_cpu[:, :-1]
+                        post_rhs = x_cpu[:, 1:]
+                        post_mask = v_cpu[:, :-1].to(torch.bool) & v_cpu[:, 1:].to(torch.bool)
+                        remove_keys, remove_counts, add_keys, add_counts = self._compute_histogram_deltas(
+                            span_bool,
+                            pre_lhs,
+                            pre_rhs,
+                            pre_mask,
+                            post_lhs,
+                            post_rhs,
+                            post_mask,
+                        )
+                        if pair_keys is None or pair_counts is None:
+                            pair_keys = torch.empty((0,), dtype=torch.long)
+                            pair_counts = torch.empty((0,), dtype=torch.long)
+                        pair_keys, pair_counts = self._apply_histogram_delta(
+                            pair_keys,
+                            pair_counts,
+                            remove_keys,
+                            remove_counts,
+                            add_keys,
+                            add_counts,
+                        )
+                        self._update_global_histogram(
+                            remove_keys, remove_counts, add_keys, add_counts
+                        )
+                    else:
+                        if self._enable_histogram_cache and width > 0:
+                            self._invalidate_hist_cache()
+                        pair_keys = pair_keys if pair_keys is not None else torch.empty((0,), dtype=torch.long)
+                        pair_counts = (
+                            pair_counts if pair_counts is not None else torch.empty((0,), dtype=torch.long)
+                        )
                     new_batches.append(
-                        _pack_cpu_batch(x_cpu.clone(), v_cpu.clone(), lengths_cpu.clone(), updated_spans)
+                        _pack_cpu_batch(
+                            x_cpu.clone(),
+                            v_cpu.clone(),
+                            lengths_cpu.clone(),
+                            updated_spans,
+                            pair_keys.clone(),
+                            pair_counts.clone(),
+                        )
                     )
                 except RuntimeError as exc:
                     if "CUDA out of memory" in str(exc):
                         oom_seen = True
                         torch.cuda.empty_cache()
-                        new_batches.append(_pack_cpu_batch(x_cpu, v_cpu, lengths_cpu, list(spans)))
-                    else:
-                        raise
+                        new_batches.append(
+                            _pack_cpu_batch(
+                                x_cpu,
+                                v_cpu,
+                                lengths_cpu,
+                                list(spans),
+                                pair_keys,
+                                pair_counts,
+                            )
+                        )
+                else:
+                    raise
             return new_batches, oom_seen, {"sync": True, "bytes": 0}
 
         if use_cuda:
@@ -673,6 +987,18 @@ class GPUBPETrainer:
                 ]
             ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], list[MultiDeviceBatch]]:
                 nonlocal current_batches, gpu_batches, scale_state
+                if (
+                    self._enable_histogram_cache
+                    and self._hist_cache_valid
+                    and not self._force_recount
+                ):
+                    realized = list(batch_iter)
+                    _mark_active_batches(realized)
+                    return (
+                        self._cached_pair_keys.clone(),
+                        self._cached_pair_counts.clone(),
+                        realized,
+                    )
                 while True:
                     for ctx in device_contexts.values():
                         ctx.reset_activity()
@@ -712,6 +1038,20 @@ class GPUBPETrainer:
                                         pairs, counts = count_pairs(shard.tokens, shard.valid)
                                     pair_results[dev].append((pairs, counts))
                                     pending_compute[dev] = True
+                                    if self._enable_histogram_cache:
+                                        if pairs.numel() > 0:
+                                            a_ids = pairs[:, 0].to(torch.long)
+                                            b_ids = pairs[:, 1].to(torch.long)
+                                            keys_cpu = ((a_ids << 32) | b_ids).to(torch.long).to("cpu")
+                                            counts_cpu = counts.to(torch.long).to("cpu")
+                                        else:
+                                            keys_cpu = torch.empty((0,), dtype=torch.long)
+                                            counts_cpu = torch.empty((0,), dtype=torch.long)
+                                        shard.pair_keys = keys_cpu
+                                        shard.pair_counts = counts_cpu
+                                    else:
+                                        shard.pair_keys = None
+                                        shard.pair_counts = None
                                 except RuntimeError as exc:
                                     if "CUDA out of memory" in str(exc):
                                         oom_triggered = True
@@ -750,6 +1090,7 @@ class GPUBPETrainer:
                         if on_batch_size_change is not None:
                             on_batch_size_change(new_bs)
                         self._active_batch_size = new_bs
+                        self._invalidate_hist_cache()
                         continue
                     for dev, ctx in device_contexts.items():
                         if pending_compute.get(dev):
@@ -779,7 +1120,19 @@ class GPUBPETrainer:
                         reduced_keys = None
                         reduced_counts = None
                     gpu_batches = consumed
-                    return reduced_keys, reduced_counts, consumed
+                    if reduced_keys is None or reduced_counts is None:
+                        cached_keys = torch.empty((0,), dtype=torch.long)
+                        cached_counts = torch.empty((0,), dtype=torch.long)
+                    else:
+                        cached_keys = reduced_keys.to(torch.long).to("cpu")
+                        cached_counts = reduced_counts.to(torch.long).to("cpu")
+                    self._cached_pair_keys = cached_keys.clone()
+                    self._cached_pair_counts = cached_counts.clone()
+                    self._hist_cache_valid = True
+                    self._force_recount = False
+                    if not self._enable_histogram_cache:
+                        self._invalidate_hist_cache()
+                    return cached_keys, cached_counts, consumed
 
             def _apply_merge_gpu(
                 batch_iter: Iterable[MultiDeviceBatch],
@@ -810,6 +1163,20 @@ class GPUBPETrainer:
                                 with torch.cuda.device(dev), torch.cuda.stream(ctx.compute_stream):
                                     shard.wait_for_device(ctx.compute_stream)
                                     shard.ensure_workspaces()
+                                    width = max(shard.tokens.shape[1] - 1, 0)
+                                    if (
+                                        self._enable_histogram_cache
+                                        and self._hist_cache_valid
+                                        and width > 0
+                                    ):
+                                        pre_lhs = shard.tokens[:, :-1].clone()
+                                        pre_rhs = shard.tokens[:, 1:].clone()
+                                        pre_mask = (
+                                            shard.valid[:, :-1].to(torch.bool).clone()
+                                            & shard.valid[:, 1:].to(torch.bool).clone()
+                                        )
+                                    else:
+                                        pre_lhs = pre_rhs = pre_mask = None
                                     _, _, _, span_mask = apply_merge_once(
                                         shard.tokens,
                                         shard.valid,
@@ -821,7 +1188,53 @@ class GPUBPETrainer:
                                         shard.prefix_workspace,
                                         shard.span_workspace,
                                     )
-                                    shard.span_history.append(span_mask.to(torch.bool).clone())
+                                    span_bool = span_mask.to(torch.bool).clone()
+                                    shard.span_history.append(span_bool)
+                                    if (
+                                        self._enable_histogram_cache
+                                        and self._hist_cache_valid
+                                        and width > 0
+                                        and pre_lhs is not None
+                                        and pre_rhs is not None
+                                        and pre_mask is not None
+                                    ):
+                                        post_lhs = shard.tokens[:, :-1]
+                                        post_rhs = shard.tokens[:, 1:]
+                                        post_mask = shard.valid[:, :-1].to(torch.bool) & shard.valid[:, 1:].to(torch.bool)
+                                        (
+                                            remove_keys,
+                                            remove_counts,
+                                            add_keys,
+                                            add_counts,
+                                        ) = self._compute_histogram_deltas(
+                                            span_bool,
+                                            pre_lhs,
+                                            pre_rhs,
+                                            pre_mask,
+                                            post_lhs,
+                                            post_rhs,
+                                            post_mask,
+                                        )
+                                        if shard.pair_keys is None or shard.pair_counts is None:
+                                            shard.pair_keys = torch.empty((0,), dtype=torch.long)
+                                            shard.pair_counts = torch.empty((0,), dtype=torch.long)
+                                        shard.pair_keys, shard.pair_counts = self._apply_histogram_delta(
+                                            shard.pair_keys,
+                                            shard.pair_counts,
+                                            remove_keys,
+                                            remove_counts,
+                                            add_keys,
+                                            add_counts,
+                                        )
+                                        self._update_global_histogram(
+                                            remove_keys, remove_counts, add_keys, add_counts
+                                        )
+                                    elif self._enable_histogram_cache and width > 0:
+                                        self._invalidate_hist_cache()
+                                        if shard.pair_keys is None:
+                                            shard.pair_keys = torch.empty((0,), dtype=torch.long)
+                                        if shard.pair_counts is None:
+                                            shard.pair_counts = torch.empty((0,), dtype=torch.long)
                                     compute_event = torch.cuda.Event(blocking=False)
                                     compute_event.record(ctx.compute_stream)
                                 shard.mark_device_event(compute_event)
@@ -861,6 +1274,7 @@ class GPUBPETrainer:
                         if on_batch_size_change is not None:
                             on_batch_size_change(new_bs)
                         self._active_batch_size = new_bs
+                        self._invalidate_hist_cache()
                         continue
                     for dev, ctx in device_contexts.items():
                         torch.cuda.current_stream(device=dev).wait_stream(ctx.compute_stream)
