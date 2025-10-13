@@ -33,7 +33,7 @@ def main() -> None:
     scaler = AutoScaler(target_util=0.80)
     init = scaler.suggest(token_bytes_per_example=8 * 1024)
     bs = min(args.bs, init.batch_size)
-    batcher = list(PackedBatcher(seqs, batch_size=bs))
+    batcher = PackedBatcher(seqs, batch_size=bs)
 
     trainer = GPUBPETrainer(base_vocab=256, merges=args.merges, autoscaler=scaler)
     meta = trainer.fit(batcher, log_every=100)

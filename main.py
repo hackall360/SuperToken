@@ -47,12 +47,12 @@ def _load_sequences(paths: Iterable[Path], bos: int | None, eos: int | None) -> 
     return [packer.encode_file(str(path)) for path in paths]
 
 
-def _build_packed_batches(
+def _iter_packed_batches(
     sequences: list[list[int]],
     batch_size: int,
     seed: int,
-) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    return list(PackedBatcher(sequences, batch_size=batch_size, seed=seed))
+) -> Iterable[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    return PackedBatcher(sequences, batch_size=batch_size, seed=seed)
 
 
 def _build_unigram_batches(
@@ -61,7 +61,7 @@ def _build_unigram_batches(
     seed: int,
 ) -> list[torch.Tensor]:
     packed = PackedBatcher(sequences, batch_size=batch_size, seed=seed)
-    return [x for (x, _mask) in packed]
+    return [x for (x, _mask, _lengths) in packed]
 
 
 def _cmd_train_bpe(args: argparse.Namespace) -> None:
@@ -75,7 +75,7 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
     )
     suggestion = autoscaler.suggest(token_bytes_per_example=args.token_bytes)
     batch_size = min(args.max_batch, max(args.min_batch, suggestion.batch_size))
-    batches = _build_packed_batches(sequences, batch_size=batch_size, seed=args.seed)
+    batches = _iter_packed_batches(sequences, batch_size=batch_size, seed=args.seed)
 
     trainer = GPUBPETrainer(
         base_vocab=args.base_vocab,
