@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import math
 import os
+from collections import deque
 from dataclasses import dataclass
-from typing import Optional
+from typing import Deque, Optional
 
 try:  # pragma: no cover - optional dependency
     import psutil  # type: ignore
@@ -12,6 +16,9 @@ except Exception:  # pragma: no cover - fallback when psutil missing
     psutil = None
 
 import torch
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -32,6 +39,7 @@ class AutoScaler:
         min_workers: int = 2,
         max_workers: Optional[int] = None,
         init_h2d_mb: int = 512,
+        window_size: int = 10,
         device: Optional[str] = None,
     ) -> None:
         self.tu = float(max(0.1, min(target_util, 0.95)))
@@ -41,6 +49,9 @@ class AutoScaler:
         self.max_workers = max_workers or max(min_workers, os.cpu_count() or 4)
         self.state: Optional[ScaleState] = None
         self._h2d_mb = init_h2d_mb
+        self._window_size = max(3, window_size)
+        self._step_times: Deque[float] = deque(maxlen=self._window_size)
+        self._vram_fracs: Deque[float] = deque(maxlen=self._window_size)
 
     def _gpu_caps(self) -> tuple[int, int]:
         if self.device == "cpu" or not torch.cuda.is_available():
@@ -82,33 +93,120 @@ class AutoScaler:
         if self.state is None:
             return
         if oom:
+            prev = self.state
             self.state = ScaleState(
                 batch_size=max(self.min_bs, self.state.batch_size // 2),
                 cpu_workers=max(self.min_workers, self.state.cpu_workers - 1),
                 h2d_mb=self.state.h2d_mb,
             )
+            self._log_adjustment(prev, self.state, event="oom")
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             return
         free, total = self._gpu_caps()
         if total == 0:
             return
-        headroom = free / (total + 1e-9)
-        target_head = 1.0 - self.tu
-        if headroom > target_head + 0.10:
-            self.state = ScaleState(
-                batch_size=min(self.max_bs, int(self.state.batch_size * 1.25)),
-                cpu_workers=min(self.max_workers, self.state.cpu_workers + 1),
-                h2d_mb=min(8192, int(self.state.h2d_mb * 1.2)),
-            )
-        elif headroom < target_head - 0.05:
-            self.state = ScaleState(
-                batch_size=max(self.min_bs, int(self.state.batch_size * 0.9)),
-                cpu_workers=max(self.min_workers, self.state.cpu_workers - 1),
-                h2d_mb=max(256, int(self.state.h2d_mb * 0.9)),
-            )
-        if step_time_s is not None:
+        used = max(0, total - free)
+        self._record_metrics(step_time_s, used, total)
+        if len(self._vram_fracs) < max(3, self._window_size // 2):
+            return
+        mean_vram, var_vram = self._stats(self._vram_fracs)
+        mean_step, _ = self._stats(self._step_times)
+        prev_state = self.state
+        new_state = self._tuned_state(mean_vram, var_vram, mean_step)
+        if new_state != prev_state:
+            self.state = new_state
             self._h2d_mb = self.state.h2d_mb
+            self._log_adjustment(prev_state, new_state, mean_vram, var_vram, mean_step)
+
+    def _record_metrics(self, step_time_s: float | None, used_bytes: int, total_bytes: int) -> None:
+        if step_time_s is not None and math.isfinite(step_time_s):
+            self._step_times.append(float(step_time_s))
+        if total_bytes > 0:
+            frac = max(0.0, min(1.0, used_bytes / float(total_bytes)))
+            self._vram_fracs.append(frac)
+
+    def _stats(self, values: Deque[float]) -> tuple[float, float]:
+        if not values:
+            return 0.0, 0.0
+        mean = sum(values) / len(values)
+        var = 0.0
+        if len(values) > 1:
+            var = sum((v - mean) ** 2 for v in values) / len(values)
+        return mean, var
+
+    def _scale_from_gap(self, gap: float, variance: float) -> float:
+        if gap <= 0:
+            return 0.0
+        base = min(0.25, max(0.05, gap * 0.6))
+        if variance > 0.01:
+            base *= 0.3
+        elif variance > 0.005:
+            base *= 0.5
+        return base
+
+    def _tuned_state(
+        self,
+        mean_vram: float,
+        var_vram: float,
+        mean_step: float,
+    ) -> ScaleState:
+        lower_bound = max(0.75, self.tu - 0.05)
+        upper_bound = min(0.95, self.tu + 0.10)
+        new_bs = self.state.batch_size
+        new_workers = self.state.cpu_workers
+        new_h2d = self.state.h2d_mb
+        if mean_vram < lower_bound:
+            gap = lower_bound - mean_vram
+            scale = self._scale_from_gap(gap, var_vram)
+            if scale > 0:
+                new_bs = min(self.max_bs, max(self.min_bs, int(self.state.batch_size * (1 + scale))))
+                new_workers = min(
+                    self.max_workers,
+                    max(self.min_workers, int(round(self.state.cpu_workers * (1 + scale * 0.5)))),
+                )
+                h2d_scale = max(0.02, scale * 0.5)
+                new_h2d = min(8192, max(256, int(self.state.h2d_mb * (1 + h2d_scale))))
+        elif mean_vram > upper_bound:
+            gap = mean_vram - upper_bound
+            scale = self._scale_from_gap(gap, var_vram)
+            if scale > 0:
+                new_bs = max(self.min_bs, int(self.state.batch_size * (1 - scale)))
+                new_workers = max(self.min_workers, int(self.state.cpu_workers * (1 - scale * 0.5)))
+                h2d_scale = max(0.02, scale * 0.5)
+                new_h2d = max(256, int(self.state.h2d_mb * (1 - h2d_scale)))
+        if mean_step > 0 and len(self._step_times) >= self._window_size:
+            # Light smoothing: if step times are trending up, avoid aggressive growth
+            recent = list(self._step_times)[-3:]
+            if len(recent) >= 3 and recent[-1] > recent[0] * 1.1 and new_bs > self.state.batch_size:
+                new_bs = max(self.state.batch_size, int((self.state.batch_size + new_bs) / 2))
+        return ScaleState(batch_size=new_bs, cpu_workers=new_workers, h2d_mb=new_h2d)
+
+    def _log_adjustment(
+        self,
+        prev: ScaleState,
+        new: ScaleState,
+        mean_vram: float | None = None,
+        var_vram: float | None = None,
+        mean_step: float | None = None,
+        event: str = "feedback",
+    ) -> None:
+        payload = {
+            "event": event,
+            "batch_size": new.batch_size,
+            "prev_batch_size": prev.batch_size,
+            "h2d_mb": new.h2d_mb,
+            "prev_h2d_mb": prev.h2d_mb,
+            "cpu_workers": new.cpu_workers,
+            "prev_cpu_workers": prev.cpu_workers,
+        }
+        if mean_vram is not None:
+            payload["mean_vram_util"] = round(mean_vram, 4)
+        if var_vram is not None:
+            payload["var_vram_util"] = round(var_vram, 6)
+        if mean_step is not None and mean_step > 0:
+            payload["mean_step_time_s"] = round(mean_step, 4)
+        logger.info("autoscale.adjust %s", json.dumps(payload, sort_keys=True))
 
 
 __all__ = ["AutoScaler", "ScaleState"]
