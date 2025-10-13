@@ -43,12 +43,11 @@ def _aggregate_pair_keys(
     prefix = torch.cat(
         [torch.zeros((1,), dtype=sorted_counts.dtype, device=device), torch.cumsum(sorted_counts, dim=0)]
     )
-    # Starts are after the previous unique position; ends are at the current unique position
-    starts = torch.cat([
-        torch.zeros((1,), dtype=pos.dtype, device=device), pos[:-1] + 1
-    ])
-    ends = pos
-    aggregated_counts = prefix[ends + 1] - prefix[starts]
+    # Next boundaries are the subsequent start positions (or the end of the array)
+    next_pos = torch.cat(
+        [pos[1:], torch.tensor([sorted_keys.numel()], dtype=pos.dtype, device=device)]
+    )
+    aggregated_counts = prefix[next_pos] - prefix[pos]
     aggregated_keys = sorted_keys[pos]
     return aggregated_keys, aggregated_counts
 
