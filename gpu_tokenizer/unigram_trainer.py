@@ -17,6 +17,9 @@ class GPUUnigramTrainer:
         vocab_size: int = 50_000,
         max_subword_len: int = 8,
         device: str | None = None,
+        *,
+        seed: int | None = None,
+        generator: torch.Generator | None = None,
     ) -> None:
         self.base_vocab = base_vocab
         self.target_vocab = vocab_size
@@ -25,6 +28,50 @@ class GPUUnigramTrainer:
         self.id2piece: Dict[int, bytes] = {i: bytes([i]) for i in range(base_vocab)}
         self.piece2id: Dict[bytes, int] = {bytes([i]): i for i in range(base_vocab)}
         self.logp = torch.full((base_vocab,), -math.log(base_vocab), device=self.device)
+        self._rng_template_state: torch.Tensor | None = None
+        self._rng_template_device: torch.device | None = None
+        self.reset_rng(seed=seed, generator=generator)
+
+    def _clone_generator(self, generator: torch.Generator) -> torch.Generator:
+        cloned = torch.Generator(device=generator.device)
+        cloned.set_state(generator.get_state())
+        return cloned
+
+    def _create_generator(
+        self,
+        *,
+        seed: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> torch.Generator:
+        if generator is not None:
+            return self._clone_generator(generator)
+        new_gen = torch.Generator(device=torch.device("cpu"))
+        if seed is not None:
+            new_gen.manual_seed(seed)
+        return new_gen
+
+    def reset_rng(
+        self,
+        *,
+        seed: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> None:
+        """Reset the trainer's RNG to a deterministic state.
+
+        Providing ``seed`` or ``generator`` establishes the template state that
+        subsequent calls without arguments will restore, making it easy to keep
+        multi-epoch runs reproducible by invoking ``reset_rng()`` at the start of
+        each epoch.
+        """
+
+        if seed is not None or generator is not None or self._rng_template_state is None:
+            self._rng = self._create_generator(seed=seed, generator=generator)
+            self._rng_template_state = self._rng.get_state()
+            self._rng_template_device = self._rng.device
+        else:
+            assert self._rng_template_device is not None  # ``_rng_template_state`` guards this path.
+            self._rng = torch.Generator(device=self._rng_template_device)
+            self._rng.set_state(self._rng_template_state.clone())
 
     def _extend_candidates(self, sequences: torch.Tensor) -> None:
         B, L = sequences.shape
@@ -42,7 +89,10 @@ class GPUUnigramTrainer:
             if idx.numel() == 0:
                 continue
             take = min(idx.size(0), 1_000_000)
-            idx = idx[torch.randperm(idx.size(0), device=idx.device)[:take]]
+            idx_cpu = idx.to("cpu")
+            perm = torch.randperm(idx_cpu.size(0), device=torch.device("cpu"), generator=self._rng)
+            idx_cpu = idx_cpu[perm[:take]]
+            idx = idx_cpu.to(idx.device)
             rows = idx[:, 0]
             cols = idx[:, 1]
             ng = torch.stack([sequences[rows, cols + k] for k in range(n)], dim=1).to("cpu")
