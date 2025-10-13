@@ -6,7 +6,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import Callable, Iterable, Iterator, List, Optional, Tuple, Union
 
 import torch
 
@@ -198,6 +198,7 @@ class GPUBPETrainer:
         self.merge_transfer_log: list[dict[str, object]] = []
         self.sync_intervals: list[dict[str, object]] = []
         self._interval_merges: int = 0
+        self._active_batch_size: int | None = None
 
     # ------------------------------------------------------------------
     # Transfer accounting helpers
@@ -252,16 +253,110 @@ class GPUBPETrainer:
         batches: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
         log_every: int = 100,
         profile_streams: bool = False,
+        on_batch_size_change: Optional[Callable[[int], None]] = None,
     ) -> dict[str, object]:
         """Train merges using a pipelined GPU workflow when possible."""
 
         self._reset_transfer_counters()
+        self._active_batch_size = None
         device = torch.device(self.device)
         step = 0
-        current_batches: Iterable[Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], GPUBatchRecord]] = batches
+        current_batches: Iterable[
+            Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], GPUBatchRecord]
+        ] = batches
         gpu_batches: Optional[list[GPUBatchRecord]] = None
 
         cpu_device = torch.device("cpu")
+
+        def _extract_sequences_from_cpu(
+            cpu_batches: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+        ) -> list[list[int]]:
+            sequences: list[list[int]] = []
+            for tokens_cpu, _valid_cpu, lengths_cpu in cpu_batches:
+                rows = int(tokens_cpu.shape[0])
+                for row in range(rows):
+                    length = int(lengths_cpu[row].item())
+                    if length <= 0:
+                        sequences.append([])
+                        continue
+                    seq = tokens_cpu[row, :length].to(torch.long).tolist()
+                    sequences.append(seq)
+            return sequences
+
+        def _extract_sequences_from_gpu(records: list[GPUBatchRecord]) -> list[list[int]]:
+            sequences: list[list[int]] = []
+            for record in records:
+                tokens_cpu = record.tokens.detach().to("cpu")
+                lengths_cpu = record.lengths.detach().to("cpu")
+                rows = int(tokens_cpu.shape[0])
+                for row in range(rows):
+                    length = int(lengths_cpu[row].item())
+                    if length <= 0:
+                        sequences.append([])
+                        continue
+                    seq = tokens_cpu[row, :length].to(torch.long).tolist()
+                    sequences.append(seq)
+            return sequences
+
+        def _iter_cpu_batches_from_sequences(
+            sequences: list[list[int]],
+            batch_size: int,
+            pin: bool,
+        ) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+            if batch_size <= 0:
+                return
+            for start in range(0, len(sequences), batch_size):
+                chunk = sequences[start : start + batch_size]
+                if not chunk:
+                    continue
+                rows = len(chunk)
+                max_len = max((len(seq) for seq in chunk), default=0)
+                width = max(1, max_len)
+                tokens = torch.full((rows, width), -1, dtype=torch.long)
+                valid = torch.zeros((rows, width), dtype=torch.long)
+                lengths = torch.zeros((rows,), dtype=torch.long)
+                for row, seq in enumerate(chunk):
+                    if not seq:
+                        continue
+                    L = len(seq)
+                    tokens[row, :L] = torch.tensor(seq, dtype=torch.long)
+                    valid[row, :L] = 1
+                    lengths[row] = L
+                if pin:
+                    tokens = tokens.pin_memory()
+                    valid = valid.pin_memory()
+                yield tokens, valid, lengths
+
+        def _reconfigure_batches(batch_size: int) -> None:
+            nonlocal current_batches, gpu_batches
+            if batch_size <= 0:
+                return
+            if use_cuda:
+                if gpu_batches is None:
+                    return
+                sequences = _extract_sequences_from_gpu(gpu_batches)
+                new_records: list[GPUBatchRecord] = []
+                for tokens_cpu, valid_cpu, lengths_cpu in _iter_cpu_batches_from_sequences(
+                    sequences, batch_size, pin=True
+                ):
+                    record = GPUBatchRecord.from_cpu(tokens_cpu, valid_cpu, lengths_cpu, device)
+                    self._record_h2d(record.tokens, record.valid, record.lengths)
+                    new_records.append(record)
+                gpu_batches = new_records
+                current_batches = new_records
+            else:
+                cpu_batches: list[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+                # Materialize iterable to allow safe reuse
+                if not isinstance(current_batches, list):
+                    current_batches = list(current_batches)
+                sequences = _extract_sequences_from_cpu(current_batches)
+                for cpu_batch in _iter_cpu_batches_from_sequences(
+                    sequences, batch_size, pin=False
+                ):
+                    cpu_batches.append(cpu_batch)
+                current_batches = cpu_batches
+            if on_batch_size_change is not None:
+                on_batch_size_change(batch_size)
 
         def _count_pairs_cpu(
             batch_iter: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
@@ -451,7 +546,12 @@ class GPUBPETrainer:
                 return records, oom_seen, {"sync": need_sync and copied_bytes > 0, "bytes": copied_bytes}
 
         while step < self.target_merges:
-            _ = self.autoscaler.suggest(token_bytes_per_example=int(8 * 1024))
+            scale_state = self.autoscaler.suggest(token_bytes_per_example=int(8 * 1024))
+            if self._active_batch_size is None:
+                self._active_batch_size = scale_state.batch_size
+            elif scale_state.batch_size != self._active_batch_size:
+                _reconfigure_batches(scale_state.batch_size)
+                self._active_batch_size = scale_state.batch_size
             t0 = time.time()
             if use_cuda:
                 global_keys, global_counts, consumed_batches = _count_pairs_gpu(current_batches)

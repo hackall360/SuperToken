@@ -76,6 +76,14 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
     suggestion = autoscaler.suggest(token_bytes_per_example=args.token_bytes)
     batch_size = min(args.max_batch, max(args.min_batch, suggestion.batch_size))
     batches = _iter_packed_batches(sequences, batch_size=batch_size, seed=args.seed)
+    current_batch_size = batch_size
+
+    def _handle_batch_resize(new_bs: int) -> None:
+        nonlocal batches, current_batch_size
+        if new_bs <= 0 or new_bs == current_batch_size:
+            return
+        batches = _iter_packed_batches(sequences, batch_size=new_bs, seed=args.seed)
+        current_batch_size = new_bs
 
     trainer = GPUBPETrainer(
         base_vocab=args.base_vocab,
@@ -83,7 +91,7 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
         device=args.device,
         autoscaler=autoscaler,
     )
-    meta = trainer.fit(batches, log_every=args.log_every)
+    meta = trainer.fit(batches, log_every=args.log_every, on_batch_size_change=_handle_batch_resize)
     if args.out_dir:
         trainer.save(args.out_dir)
     print(meta)
