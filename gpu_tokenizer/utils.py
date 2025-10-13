@@ -126,44 +126,83 @@ def apply_merge_once(
 
 
 @torch.jit.script
-def count_pairs(seqs: torch.Tensor, valid: torch.Tensor):
-    """Return unique adjacent token pairs and their counts."""
+def count_pairs(
+    seqs: torch.Tensor,
+    valid: torch.Tensor,
+    pair_keys_buffer: torch.Tensor,
+    pair_counts_buffer: torch.Tensor,
+    pair_count_length: torch.Tensor,
+) -> None:
+    """Populate ``pair_*`` workspaces with unique adjacent token pairs."""
+
+    B = seqs.size(0)
+    L = seqs.size(1) if seqs.dim() > 1 else 0
+    width = L - 1 if L > 0 else 0
+    capacity = pair_counts_buffer.numel()
+
+    if pair_count_length.numel() != 1:
+        raise RuntimeError("pair_count_length must be a singleton tensor")
+
+    pair_count_length.zero_()
+
+    if B == 0 or width <= 0 or capacity == 0:
+        if pair_keys_buffer.numel() > 0:
+            pair_keys_buffer.fill_(-1)
+        if pair_counts_buffer.numel() > 0:
+            pair_counts_buffer.zero_()
+        return
 
     lhs = seqs[:, :-1]
     rhs = seqs[:, 1:]
     mask = valid[:, :-1].to(torch.bool) & valid[:, 1:].to(torch.bool)
+
     if not mask.any():
-        return seqs.new_empty((0, 2)), seqs.new_empty((0,), dtype=torch.long)
-    device = seqs.device
+        pair_keys_buffer.fill_(-1)
+        pair_counts_buffer.zero_()
+        return
+
     lhs_vals = lhs[mask].to(torch.long)
     rhs_vals = rhs[mask].to(torch.long)
 
     pair_keys = (lhs_vals << 32) | rhs_vals
     sorted_keys, _ = torch.sort(pair_keys)
 
-    num_keys = sorted_keys.numel()
+    num_keys = int(sorted_keys.numel())
     if num_keys == 0:
-        return seqs.new_empty((0, 2)), seqs.new_empty((0,), dtype=torch.long)
+        pair_keys_buffer.fill_(-1)
+        pair_counts_buffer.zero_()
+        return
 
-    run_start = torch.ones(1, dtype=torch.bool, device=device)
-    run_start = torch.cat([run_start, sorted_keys[1:] != sorted_keys[:-1]])
-    run_indices = torch.nonzero(run_start).flatten()
+    device = seqs.device
+    run_start = torch.ones((num_keys,), dtype=torch.bool, device=device)
+    if num_keys > 1:
+        run_start[1:] = sorted_keys[1:] != sorted_keys[:-1]
+    run_indices = torch.nonzero(run_start, as_tuple=False).flatten()
 
-    next_indices = torch.cat(
-        [
-            run_indices[1:],
-            torch.as_tensor([num_keys], device=device, dtype=run_indices.dtype),
-        ]
-    )
+    next_indices = torch.empty_like(run_indices)
+    next_indices[:-1] = run_indices[1:]
+    next_indices[-1] = num_keys
     counts = next_indices - run_indices
 
     unique_keys = sorted_keys[run_indices]
-    lower_mask = torch.as_tensor((1 << 32) - 1, device=device, dtype=torch.long)
-    a_vals = (unique_keys >> 32).to(seqs.dtype)
-    b_vals = (unique_keys & lower_mask).to(seqs.dtype)
-    pairs = torch.stack([a_vals, b_vals], dim=1)
+    length = int(unique_keys.numel())
+    if length > capacity:
+        raise RuntimeError("pair workspace capacity exceeded")
 
-    return pairs, counts
+    a_vals = (unique_keys >> 32).to(seqs.dtype)
+    b_vals = (unique_keys & ((1 << 32) - 1)).to(seqs.dtype)
+
+    if length > 0:
+        pair_keys_buffer[:length, 0].copy_(a_vals)
+        pair_keys_buffer[:length, 1].copy_(b_vals)
+        pair_counts_buffer[:length].copy_(counts)
+
+    if length < pair_keys_buffer.size(0):
+        pair_keys_buffer[length:].fill_(-1)
+    if length < pair_counts_buffer.size(0):
+        pair_counts_buffer[length:].zero_()
+
+    pair_count_length[0] = length
 
 
 def aggregate_pair_keys(
