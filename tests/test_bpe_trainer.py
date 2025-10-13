@@ -70,6 +70,29 @@ def test_fit_supports_streaming_iterator():
     stream = OneShotIterable([first_batch, second_batch])
 
     trainer = GPUBPETrainer(base_vocab=256, merges=1, device="cpu")
-    trainer.fit(stream, log_every=10)
+    result = trainer.fit(stream, log_every=10)
 
     assert trainer.merges[:1] == [(1, 2)]
+    metrics = result["transfer_metrics"]
+    assert metrics["bytes_h2d"] == 0
+    assert metrics["bytes_d2h"] == 0
+    assert metrics["merge_stats"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_gpu_transfer_counters_accumulate():
+    seqs = [
+        [1, 2, 1, 2, 3],
+        [1, 2, 4, 2],
+    ]
+    batch = _make_batch(seqs)
+    trainer = GPUBPETrainer(base_vocab=256, merges=1, device="cuda", sync_every=1)
+
+    result = trainer.fit([batch], log_every=10)
+
+    metrics = result["transfer_metrics"]
+    assert metrics["bytes_h2d"] > 0
+    assert metrics["bytes_d2h"] > 0
+    assert metrics["h2d_events"] >= 1
+    assert metrics["d2h_events"] >= 1
+    assert metrics["sync_intervals"]
