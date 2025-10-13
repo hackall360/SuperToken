@@ -234,12 +234,12 @@ def test_gpu_count_pairs_retries_after_oom(monkeypatch):
     call_rows: list[int] = []
     call_count = {"count": 0}
 
-    def _oom_then_count(tokens, valid):
+    def _oom_then_count(tokens, valid, pair_keys_buffer, pair_counts_buffer, pair_count_length):
         call_count["count"] += 1
         if call_count["count"] == 1:
             raise RuntimeError("CUDA out of memory")
         call_rows.append(int(tokens.shape[0]))
-        return original_count(tokens, valid)
+        return original_count(tokens, valid, pair_keys_buffer, pair_counts_buffer, pair_count_length)
 
     monkeypatch.setattr(bt, "count_pairs", _oom_then_count)
 
@@ -355,11 +355,11 @@ def test_multi_gpu_autoscaler_updates_contexts(monkeypatch):
     original_count = bt.count_pairs
     call_order: list[int] = []
 
-    def _oom_then_count(tokens, valid):
+    def _oom_then_count(tokens, valid, pair_keys_buffer, pair_counts_buffer, pair_count_length):
         call_order.append(int(tokens.shape[0]))
         if len(call_order) == 1:
             raise RuntimeError("CUDA out of memory")
-        return original_count(tokens, valid)
+        return original_count(tokens, valid, pair_keys_buffer, pair_counts_buffer, pair_count_length)
 
     monkeypatch.setattr(bt, "count_pairs", _oom_then_count)
 

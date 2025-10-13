@@ -33,6 +33,9 @@ class GPUBatchRecord:
     span_history: list[torch.Tensor] = field(default_factory=list)
     pair_keys: Optional[torch.Tensor] = None
     pair_counts: Optional[torch.Tensor] = None
+    pair_keys_buffer: Optional[torch.Tensor] = None
+    pair_counts_buffer: Optional[torch.Tensor] = None
+    pair_count_length: Optional[torch.Tensor] = None
 
 
     @classmethod
@@ -78,6 +81,30 @@ class GPUBatchRecord:
             self.span_workspace = torch.zeros((B, width), dtype=torch.bool, device=device)
         if self.prefix_workspace is None or self.prefix_workspace.shape[0] != B:
             self.prefix_workspace = torch.zeros((B,), dtype=torch.long, device=device)
+        capacity = B * width
+        if capacity == 0:
+            if self.pair_keys_buffer is None or self.pair_keys_buffer.shape != (0, 2):
+                self.pair_keys_buffer = torch.empty((0, 2), dtype=self.tokens.dtype, device=device)
+            if self.pair_counts_buffer is None or self.pair_counts_buffer.shape != (0,):
+                self.pair_counts_buffer = torch.empty((0,), dtype=torch.long, device=device)
+        else:
+            if (
+                self.pair_keys_buffer is None
+                or self.pair_keys_buffer.shape[0] != capacity
+                or self.pair_keys_buffer.shape[1] != 2
+            ):
+                self.pair_keys_buffer = torch.empty(
+                    (capacity, 2), dtype=self.tokens.dtype, device=device
+                )
+            if (
+                self.pair_counts_buffer is None
+                or self.pair_counts_buffer.shape[0] != capacity
+            ):
+                self.pair_counts_buffer = torch.empty(
+                    (capacity,), dtype=torch.long, device=device
+                )
+        if self.pair_count_length is None or self.pair_count_length.shape != (1,):
+            self.pair_count_length = torch.zeros((1,), dtype=torch.long, device=device)
 
     def ensure_host_buffers(self) -> None:
         """Allocate pinned host mirrors if absent or stale."""
@@ -772,32 +799,75 @@ class GPUBPETrainer:
                     Optional[tuple[torch.Tensor, torch.Tensor]],
                 ]
             ] = []
+            pair_keys_workspace: Optional[torch.Tensor] = None
+            pair_counts_workspace: Optional[torch.Tensor] = None
+            pair_count_length_workspace: Optional[torch.Tensor] = None
             for batch in batches:
                 x_cpu, v_cpu, lengths_cpu, spans, _, _ = _unpack_cpu_batch(batch)
                 x_snapshot = x_cpu.clone()
                 v_snapshot = v_cpu.clone()
                 lengths_snapshot = lengths_cpu.clone()
-                pairs, counts = count_pairs(x_snapshot.to(cpu_device), v_snapshot.to(cpu_device))
-                if pairs.numel() > 0:
-                    a_ids = pairs[:, 0].to(torch.long)
-                    b_ids = pairs[:, 1].to(torch.long)
-                    keys = ((a_ids << 32) | b_ids).to(torch.long).to("cpu")
-                    counts_cpu = counts.to(torch.long).to("cpu")
+                B, L = x_snapshot.shape
+                width = max(L - 1, 0)
+                capacity = int(B * width)
+                if capacity == 0:
+                    pair_keys_workspace = torch.empty((0, 2), dtype=x_snapshot.dtype, device=cpu_device)
+                    pair_counts_workspace = torch.empty((0,), dtype=torch.long, device=cpu_device)
                 else:
-                    keys = torch.empty((0,), dtype=torch.long)
-                    counts_cpu = torch.empty((0,), dtype=torch.long)
+                    if (
+                        pair_keys_workspace is None
+                        or pair_keys_workspace.shape[0] != capacity
+                        or pair_keys_workspace.shape[1] != 2
+                    ):
+                        pair_keys_workspace = torch.empty(
+                            (capacity, 2), dtype=x_snapshot.dtype, device=cpu_device
+                        )
+                    if (
+                        pair_counts_workspace is None
+                        or pair_counts_workspace.shape[0] != capacity
+                    ):
+                        pair_counts_workspace = torch.empty(
+                            (capacity,), dtype=torch.long, device=cpu_device
+                        )
+                if (
+                    pair_count_length_workspace is None
+                    or pair_count_length_workspace.device != cpu_device
+                ):
+                    pair_count_length_workspace = torch.zeros(
+                        (1,), dtype=torch.long, device=cpu_device
+                    )
+                count_pairs(
+                    x_snapshot.to(cpu_device),
+                    v_snapshot.to(cpu_device),
+                    pair_keys_workspace,
+                    pair_counts_workspace,
+                    pair_count_length_workspace,
+                )
+                length = int(pair_count_length_workspace.item())
+                if length > 0:
+                    pairs_view = pair_keys_workspace[:length]
+                    counts_view = pair_counts_workspace[:length]
+                    a_ids = pairs_view[:, 0].to(torch.long)
+                    b_ids = pairs_view[:, 1].to(torch.long)
+                    keys = ((a_ids << 32) | b_ids).to(torch.long)
+                    counts_cpu = counts_view.to(torch.long)
+                else:
+                    keys = torch.empty((0,), dtype=torch.long, device=cpu_device)
+                    counts_cpu = torch.empty((0,), dtype=torch.long, device=cpu_device)
+                keys_cpu = keys.clone().to("cpu")
+                counts_cpu = counts_cpu.clone().to("cpu")
                 consumed.append(
                     _pack_cpu_batch(
                         x_snapshot,
                         v_snapshot,
                         lengths_snapshot,
                         list(spans),
-                        keys,
+                        keys_cpu,
                         counts_cpu,
                     )
                 )
-                if keys.numel() > 0:
-                    global_keys.append(keys)
+                if keys_cpu.numel() > 0:
+                    global_keys.append(keys_cpu)
                     global_counts.append(counts_cpu)
 
             if global_keys:
@@ -1005,7 +1075,7 @@ class GPUBPETrainer:
                     local_keys: list[torch.Tensor] = []
                     local_counts: list[torch.Tensor] = []
                     consumed: list[MultiDeviceBatch] = []
-                    pair_results: Dict[torch.device, list[tuple[torch.Tensor, torch.Tensor]]] = {
+                    pair_results: Dict[torch.device, list[GPUBatchRecord]] = {
                         dev: [] for dev in device_contexts
                     }
                     pending_compute: Dict[torch.device, bool] = {
@@ -1035,23 +1105,21 @@ class GPUBPETrainer:
                                 try:
                                     with torch.cuda.device(dev), torch.cuda.stream(ctx.compute_stream):
                                         shard.wait_for_device(ctx.compute_stream)
-                                        pairs, counts = count_pairs(shard.tokens, shard.valid)
-                                    pair_results[dev].append((pairs, counts))
+                                        shard.ensure_workspaces()
+                                        assert shard.pair_keys_buffer is not None
+                                        assert shard.pair_counts_buffer is not None
+                                        assert shard.pair_count_length is not None
+                                        count_pairs(
+                                            shard.tokens,
+                                            shard.valid,
+                                            shard.pair_keys_buffer,
+                                            shard.pair_counts_buffer,
+                                            shard.pair_count_length,
+                                        )
+                                    pair_results[dev].append(shard)
                                     pending_compute[dev] = True
-                                    if self._enable_histogram_cache:
-                                        if pairs.numel() > 0:
-                                            a_ids = pairs[:, 0].to(torch.long)
-                                            b_ids = pairs[:, 1].to(torch.long)
-                                            keys_cpu = ((a_ids << 32) | b_ids).to(torch.long).to("cpu")
-                                            counts_cpu = counts.to(torch.long).to("cpu")
-                                        else:
-                                            keys_cpu = torch.empty((0,), dtype=torch.long)
-                                            counts_cpu = torch.empty((0,), dtype=torch.long)
-                                        shard.pair_keys = keys_cpu
-                                        shard.pair_counts = counts_cpu
-                                    else:
-                                        shard.pair_keys = None
-                                        shard.pair_counts = None
+                                    shard.pair_keys = None
+                                    shard.pair_counts = None
                                 except RuntimeError as exc:
                                     if "CUDA out of memory" in str(exc):
                                         oom_triggered = True
@@ -1101,15 +1169,27 @@ class GPUBPETrainer:
                                 torch.cuda.set_device(dev)
                                 torch.cuda.synchronize(dev)
                                 assert device_contexts[dev].compute_stream.query(), "compute stream did not drain"
-                    for per_device_results in pair_results.values():
-                        for pairs, counts in per_device_results:
-                            if pairs.numel() == 0:
+                    for dev, per_device_records in pair_results.items():
+                        for shard in per_device_records:
+                            assert shard.pair_count_length is not None
+                            length = int(shard.pair_count_length.item())
+                            if length <= 0:
+                                if self._enable_histogram_cache:
+                                    shard.pair_keys = torch.empty((0,), dtype=torch.long)
+                                    shard.pair_counts = torch.empty((0,), dtype=torch.long)
                                 continue
-                            a_ids = pairs[:, 0].to(torch.long)
-                            b_ids = pairs[:, 1].to(torch.long)
+                            assert shard.pair_keys_buffer is not None
+                            assert shard.pair_counts_buffer is not None
+                            pairs_view = shard.pair_keys_buffer.narrow(0, 0, length)
+                            counts_view = shard.pair_counts_buffer.narrow(0, 0, length)
+                            a_ids = pairs_view[:, 0].to(torch.long)
+                            b_ids = pairs_view[:, 1].to(torch.long)
                             keys = (a_ids << 32) | b_ids
                             local_keys.append(keys)
-                            local_counts.append(counts.to(torch.long))
+                            local_counts.append(counts_view.to(torch.long))
+                            if self._enable_histogram_cache:
+                                shard.pair_keys = keys.to(torch.long).to("cpu")
+                                shard.pair_counts = counts_view.to(torch.long).to("cpu")
                     if local_keys and local_counts:
                         combined_keys = torch.cat(local_keys, dim=0)
                         combined_counts = torch.cat(local_counts, dim=0)
