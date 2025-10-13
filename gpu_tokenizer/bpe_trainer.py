@@ -11,46 +11,7 @@ from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence,
 import torch
 
 from .autoscaler import AutoScaler
-from .utils import apply_merge_once, count_pairs
-
-def _aggregate_pair_keys(
-    keys: torch.Tensor, counts: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Aggregate duplicate 64‑bit pair keys by summing their counts.
-
-    Given a 1‑D tensor of packed pair keys and a 1‑D tensor of counts of the
-    same length, this helper will sort the keys, perform a run–length encoding
-    on the sorted keys, and sum the corresponding counts for each unique key.
-    It returns a tuple of unique keys and their aggregated counts.  Both
-    tensors are on the same device as the inputs.
-
-    The packed key format is ``(a_id << 32) | b_id``, so values should be
-    64‑bit integers.  See the training loop for how keys are constructed.
-    """
-    # Ensure inputs are 1‑D and on the same device
-    if keys.numel() == 0:
-        return keys, counts
-    device = keys.device
-    # Sort the keys; keep corresponding counts aligned
-    order = torch.argsort(keys)
-    sorted_keys = keys[order]
-    sorted_counts = counts[order]
-    # Identify boundaries where the key changes (i.e. new unique starts)
-    diff = torch.ones_like(sorted_keys, dtype=torch.bool)
-    diff[1:] = sorted_keys[1:] != sorted_keys[:-1]
-    # Positions of the first occurrence of each unique key
-    pos = torch.nonzero(diff, as_tuple=False).flatten()
-    # Compute prefix sums of counts with a leading zero for convenience
-    prefix = torch.cat(
-        [torch.zeros((1,), dtype=sorted_counts.dtype, device=device), torch.cumsum(sorted_counts, dim=0)]
-    )
-    # Next boundaries are the subsequent start positions (or the end of the array)
-    next_pos = torch.cat(
-        [pos[1:], torch.tensor([sorted_keys.numel()], dtype=pos.dtype, device=device)]
-    )
-    aggregated_counts = prefix[next_pos] - prefix[pos]
-    aggregated_keys = sorted_keys[pos]
-    return aggregated_keys, aggregated_counts
+from .utils import aggregate_pair_keys, apply_merge_once, count_pairs, reduce_pair_histograms
 
 
 @dataclass
@@ -642,8 +603,8 @@ class GPUBPETrainer:
                 while True:
                     for ctx in device_contexts.values():
                         ctx.reset_activity()
-                    global_keys: Optional[torch.Tensor] = None
-                    global_counts: Optional[torch.Tensor] = None
+                    local_keys: list[torch.Tensor] = []
+                    local_counts: list[torch.Tensor] = []
                     consumed: list[MultiDeviceBatch] = []
                     pair_results: Dict[torch.device, list[tuple[torch.Tensor, torch.Tensor]]] = {
                         dev: [] for dev in device_contexts
@@ -733,14 +694,19 @@ class GPUBPETrainer:
                             a_ids = pairs[:, 0].to(torch.long)
                             b_ids = pairs[:, 1].to(torch.long)
                             keys = (a_ids << 32) | b_ids
-                            if global_keys is None:
-                                global_keys = keys
-                                global_counts = counts.to(torch.long)
-                            else:
-                                global_keys = torch.cat([global_keys, keys], dim=0)
-                                global_counts = torch.cat([global_counts, counts.to(torch.long)], dim=0)
+                            local_keys.append(keys)
+                            local_counts.append(counts.to(torch.long))
+                    if local_keys and local_counts:
+                        combined_keys = torch.cat(local_keys, dim=0)
+                        combined_counts = torch.cat(local_counts, dim=0)
+                        reduced_keys, reduced_counts = reduce_pair_histograms(
+                            combined_keys, combined_counts
+                        )
+                    else:
+                        reduced_keys = None
+                        reduced_counts = None
                     gpu_batches = consumed
-                    return global_keys, global_counts, consumed
+                    return reduced_keys, reduced_counts, consumed
 
             def _apply_merge_gpu(
                 batch_iter: Iterable[MultiDeviceBatch],
@@ -859,12 +825,17 @@ class GPUBPETrainer:
                 print("No pairs left to merge.")
                 break
             current_batches = consumed_batches
-            agg_keys, agg_counts = _aggregate_pair_keys(global_keys, global_counts)
-            best_idx = torch.argmax(agg_counts)
+            agg_keys, agg_counts = aggregate_pair_keys(global_keys, global_counts)
+            best_count = torch.max(agg_counts)
+            candidate_indices = torch.nonzero(agg_counts == best_count, as_tuple=False).flatten()
+            if candidate_indices.numel() == 1:
+                best_idx = candidate_indices[0]
+            else:
+                best_idx = candidate_indices[torch.argmin(agg_keys[candidate_indices])]
             best_key = agg_keys[best_idx]
             a_id = int((best_key >> 32).item())
             b_id = int((best_key & ((1 << 32) - 1)).item())
-            best_count = int(agg_counts[best_idx].item())
+            best_count = int(best_count.item())
             if best_count <= 1:
                 print("Stopping: no frequent pairs.")
                 break

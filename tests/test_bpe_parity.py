@@ -11,6 +11,8 @@ reference trainer remains reproducible across platforms.
 from __future__ import annotations
 
 import random
+import os
+import socket
 from typing import List, Sequence, Tuple
 
 import pytest
@@ -18,6 +20,7 @@ import pytest
 np = pytest.importorskip("numpy")
 tokenizers = pytest.importorskip("tokenizers")
 torch = pytest.importorskip("torch")
+import torch.multiprocessing as mp
 
 from gpu_tokenizer.bpe_trainer import GPUBPETrainer
 from gpu_tokenizer.utils import apply_merge_once
@@ -250,6 +253,44 @@ def _train_gpu_trainer(
 _CORPORA = list(get_adversarial_corpora())
 
 
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _distributed_train_worker(
+    rank: int,
+    world_size: int,
+    base_vocab: int,
+    merge_budget: int,
+    shards: Sequence[Sequence[Sequence[int]]],
+    master_addr: str,
+    master_port: str,
+    output_file: str,
+) -> None:
+    from torch import distributed as dist
+
+    os.environ["MASTER_ADDR"] = master_addr
+    os.environ["MASTER_PORT"] = master_port
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    try:
+        _seed_everything(GLOBAL_SEED)
+        trainer = GPUBPETrainer(base_vocab=base_vocab, merges=merge_budget, device=f"cuda:{rank}")
+        local_sequences = shards[rank]
+        batches = _build_tensor_batches(local_sequences)
+        trainer.fit(batches, log_every=max(merge_budget, 1))
+        if rank == 0:
+            torch.save(list(trainer.merges), output_file)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
 @pytest.mark.parametrize("corpus", _CORPORA, ids=[corpus.name for corpus in _CORPORA])
 def test_gpu_trainer_matches_huggingface(corpus: AdversarialCorpus) -> None:
     reference = _train_reference_tokenizer(corpus, corpus.target_merge_operations)
@@ -276,3 +317,50 @@ def test_gpu_trainer_matches_huggingface(corpus: AdversarialCorpus) -> None:
     assert (
         second_encoded_ids == encoded_gpu_ids
     ), "GPUBPETrainer encodings were not deterministic"
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="Requires at least two CUDA devices",
+)
+def test_gpu_trainer_multi_gpu_parity(tmp_path) -> None:
+    corpus = _CORPORA[0]
+    world_size = 2
+    master_port = str(_find_free_port())
+    master_addr = "127.0.0.1"
+
+    sequences = _corpus_to_byte_sequences(corpus.corpus)
+    if len(sequences) < world_size:
+        base = list(sequences) if sequences else [[idx] for idx in range(world_size)]
+        while len(sequences) < world_size:
+            sequences.extend(base)
+        sequences = sequences[:world_size]
+
+    reference_trainer = _train_gpu_trainer(
+        sequences, corpus.target_merge_operations, device="cuda:0"
+    )
+    reference_merges = list(reference_trainer.merges)
+
+    shards: List[List[List[int]]] = [[] for _ in range(world_size)]
+    for idx, seq in enumerate(sequences):
+        shards[idx % world_size].append(seq)
+
+    output_file = tmp_path / "distributed_merges.pt"
+
+    mp.spawn(
+        _distributed_train_worker,
+        args=(
+            world_size,
+            BASE_VOCAB,
+            corpus.target_merge_operations,
+            shards,
+            master_addr,
+            master_port,
+            str(output_file),
+        ),
+        nprocs=world_size,
+        join=True,
+    )
+
+    distributed_merges = torch.load(output_file)
+    assert distributed_merges == reference_merges, "Distributed merges diverged from baseline"
