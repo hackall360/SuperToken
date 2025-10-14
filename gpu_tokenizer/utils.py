@@ -4,14 +4,31 @@ from __future__ import annotations
 
 from typing import Optional, Tuple
 
+import logging
 import torch
 import torch.distributed as dist
 
 from .cuda_kernels import apply_merge_and_compact as cuda_apply_merge_and_compact
-from .dtypes import clamp_lengths_to_dtype, promote_length_sum_dtype
+from .dtypes import clamp_lengths_to_dtype, promote_length_sum_dtype, INT32_MAX
 
 
 UINT32_MAX = (1 << 32) - 1
+logger = logging.getLogger(__name__)
+
+
+def _clamp_counts_to_int32(counts: torch.Tensor, context: str) -> torch.Tensor:
+    """Clamp ``counts`` to ``torch.int32`` while logging saturation."""
+
+    if counts.numel() == 0:
+        return counts.to(torch.int32)
+
+    working = counts.to(torch.int64)
+    overflow = working > INT32_MAX
+    if overflow.any():
+        saturated = int(overflow.sum().item())
+        logger.warning("%s saturated %d entries at INT32_MAX", context, saturated)
+        working = torch.clamp(working, max=INT32_MAX)
+    return working.to(torch.int32)
 
 
 def device_of(x: torch.Tensor) -> torch.device:
@@ -284,6 +301,7 @@ def count_pairs(
     next_indices[:-1] = run_indices[1:]
     next_indices[-1] = num_keys
     counts = next_indices - run_indices
+    counts = _clamp_counts_to_int32(counts, "count_pairs")
 
     unique_keys = sorted_keys[run_indices]
     length = int(unique_keys.numel())
@@ -317,19 +335,19 @@ def aggregate_pair_keys(
     """
 
     if keys.numel() == 0:
-        if counts.dtype != torch.long:
-            counts = counts.to(torch.long)
         if keys.dtype != torch.long:
             keys = keys.to(torch.long)
+        counts = _clamp_counts_to_int32(counts, "aggregate_pair_keys input")
         return keys, counts
 
     device = keys.device
     keys = keys.to(torch.long)
-    counts = counts.to(torch.long)
+    counts = _clamp_counts_to_int32(counts, "aggregate_pair_keys input")
 
     order = torch.argsort(keys)
     sorted_keys = keys[order]
-    sorted_counts = counts[order]
+    sorted_counts32 = counts[order]
+    sorted_counts = sorted_counts32.to(torch.int64)
 
     diff = torch.ones_like(sorted_keys, dtype=torch.bool)
     diff[1:] = sorted_keys[1:] != sorted_keys[:-1]
@@ -347,7 +365,8 @@ def aggregate_pair_keys(
         ]
     )
 
-    aggregated_counts = prefix[next_indices] - prefix[run_starts]
+    aggregated_counts64 = prefix[next_indices] - prefix[run_starts]
+    aggregated_counts = _clamp_counts_to_int32(aggregated_counts64, "aggregate_pair_keys")
     aggregated_keys = sorted_keys[run_starts]
     return aggregated_keys, aggregated_counts
 
@@ -378,11 +397,11 @@ def reduce_pair_histograms(
 
     max_len = max(lengths, default=0)
     if max_len == 0:
-        return keys.new_empty((0,), dtype=torch.long), counts.new_empty((0,), dtype=torch.long)
+        return keys.new_empty((0,), dtype=torch.long), counts.new_empty((0,), dtype=torch.int32)
 
     pad_value = torch.iinfo(torch.long).max
     padded_keys = torch.full((max_len,), pad_value, dtype=torch.long, device=device)
-    padded_counts = torch.zeros((max_len,), dtype=torch.long, device=device)
+    padded_counts = torch.zeros((max_len,), dtype=torch.int32, device=device)
     if keys.numel() > 0:
         padded_keys[: keys.numel()] = keys
         padded_counts[: counts.numel()] = counts
@@ -401,7 +420,7 @@ def reduce_pair_histograms(
         slice_counts.append(gathered_counts[rank][:length])
 
     if not slices:
-        return keys.new_empty((0,), dtype=torch.long), counts.new_empty((0,), dtype=torch.long)
+        return keys.new_empty((0,), dtype=torch.long), counts.new_empty((0,), dtype=torch.int32)
 
     all_keys = torch.cat(slices, dim=0)
     all_counts = torch.cat(slice_counts, dim=0)
