@@ -274,6 +274,72 @@ def _load_module() -> torch._C.ScriptModule:
         prefix_workspace[row] = length;
     }
 
+    extern "C" __global__ void apply_merge_and_compact_u32_u16(
+        uint32_t* tokens,
+        uint8_t* valid,
+        uint16_t* prefix_workspace,
+        bool* pair_mask,
+        const int32_t B,
+        const int32_t L,
+        const int32_t width,
+        const uint32_t a_id,
+        const uint32_t b_id,
+        const uint32_t new_id
+    ) {
+        int32_t row = static_cast<int32_t>(blockIdx.x);
+        if (row >= B) {
+            return;
+        }
+        uint32_t* row_tokens = tokens + row * L;
+        uint8_t* row_valid = valid + row * L;
+        bool* row_mask = nullptr;
+        if (width > 0 && pair_mask != nullptr) {
+            row_mask = pair_mask + row * width;
+        }
+
+        if (row_mask != nullptr) {
+            for (int32_t col = 0; col < width; ++col) {
+                bool left_valid = row_valid[col] != 0;
+                bool right_valid = row_valid[col + 1] != 0;
+                bool match =
+                    left_valid && right_valid && (row_tokens[col] == a_id) && (row_tokens[col + 1] == b_id);
+                row_mask[col] = match;
+            }
+            for (int32_t col = 0; col < width; ++col) {
+                if (row_mask[col]) {
+                    row_tokens[col] = new_id;
+                    row_valid[col + 1] = 0;
+                    row_tokens[col + 1] = 0u;
+                }
+            }
+        }
+
+        int32_t length = 0;
+        for (int32_t col = 0; col < L; ++col) {
+            uint8_t is_valid = row_valid[col];
+            if (is_valid != 0) {
+                uint32_t value = row_tokens[col];
+                row_tokens[length] = value;
+                row_valid[length] = 1;
+                if (length != col) {
+                    row_tokens[col] = 0u;
+                    row_valid[col] = 0;
+                }
+                length += 1;
+            } else {
+                row_tokens[col] = 0u;
+                row_valid[col] = 0;
+            }
+        }
+        for (int32_t col = length; col < L; ++col) {
+            row_tokens[col] = 0u;
+            row_valid[col] = 0;
+        }
+        const uint16_t max_val = 65535u;
+        uint16_t stored = length > static_cast<int32_t>(max_val) ? max_val : static_cast<uint16_t>(length);
+        prefix_workspace[row] = stored;
+    }
+
     extern "C" __global__ void accumulate_expectations(
         const int32_t* sequences,
         const uint8_t* valid,
@@ -355,6 +421,7 @@ def _load_module() -> torch._C.ScriptModule:
             "backward_logz",
             "accumulate_expectations",
             "apply_merge_and_compact_u32",
+            "apply_merge_and_compact_u32_u16",
         ],
         extra_cuda_cflags=["-lineinfo"],
     )
@@ -526,8 +593,8 @@ def apply_merge_and_compact(
         raise TypeError("tokens must use torch.int32 dtype for CUDA merge kernel")
     if valid.dtype not in (torch.uint8, torch.bool):
         raise TypeError("valid must use torch.uint8 or torch.bool dtype for CUDA merge kernel")
-    if prefix_workspace.dtype != torch.int32:
-        raise TypeError("prefix_workspace must use torch.int32 dtype")
+    if prefix_workspace.dtype not in (torch.int32, torch.uint16):
+        raise TypeError("prefix_workspace must use torch.int32 or torch.uint16 dtype")
     if pair_workspace.dtype != torch.bool:
         raise TypeError("pair_workspace must use torch.bool dtype")
 
@@ -544,20 +611,36 @@ def apply_merge_and_compact(
             pair_workspace.zero_()
         return
 
-    module.apply_merge_and_compact_u32(
-        tokens,
-        valid,
-        prefix_workspace,
-        pair_workspace,
-        B,
-        L,
-        width,
-        int(a_id),
-        int(b_id),
-        int(new_id),
-        grid=(B,),
-        block=(1,),
-    )
+    if prefix_workspace.dtype == torch.int32:
+        module.apply_merge_and_compact_u32(
+            tokens,
+            valid,
+            prefix_workspace,
+            pair_workspace,
+            B,
+            L,
+            width,
+            int(a_id),
+            int(b_id),
+            int(new_id),
+            grid=(B,),
+            block=(1,),
+        )
+    else:
+        module.apply_merge_and_compact_u32_u16(
+            tokens,
+            valid,
+            prefix_workspace,
+            pair_workspace,
+            B,
+            L,
+            width,
+            int(a_id),
+            int(b_id),
+            int(new_id),
+            grid=(B,),
+            block=(1,),
+        )
 
 
 __all__ = [

@@ -22,6 +22,7 @@ def test_packed_batcher_double_buffer_reuse():
 
     assert first_tokens.dtype == torch.int32
     assert first_valid.dtype == torch.uint8
+    assert first_lengths.dtype == torch.uint16
 
     for lengths in (first_lengths, second_lengths, third_lengths):
         assert torch.all(lengths == 1)

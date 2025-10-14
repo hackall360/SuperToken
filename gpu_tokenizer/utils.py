@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 
 from .cuda_kernels import apply_merge_and_compact as cuda_apply_merge_and_compact
+from .dtypes import clamp_lengths_to_dtype, promote_length_sum_dtype
 
 
 UINT32_MAX = (1 << 32) - 1
@@ -25,6 +26,7 @@ def compact_tokens_inplace(
     valid: torch.Tensor,
     lengths: torch.Tensor,
     prefix_workspace: torch.Tensor,
+    overflow_workspace: Optional[torch.Tensor] = None,
 ) -> None:
     """Compact ``tokens``/``valid`` in place using ``prefix_workspace``.
 
@@ -41,6 +43,10 @@ def compact_tokens_inplace(
 
     rows = torch.arange(B, device=tokens.device, dtype=torch.int64)
     prefix_workspace.zero_()
+    if overflow_workspace is not None:
+        if overflow_workspace.numel() != B:
+            raise RuntimeError("overflow_workspace shape mismatch")
+        overflow_workspace.zero_()
 
     for col in range(L):
         keep_col = valid[:, col].to(torch.bool)
@@ -52,12 +58,27 @@ def compact_tokens_inplace(
             dst_long = prefix_workspace[row_ids].to(torch.long)
             tokens[row_ids, dst_long] = src_vals[keep_col]
             valid[row_ids, dst_long] = 1
-            prefix_workspace[row_ids] = (dst_long + 1).to(prefix_workspace.dtype)
+            next_counts = dst_long + 1
+            if prefix_workspace.dtype == torch.uint16:
+                max_val = 65535
+                next_counts = torch.clamp_max(next_counts, max_val)
+            prefix_workspace[row_ids] = next_counts.to(prefix_workspace.dtype)
 
-    if lengths.dtype == prefix_workspace.dtype:
-        lengths.copy_(prefix_workspace)
+    prefix_values = prefix_workspace.to(torch.int64)
+    if lengths.dtype == torch.uint16:
+        max_val = 65535
+        clipped = torch.clamp_max(prefix_values, max_val)
+        lengths.copy_(clipped.to(torch.uint16))
+        if overflow_workspace is not None:
+            overflow_workspace.copy_(prefix_values > max_val)
+    elif lengths.dtype == torch.int32:
+        lengths.copy_(prefix_values.to(torch.int32))
+        if overflow_workspace is not None:
+            overflow_workspace.zero_()
     else:
-        lengths.copy_(prefix_workspace.to(lengths.dtype))
+        lengths.copy_(prefix_values.to(lengths.dtype))
+        if overflow_workspace is not None:
+            overflow_workspace.zero_()
 
 
 def apply_merge_once(
@@ -70,6 +91,7 @@ def apply_merge_once(
     pair_workspace: Optional[torch.Tensor] = None,
     prefix_workspace: Optional[torch.Tensor] = None,
     span_workspace: Optional[torch.Tensor] = None,
+    overflow_workspace: Optional[torch.Tensor] = None,
 ):
     """Apply a single BPE merge directly within ``seqs`` and ``valid``.
 
@@ -99,7 +121,17 @@ def apply_merge_once(
 
     if L <= 1:
         if lengths.numel() == B:
-            lengths.copy_(valid.sum(dim=-1, dtype=lengths.dtype))
+            sum_dtype = promote_length_sum_dtype(lengths.dtype)
+            computed = valid.sum(dim=-1, dtype=sum_dtype)
+            coerced, overflow = clamp_lengths_to_dtype(computed, lengths.dtype)
+            lengths.copy_(coerced)
+            if overflow_workspace is not None:
+                if overflow_workspace.shape != (B,):
+                    raise RuntimeError("overflow_workspace shape mismatch")
+                if overflow is not None:
+                    overflow_workspace.copy_(overflow.to(overflow_workspace.dtype))
+                else:
+                    overflow_workspace.zero_()
         if span_workspace is not None and span_workspace.shape == empty_span.shape:
             span_workspace.zero_()
             return seqs, valid, lengths, span_workspace
@@ -108,12 +140,17 @@ def apply_merge_once(
     if seqs.is_cuda:
         if pair_workspace is None or pair_workspace.shape != (B, width):
             pair_workspace = torch.zeros((B, width), dtype=torch.bool, device=device)
+        expected_dtype = lengths.dtype
         if (
             prefix_workspace is None
             or prefix_workspace.shape[0] != B
-            or prefix_workspace.dtype != torch.int32
+            or prefix_workspace.dtype != expected_dtype
         ):
-            prefix_workspace = torch.zeros((B,), dtype=torch.int32, device=device)
+            prefix_workspace = torch.zeros((B,), dtype=expected_dtype, device=device)
+        if overflow_workspace is not None:
+            if overflow_workspace.shape != (B,):
+                raise RuntimeError("overflow_workspace shape mismatch")
+            overflow_workspace.zero_()
 
         cuda_apply_merge_and_compact(
             seqs,
@@ -125,10 +162,17 @@ def apply_merge_once(
             int(new_id),
         )
 
-        if lengths.dtype == prefix_workspace.dtype:
-            lengths.copy_(prefix_workspace)
+        prefix_values = prefix_workspace.to(torch.int64)
+        if lengths.dtype == torch.uint16:
+            max_val = 65535
+            clipped = torch.clamp_max(prefix_values, max_val)
+            lengths.copy_(clipped.to(torch.uint16))
+            if overflow_workspace is not None:
+                overflow_workspace.copy_(prefix_values > max_val)
         else:
-            lengths.copy_(prefix_workspace.to(lengths.dtype))
+            lengths.copy_(prefix_values.to(lengths.dtype))
+            if overflow_workspace is not None:
+                overflow_workspace.zero_()
 
         spans: torch.Tensor = pair_workspace
         if span_workspace is not None and span_workspace.shape == pair_workspace.shape:
@@ -166,14 +210,19 @@ def apply_merge_once(
             span_workspace.copy_(pair_workspace)
         spans = span_workspace
 
+    expected_dtype = lengths.dtype
     if (
         prefix_workspace is None
         or prefix_workspace.size(0) != B
-        or prefix_workspace.dtype != torch.int32
+        or prefix_workspace.dtype != expected_dtype
     ):
-        prefix_workspace = torch.zeros((B,), dtype=torch.int32, device=device)
+        prefix_workspace = torch.zeros((B,), dtype=expected_dtype, device=device)
+    if overflow_workspace is not None:
+        if overflow_workspace.shape != (B,):
+            raise RuntimeError("overflow_workspace shape mismatch")
+        overflow_workspace.zero_()
 
-    compact_tokens_inplace(seqs, valid, lengths, prefix_workspace)
+    compact_tokens_inplace(seqs, valid, lengths, prefix_workspace, overflow_workspace)
     return seqs, valid, lengths, spans
 
 
