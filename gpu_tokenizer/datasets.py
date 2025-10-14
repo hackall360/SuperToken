@@ -8,6 +8,8 @@ import random
 
 import torch
 
+_PIN_MEMORY = torch.cuda.is_available()
+
 from .dtypes import length_storage_dtype
 from .io import CorpusStreamer, DecodedShard
 
@@ -37,12 +39,16 @@ class PackedBatcher:
             (self.bs, self._storage_width),
             -1,
             dtype=torch.int32,
-            pin_memory=True,
+            pin_memory=_PIN_MEMORY,
         )
         valid = torch.zeros(
-            (self.bs, self._storage_width), dtype=torch.uint8, pin_memory=True
+            (self.bs, self._storage_width),
+            dtype=torch.uint8,
+            pin_memory=_PIN_MEMORY,
         )
-        lengths = torch.zeros((self.bs,), dtype=self._length_dtype, pin_memory=True)
+        lengths = torch.zeros(
+            (self.bs,), dtype=self._length_dtype, pin_memory=_PIN_MEMORY
+        )
         return tokens, valid, lengths
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
@@ -105,10 +111,16 @@ class StreamingPackedBatcher:
             (self.bs, self._storage_width),
             -1,
             dtype=torch.int32,
-            pin_memory=True,
+            pin_memory=_PIN_MEMORY,
         )
-        valid = torch.zeros((self.bs, self._storage_width), dtype=torch.uint8, pin_memory=True)
-        lengths = torch.zeros((self.bs,), dtype=self._length_dtype, pin_memory=True)
+        valid = torch.zeros(
+            (self.bs, self._storage_width),
+            dtype=torch.uint8,
+            pin_memory=_PIN_MEMORY,
+        )
+        lengths = torch.zeros(
+            (self.bs,), dtype=self._length_dtype, pin_memory=_PIN_MEMORY
+        )
         return tokens, valid, lengths
 
     def _ensure_width(self, width: int) -> None:
