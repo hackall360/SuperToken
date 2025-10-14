@@ -26,6 +26,7 @@ class ScaleState:
     batch_size: int
     cpu_workers: int
     h2d_mb: int
+    cpu_fallback_rate: float = 0.0
 
 
 class AutoScaler:
@@ -86,18 +87,33 @@ class AutoScaler:
             self._h2d_mb = h2d_mb or self._h2d_mb
         else:
             h2d_mb = self._h2d_mb
-        self.state = ScaleState(batch_size=bs_gpu, cpu_workers=workers, h2d_mb=h2d_mb)
+        fallback_rate = self.state.cpu_fallback_rate if self.state is not None else 0.0
+        self.state = ScaleState(
+            batch_size=bs_gpu,
+            cpu_workers=workers,
+            h2d_mb=h2d_mb,
+            cpu_fallback_rate=fallback_rate,
+        )
         return self.state
 
-    def feedback(self, step_time_s: float | None = None, oom: bool = False) -> None:
+    def feedback(
+        self,
+        step_time_s: float | None = None,
+        oom: bool = False,
+        cpu_fallback_rate: float | None = None,
+    ) -> None:
         if self.state is None:
             return
+        fallback_rate = self.state.cpu_fallback_rate
+        if cpu_fallback_rate is not None:
+            fallback_rate = max(0.0, min(1.0, float(cpu_fallback_rate)))
         if oom:
             prev = self.state
             self.state = ScaleState(
                 batch_size=max(self.min_bs, self.state.batch_size // 2),
                 cpu_workers=max(self.min_workers, self.state.cpu_workers - 1),
                 h2d_mb=self.state.h2d_mb,
+                cpu_fallback_rate=fallback_rate,
             )
             self._log_adjustment(prev, self.state, event="oom")
             if torch.cuda.is_available():
@@ -113,11 +129,18 @@ class AutoScaler:
         mean_vram, var_vram = self._stats(self._vram_fracs)
         mean_step, _ = self._stats(self._step_times)
         prev_state = self.state
-        new_state = self._tuned_state(mean_vram, var_vram, mean_step)
+        new_state = self._tuned_state(mean_vram, var_vram, mean_step, fallback_rate)
         if new_state != prev_state:
             self.state = new_state
             self._h2d_mb = self.state.h2d_mb
             self._log_adjustment(prev_state, new_state, mean_vram, var_vram, mean_step)
+        else:
+            self.state = ScaleState(
+                batch_size=self.state.batch_size,
+                cpu_workers=self.state.cpu_workers,
+                h2d_mb=self.state.h2d_mb,
+                cpu_fallback_rate=fallback_rate,
+            )
 
     def _record_metrics(self, step_time_s: float | None, used_bytes: int, total_bytes: int) -> None:
         if step_time_s is not None and math.isfinite(step_time_s):
@@ -150,6 +173,7 @@ class AutoScaler:
         mean_vram: float,
         var_vram: float,
         mean_step: float,
+        fallback_rate: float,
     ) -> ScaleState:
         lower_bound = max(0.75, self.tu - 0.05)
         upper_bound = min(0.95, self.tu + 0.10)
@@ -175,12 +199,22 @@ class AutoScaler:
                 new_workers = max(self.min_workers, int(self.state.cpu_workers * (1 - scale * 0.5)))
                 h2d_scale = max(0.02, scale * 0.5)
                 new_h2d = max(256, int(self.state.h2d_mb * (1 - h2d_scale)))
+        if fallback_rate > 0.25:
+            new_bs = max(self.min_bs, int(new_bs * 0.9))
+            new_workers = min(self.max_workers, max(new_workers, self.state.cpu_workers + 1))
+        elif fallback_rate < 0.05 and new_workers < self.max_workers:
+            new_workers = min(self.max_workers, max(new_workers, self.state.cpu_workers))
         if mean_step > 0 and len(self._step_times) >= self._window_size:
             # Light smoothing: if step times are trending up, avoid aggressive growth
             recent = list(self._step_times)[-3:]
             if len(recent) >= 3 and recent[-1] > recent[0] * 1.1 and new_bs > self.state.batch_size:
                 new_bs = max(self.state.batch_size, int((self.state.batch_size + new_bs) / 2))
-        return ScaleState(batch_size=new_bs, cpu_workers=new_workers, h2d_mb=new_h2d)
+        return ScaleState(
+            batch_size=new_bs,
+            cpu_workers=new_workers,
+            h2d_mb=new_h2d,
+            cpu_fallback_rate=fallback_rate,
+        )
 
     def _log_adjustment(
         self,
@@ -199,6 +233,7 @@ class AutoScaler:
             "prev_h2d_mb": prev.h2d_mb,
             "cpu_workers": new.cpu_workers,
             "prev_cpu_workers": prev.cpu_workers,
+            "cpu_fallback_rate": new.cpu_fallback_rate,
         }
         if mean_vram is not None:
             payload["mean_vram_util"] = round(mean_vram, 4)
