@@ -15,6 +15,9 @@ from .cuda_kernels import apply_merge_and_compact as cuda_apply_merge_and_compac
 from .utils import aggregate_pair_keys, apply_merge_once, count_pairs, reduce_pair_histograms
 
 
+UINT32_MAX = (1 << 32) - 1
+
+
 @dataclass
 class GPUBatchRecord:
     """Container for GPU-resident batch state with optional host mirrors."""
@@ -48,8 +51,8 @@ class GPUBatchRecord:
         lengths_cpu: torch.Tensor,
         device: torch.device,
     ) -> "GPUBatchRecord":
-        tokens_host = tokens_cpu.clone().pin_memory()
-        valid_host = valid_cpu.clone().pin_memory()
+        tokens_host = tokens_cpu.to(torch.int32).pin_memory()
+        valid_host = valid_cpu.to(torch.uint8).pin_memory()
         lengths_host = lengths_cpu.clone().pin_memory()
         tokens_dev = tokens_host.to(device=device, non_blocking=True)
         valid_dev = valid_host.to(device=device, non_blocking=True)
@@ -84,7 +87,7 @@ class GPUBatchRecord:
         if width > 0 and (self.span_workspace is None or self.span_workspace.shape != (B, width)):
             self.span_workspace = torch.zeros((B, width), dtype=torch.bool, device=device)
         if self.prefix_workspace is None or self.prefix_workspace.shape[0] != B:
-            self.prefix_workspace = torch.zeros((B,), dtype=torch.long, device=device)
+            self.prefix_workspace = torch.zeros((B,), dtype=torch.int32, device=device)
             self.merge_kernel_warm = False
         capacity = B * width
         if capacity == 0:
@@ -625,14 +628,14 @@ class GPUBPETrainer:
                 rows = len(chunk)
                 max_len = max((len(seq) for seq in chunk), default=0)
                 width = max(1, max_len)
-                tokens = torch.full((rows, width), -1, dtype=torch.long)
-                valid = torch.zeros((rows, width), dtype=torch.long)
+                tokens = torch.full((rows, width), -1, dtype=torch.int32)
+                valid = torch.zeros((rows, width), dtype=torch.uint8)
                 lengths = torch.zeros((rows,), dtype=torch.long)
                 for row, seq in enumerate(chunk):
                     if not seq:
                         continue
                     L = len(seq)
-                    tokens[row, :L] = torch.tensor(seq, dtype=torch.long)
+                    tokens[row, :L] = torch.tensor(seq, dtype=torch.int32)
                     valid[row, :L] = 1
                     lengths[row] = L
                 if pin:
@@ -928,7 +931,7 @@ class GPUBPETrainer:
                     if pair_workspace is None or pair_workspace.shape != (B, width):
                         pair_workspace = torch.zeros((B, width), dtype=torch.bool, device=cpu_device)
                     if prefix_workspace is None or prefix_workspace.shape[0] != B:
-                        prefix_workspace = torch.zeros((B,), dtype=torch.long, device=cpu_device)
+                        prefix_workspace = torch.zeros((B,), dtype=torch.int32, device=cpu_device)
                     if span_workspace is None or span_workspace.shape != (B, width):
                         span_workspace = torch.zeros((B, width), dtype=torch.bool, device=cpu_device)
                     if (
@@ -1432,10 +1435,18 @@ class GPUBPETrainer:
                 print("Stopping: no frequent pairs.")
                 break
             new_id = self.vocab_size
+            if max(a_id, b_id, new_id) > UINT32_MAX:
+                raise OverflowError(
+                    f"Token id overflow: encountered id above UINT32_MAX (limit {UINT32_MAX})."
+                )
             if step % log_every == 0:
                 print(f"merge {step:6d}: ({a_id},{b_id}) -> {new_id}  count={best_count}")
             self.merges.append((a_id, b_id))
             self.vocab_size += 1
+            if self.vocab_size > UINT32_MAX:
+                raise OverflowError(
+                    f"Vocabulary size exceeded UINT32_MAX (limit {UINT32_MAX})."
+                )
             if use_cuda:
                 current_batches, oom_seen, sync_report = _apply_merge_gpu(
                     current_batches, a_id, b_id, new_id, step + 1

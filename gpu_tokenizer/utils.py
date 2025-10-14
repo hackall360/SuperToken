@@ -10,6 +10,9 @@ import torch.distributed as dist
 from .cuda_kernels import apply_merge_and_compact as cuda_apply_merge_and_compact
 
 
+UINT32_MAX = (1 << 32) - 1
+
+
 def device_of(x: torch.Tensor) -> torch.device:
     """Return the device hosting ``x``."""
 
@@ -36,7 +39,7 @@ def compact_tokens_inplace(
         lengths.zero_()
         return
 
-    rows = torch.arange(B, device=tokens.device)
+    rows = torch.arange(B, device=tokens.device, dtype=torch.int64)
     prefix_workspace.zero_()
 
     for col in range(L):
@@ -46,10 +49,10 @@ def compact_tokens_inplace(
         valid[:, col] = 0
         if keep_col.any():
             row_ids = rows[keep_col]
-            dst = prefix_workspace[row_ids]
-            tokens[row_ids, dst] = src_vals[keep_col]
-            valid[row_ids, dst] = 1
-            prefix_workspace[row_ids] = dst + 1
+            dst_long = prefix_workspace[row_ids].to(torch.long)
+            tokens[row_ids, dst_long] = src_vals[keep_col]
+            valid[row_ids, dst_long] = 1
+            prefix_workspace[row_ids] = (dst_long + 1).to(prefix_workspace.dtype)
 
     if lengths.dtype == prefix_workspace.dtype:
         lengths.copy_(prefix_workspace)
@@ -79,6 +82,11 @@ def apply_merge_once(
     tensors along with the boolean mask identifying merged left indices.
     """
 
+    if max(a_id, b_id, new_id) > UINT32_MAX:
+        raise OverflowError(
+            f"Token id overflow: encountered id above UINT32_MAX (limit {UINT32_MAX})."
+        )
+
     B, L = seqs.shape
     device = seqs.device
     width = max(L - 1, 0)
@@ -100,8 +108,12 @@ def apply_merge_once(
     if seqs.is_cuda:
         if pair_workspace is None or pair_workspace.shape != (B, width):
             pair_workspace = torch.zeros((B, width), dtype=torch.bool, device=device)
-        if prefix_workspace is None or prefix_workspace.shape[0] != B:
-            prefix_workspace = torch.zeros((B,), dtype=torch.long, device=device)
+        if (
+            prefix_workspace is None
+            or prefix_workspace.shape[0] != B
+            or prefix_workspace.dtype != torch.int32
+        ):
+            prefix_workspace = torch.zeros((B,), dtype=torch.int32, device=device)
 
         cuda_apply_merge_and_compact(
             seqs,
@@ -154,8 +166,12 @@ def apply_merge_once(
             span_workspace.copy_(pair_workspace)
         spans = span_workspace
 
-    if prefix_workspace is None or prefix_workspace.size(0) != B:
-        prefix_workspace = torch.zeros((B,), dtype=torch.long, device=device)
+    if (
+        prefix_workspace is None
+        or prefix_workspace.size(0) != B
+        or prefix_workspace.dtype != torch.int32
+    ):
+        prefix_workspace = torch.zeros((B,), dtype=torch.int32, device=device)
 
     compact_tokens_inplace(seqs, valid, lengths, prefix_workspace)
     return seqs, valid, lengths, spans

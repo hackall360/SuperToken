@@ -20,5 +20,8 @@ def test_packed_batcher_double_buffer_reuse():
     assert first_valid.data_ptr() == third_valid.data_ptr()
     assert first_valid.data_ptr() != second_valid.data_ptr()
 
+    assert first_tokens.dtype == torch.int32
+    assert first_valid.dtype == torch.uint8
+
     for lengths in (first_lengths, second_lengths, third_lengths):
         assert torch.all(lengths == 1)

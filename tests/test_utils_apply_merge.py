@@ -11,15 +11,15 @@ from gpu_tokenizer.utils import apply_merge_once
 
 def _prepare_batch(seqs: list[list[int]]):
     max_len = max((len(seq) for seq in seqs), default=0)
-    tokens = torch.zeros((len(seqs), max_len), dtype=torch.long)
-    valid = torch.zeros((len(seqs), max_len), dtype=torch.long)
+    tokens = torch.zeros((len(seqs), max_len), dtype=torch.int32)
+    valid = torch.zeros((len(seqs), max_len), dtype=torch.uint8)
     lengths = torch.zeros(len(seqs), dtype=torch.long)
     for row, seq in enumerate(seqs):
         if not seq:
             continue
-        vals = torch.tensor(seq, dtype=torch.long)
+        vals = torch.tensor(seq, dtype=torch.int64)
         L = vals.numel()
-        tokens[row, :L] = vals
+        tokens[row, :L] = vals.to(torch.int32)
         valid[row, :L] = 1
         lengths[row] = L
     return tokens, valid, lengths
@@ -41,7 +41,7 @@ def test_apply_merge_inplace_matches_cpu_multi_step():
     B, L = tokens_cpu.shape
     width = max(L - 1, 0)
     pair_workspace_cpu = torch.zeros((B, width), dtype=torch.bool)
-    prefix_workspace_cpu = torch.zeros((B,), dtype=torch.long)
+    prefix_workspace_cpu = torch.zeros((B,), dtype=torch.int32)
     span_workspace_cpu = torch.zeros((B, width), dtype=torch.bool)
     cpu_spans: list[torch.Tensor] = []
 
@@ -72,7 +72,7 @@ def test_apply_merge_inplace_matches_cpu_multi_step():
     valid_gpu = valid_cpu.to("cuda")
     lengths_gpu = lengths_cpu.to("cuda")
     pair_workspace_gpu = torch.zeros((B, width), dtype=torch.bool, device="cuda")
-    prefix_workspace_gpu = torch.zeros((B,), dtype=torch.long, device="cuda")
+    prefix_workspace_gpu = torch.zeros((B,), dtype=torch.int32, device="cuda")
     span_workspace_gpu = torch.zeros((B, width), dtype=torch.bool, device="cuda")
     gpu_spans: list[torch.Tensor] = []
 
@@ -111,3 +111,15 @@ def test_apply_merge_inplace_matches_cpu_multi_step():
         keep = int(lengths_ref[row].item())
         assert torch.all(valid_ref[row, keep:] == 0)
         assert torch.all(tokens_ref[row, keep:] == 0)
+
+    assert tokens_ref.dtype == torch.int32
+    assert valid_ref.dtype == torch.uint8
+
+
+def test_apply_merge_guard_raises_for_uint32_overflow():
+    tokens = torch.tensor([[0, 1]], dtype=torch.int32)
+    valid = torch.ones_like(tokens, dtype=torch.uint8)
+    lengths = torch.tensor([2], dtype=torch.long)
+
+    with pytest.raises(OverflowError):
+        apply_merge_once(tokens, valid, lengths, 0, 1, (1 << 32))

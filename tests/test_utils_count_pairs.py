@@ -50,7 +50,7 @@ def _cpu_reference_count_pairs(seqs: torch.Tensor, valid: torch.Tensor):
 def test_count_pairs_matches_cpu_reference(dtype):
     torch.manual_seed(0)
     seqs = torch.randint(0, 512, (4, 32), dtype=dtype)
-    valid = torch.randint(0, 2, (4, 32), dtype=torch.long)
+    valid = torch.randint(0, 2, (4, 32), dtype=torch.uint8)
 
     pairs, counts, _, _, _ = _run_count_pairs(seqs, valid)
     ref_pairs, ref_counts = _cpu_reference_count_pairs(seqs.cpu(), valid.cpu())
@@ -62,7 +62,7 @@ def test_count_pairs_matches_cpu_reference(dtype):
 def test_count_pairs_device_matches_input():
     torch.manual_seed(0)
     seqs = torch.randint(0, 100, (2, 5), dtype=torch.long)
-    valid = torch.ones_like(seqs, dtype=torch.long)
+    valid = torch.ones_like(seqs, dtype=torch.uint8)
 
     pairs, counts, keys_buffer, counts_buffer, length_buffer = _run_count_pairs(seqs, valid)
     assert keys_buffer.device == seqs.device

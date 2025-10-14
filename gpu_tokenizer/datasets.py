@@ -25,9 +25,14 @@ class PackedBatcher:
 
     def _allocate_buffer(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         tokens = torch.full(
-            (self.bs, self._storage_width), -1, dtype=torch.long, pin_memory=True
+            (self.bs, self._storage_width),
+            -1,
+            dtype=torch.int32,
+            pin_memory=True,
         )
-        valid = torch.zeros((self.bs, self._storage_width), dtype=torch.long, pin_memory=True)
+        valid = torch.zeros(
+            (self.bs, self._storage_width), dtype=torch.uint8, pin_memory=True
+        )
         lengths = torch.zeros((self.bs,), dtype=torch.long)
         return tokens, valid, lengths
 
@@ -55,7 +60,8 @@ class PackedBatcher:
                     continue
                 max_len = max(max_len, L)
                 lengths[row] = L
-                tokens[row, :L] = torch.as_tensor(seq, dtype=torch.long)
+                vals = torch.as_tensor(seq, dtype=torch.long)
+                tokens[row, :L] = vals.to(torch.int32)
                 valid[row, :L] = 1
 
             # Ensure we always provide a view with at least one column to avoid zero-width tensors
