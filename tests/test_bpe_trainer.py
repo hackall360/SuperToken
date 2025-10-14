@@ -126,6 +126,53 @@ def test_histogram_cache_matches_baseline():
     assert baseline_trainer.vocab_size == delta_trainer.vocab_size
 
 
+def test_warm_start_plan_reduces_counts(monkeypatch):
+    seqs = [
+        [1, 2, 1, 2, 3],
+        [1, 2, 4, 2, 4],
+        [1, 2, 1, 2, 5],
+        [1, 2, 6, 2, 7],
+    ]
+    batch = _make_batch(seqs)
+    plan = GPUBPETrainer.precompute_warm_start_plan([batch], top_k=1)
+    assert plan["merges"], "expected a warm-start merge to be selected"
+
+    baseline_trainer = GPUBPETrainer(base_vocab=256, merges=2, device="cpu")
+    baseline_trainer._enable_histogram_cache = False
+    baseline_calls = {"count": 0}
+    original_cpu = GPUBPETrainer._invoke_count_pairs_cpu
+
+    def _count_baseline(self, batch_iter, impl):
+        baseline_calls["count"] += 1
+        return original_cpu(self, batch_iter, impl)
+
+    with monkeypatch.context() as ctx:
+        ctx.setattr(GPUBPETrainer, "_invoke_count_pairs_cpu", _count_baseline)
+        baseline_trainer.fit([batch], log_every=10)
+
+    seeded_trainer = GPUBPETrainer(
+        base_vocab=256,
+        merges=2,
+        device="cpu",
+        warm_start_merges=plan["merges"],
+        freeze_warm_start=True,
+    )
+    seeded_trainer._enable_histogram_cache = False
+    seeded_calls = {"count": 0}
+
+    def _count_seeded(self, batch_iter, impl):
+        seeded_calls["count"] += 1
+        return original_cpu(self, batch_iter, impl)
+
+    with monkeypatch.context() as ctx:
+        ctx.setattr(GPUBPETrainer, "_invoke_count_pairs_cpu", _count_seeded)
+        meta = seeded_trainer.fit([batch], log_every=10, warm_start_plan=plan)
+
+    assert seeded_calls["count"] < baseline_calls["count"]
+    assert seeded_trainer.merges[: len(plan["merges"])] == plan["merges"]
+    assert meta["warm_start"]["applied"] == plan["merges"]
+
+
 def test_histogram_delta_recounts_expected_spans(monkeypatch):
     seqs = [
         [1, 2, 3, 1, 2, 4],

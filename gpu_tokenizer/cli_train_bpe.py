@@ -22,6 +22,17 @@ def main() -> None:
         default=2048,
         help="Max initial batch size; autoscaler may select smaller values",
     )
+    parser.add_argument(
+        "--warm-start-ngrams",
+        type=int,
+        default=0,
+        help="Seed merges using the top-N bigrams from an n-gram histogram",
+    )
+    parser.add_argument(
+        "--freeze-warm-start",
+        action="store_true",
+        help="Prevent seeded merges from being reconsidered during training",
+    )
     args = parser.parse_args()
 
     packer = BytePacker()
@@ -35,8 +46,30 @@ def main() -> None:
     bs = min(args.bs, init.batch_size)
     batcher = PackedBatcher(seqs, batch_size=bs)
 
-    trainer = GPUBPETrainer(base_vocab=256, merges=args.merges, autoscaler=scaler)
-    meta = trainer.fit(batcher, log_every=100)
+    warm_plan = None
+    if args.warm_start_ngrams:
+        warm_plan = GPUBPETrainer.precompute_warm_start_plan(
+            batcher, args.warm_start_ngrams
+        )
+        if warm_plan["merges"]:
+            print(
+                f"Seeding {len(warm_plan['merges'])} merges from top "
+                f"{warm_plan['requested_top_k']} bigrams"
+            )
+
+    trainer = GPUBPETrainer(
+        base_vocab=256,
+        merges=args.merges,
+        autoscaler=scaler,
+        warm_start_merges=(warm_plan["merges"] if warm_plan else None),
+        freeze_warm_start=args.freeze_warm_start,
+    )
+    meta = trainer.fit(
+        batcher,
+        log_every=100,
+        warm_start_plan=warm_plan,
+        freeze_warm_start=args.freeze_warm_start if warm_plan else None,
+    )
     trainer.save("./bpe_out")
     print(meta)
 
