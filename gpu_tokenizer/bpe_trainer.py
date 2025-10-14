@@ -13,6 +13,12 @@ import torch
 
 from .autoscaler import AutoScaler
 from .cuda_kernels import apply_merge_and_compact as cuda_apply_merge_and_compact
+from .cpu_fastpath import (
+    FastPathWorkspaces,
+    apply_merge_fastpath,
+    count_pairs_fastpath,
+    should_route_to_cpu,
+)
 from .dtypes import (
     clamp_lengths_to_dtype,
     length_storage_dtype,
@@ -273,6 +279,30 @@ class MultiDeviceBatch:
                 sequences.append(seq)
         return sequences
 
+
+@dataclass
+class CPUFallbackBatch:
+    """Container representing a CPU-resident batch handled by the fast path."""
+
+    tokens: torch.Tensor
+    valid: torch.Tensor
+    lengths: torch.Tensor
+    spans: list[torch.Tensor] = field(default_factory=list)
+    pair_keys: Optional[torch.Tensor] = None
+    pair_counts: Optional[torch.Tensor] = None
+    workspaces: FastPathWorkspaces = field(default_factory=FastPathWorkspaces)
+
+    def clone(self) -> "CPUFallbackBatch":
+        return CPUFallbackBatch(
+            tokens=self.tokens.clone(),
+            valid=self.valid.clone(),
+            lengths=self.lengths.clone(),
+            spans=list(self.spans),
+            pair_keys=None if self.pair_keys is None else self.pair_keys.clone(),
+            pair_counts=None if self.pair_counts is None else self.pair_counts.clone(),
+            workspaces=self.workspaces,
+        )
+
     @classmethod
     def from_cpu_batch(
         cls,
@@ -378,6 +408,8 @@ class GPUBPETrainer:
         self._top_pairs_heap: list[tuple[int, int]] = []
         self._top_pairs_index: dict[int, int] = {}
         self._pair_count_lookup: dict[int, int] = {}
+        self._cpu_fallback_batches: int = 0
+        self._last_cpu_fallback_ratio: float = 0.0
 
     # ------------------------------------------------------------------
     # Transfer accounting helpers
@@ -389,6 +421,8 @@ class GPUBPETrainer:
         self.merge_transfer_log = []
         self.sync_intervals = []
         self._interval_merges = 0
+        self._cpu_fallback_batches = 0
+        self._last_cpu_fallback_ratio = 0.0
         for ctx in self._device_contexts.values():
             ctx.bytes_h2d = 0
             ctx.bytes_d2h = 0
@@ -871,7 +905,14 @@ class GPUBPETrainer:
         def _unpack_cpu_batch(
             batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
             | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
-            | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor], tuple[torch.Tensor, torch.Tensor] | None],
+            | Tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                list[torch.Tensor],
+                tuple[torch.Tensor, torch.Tensor] | None,
+            ]
+            | CPUFallbackBatch,
         ) -> tuple[
             torch.Tensor,
             torch.Tensor,
@@ -880,6 +921,15 @@ class GPUBPETrainer:
             Optional[torch.Tensor],
             Optional[torch.Tensor],
         ]:
+            if isinstance(batch, CPUFallbackBatch):
+                return (
+                    batch.tokens,
+                    batch.valid,
+                    batch.lengths,
+                    list(batch.spans),
+                    batch.pair_keys,
+                    batch.pair_counts,
+                )
             tokens_cpu = batch[0]
             valid_cpu = batch[1]
             lengths_cpu = batch[2]
@@ -899,16 +949,32 @@ class GPUBPETrainer:
             spans: list[torch.Tensor] | None = None,
             pair_keys: Optional[torch.Tensor] = None,
             pair_counts: Optional[torch.Tensor] = None,
-        ) -> tuple[
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            list[torch.Tensor],
-            Optional[tuple[torch.Tensor, torch.Tensor]],
-        ]:
+            *,
+            as_fallback: bool = False,
+            workspaces: Optional[FastPathWorkspaces] = None,
+        ) -> (
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                list[torch.Tensor],
+                Optional[tuple[torch.Tensor, torch.Tensor]],
+            ]
+            | CPUFallbackBatch
+        ):
             pair_tuple: Optional[tuple[torch.Tensor, torch.Tensor]] = None
             if pair_keys is not None and pair_counts is not None:
                 pair_tuple = (pair_keys, pair_counts)
+            if as_fallback:
+                return CPUFallbackBatch(
+                    tokens=tokens_cpu,
+                    valid=valid_cpu,
+                    lengths=lengths_cpu,
+                    spans=[] if spans is None else list(spans),
+                    pair_keys=None if pair_keys is None else pair_keys,
+                    pair_counts=None if pair_counts is None else pair_counts,
+                    workspaces=workspaces or FastPathWorkspaces(),
+                )
             return (
                 tokens_cpu,
                 valid_cpu,
@@ -1050,20 +1116,38 @@ class GPUBPETrainer:
 
         def _build_gpu_batches_from_sequences(
             sequences: list[list[int]], batch_size: int
-        ) -> list[MultiDeviceBatch]:
+        ) -> tuple[list[MultiDeviceBatch], list[CPUFallbackBatch]]:
             new_records: list[MultiDeviceBatch] = []
+            cpu_fallbacks: list[CPUFallbackBatch] = []
             if batch_size <= 0 or not sequences or not use_cuda:
-                return new_records
+                return new_records, cpu_fallbacks
             for cpu_batch in _iter_cpu_batches_from_sequences(
                 sequences, batch_size, pin=True
             ):
-                tokens_cpu, valid_cpu, lengths_cpu, _ = _unpack_cpu_batch(cpu_batch)
+                tokens_cpu, valid_cpu, lengths_cpu, spans, pair_keys, pair_counts = _unpack_cpu_batch(
+                    cpu_batch
+                )
                 multi_batch = MultiDeviceBatch.from_cpu_batch(
                     tokens_cpu, valid_cpu, lengths_cpu, device_contexts, _record_new_batch
                 )
+                B, L = tokens_cpu.shape
+                width = max(L - 1, 0)
+                if should_route_to_cpu(int(B), int(width)):
+                    fallback = _pack_cpu_batch(
+                        tokens_cpu.clone().to("cpu"),
+                        valid_cpu.clone().to("cpu"),
+                        lengths_cpu.clone().to("cpu"),
+                        spans=list(spans),
+                        pair_keys=None if pair_keys is None else pair_keys.clone(),
+                        pair_counts=None if pair_counts is None else pair_counts.clone(),
+                        as_fallback=True,
+                    )
+                    if isinstance(fallback, CPUFallbackBatch):
+                        cpu_fallbacks.append(fallback)
+                    continue
                 new_records.append(multi_batch)
             _mark_active_batches(new_records)
-            return new_records
+            return new_records, cpu_fallbacks
 
         def _reconfigure_batches(batch_size: int) -> None:
             nonlocal current_batches, gpu_batches
@@ -1078,9 +1162,29 @@ class GPUBPETrainer:
                 else:
                     source_batches = current_batches
                 sequences = _collect_sequences_from_mixed(source_batches)
-                new_records = _build_gpu_batches_from_sequences(sequences, batch_size)
+                new_records, cpu_fallbacks = _build_gpu_batches_from_sequences(
+                    sequences, batch_size
+                )
+                combined: list[
+                    Union[
+                        MultiDeviceBatch,
+                        CPUFallbackBatch,
+                        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]],
+                        Tuple[
+                            torch.Tensor,
+                            torch.Tensor,
+                            torch.Tensor,
+                            list[torch.Tensor],
+                            Optional[tuple[torch.Tensor, torch.Tensor]],
+                        ],
+                    ]
+                ] = []
+                if cpu_fallbacks:
+                    combined.extend(cpu_fallbacks)
+                combined.extend(new_records)
                 gpu_batches = new_records
-                current_batches = new_records
+                current_batches = combined
             else:
                 cpu_batches: list[
                     Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -1150,6 +1254,7 @@ class GPUBPETrainer:
             pair_counts_workspace: Optional[torch.Tensor] = None
             pair_count_length_workspace: Optional[torch.Tensor] = None
             for batch in batches:
+                is_fallback = isinstance(batch, CPUFallbackBatch)
                 x_cpu, v_cpu, lengths_cpu, spans, _, _ = _unpack_cpu_batch(batch)
                 x_snapshot = x_cpu.clone()
                 v_snapshot = v_cpu.clone()
@@ -1216,6 +1321,8 @@ class GPUBPETrainer:
                         list(spans),
                         keys_cpu,
                         counts_cpu,
+                        as_fallback=is_fallback,
+                        workspaces=batch.workspaces if is_fallback else None,
                     )
                 )
                 if keys_cpu.numel() > 0:
@@ -1271,6 +1378,7 @@ class GPUBPETrainer:
                     pair_keys,
                     pair_counts,
                 ) = _unpack_cpu_batch(batch)
+                is_fallback = isinstance(batch, CPUFallbackBatch)
                 try:
                     B, L = x_cpu.shape
                     width = max(L - 1, 0)
@@ -1370,6 +1478,8 @@ class GPUBPETrainer:
                             updated_spans,
                             pair_keys.clone(),
                             pair_counts.clone(),
+                            as_fallback=is_fallback,
+                            workspaces=batch.workspaces if is_fallback else None,
                         )
                     )
                 except RuntimeError as exc:
@@ -1384,6 +1494,8 @@ class GPUBPETrainer:
                                 list(spans),
                                 pair_keys,
                                 pair_counts,
+                                as_fallback=is_fallback,
+                                workspaces=batch.workspaces if is_fallback else None,
                             )
                         )
                 else:
@@ -1421,9 +1533,17 @@ class GPUBPETrainer:
 
             def _count_pairs_gpu(
                 batch_iter: Iterable[
-                    Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], MultiDeviceBatch]
+                    Union[
+                        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                        MultiDeviceBatch,
+                        CPUFallbackBatch,
+                    ]
                 ]
-            ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], list[MultiDeviceBatch]]:
+            ) -> tuple[
+                Optional[torch.Tensor],
+                Optional[torch.Tensor],
+                list[Union[MultiDeviceBatch, CPUFallbackBatch]],
+            ]:
                 nonlocal current_batches, gpu_batches, scale_state
                 if (
                     self._enable_histogram_cache
@@ -1442,7 +1562,8 @@ class GPUBPETrainer:
                         ctx.reset_activity()
                     local_keys: list[torch.Tensor] = []
                     local_counts: list[torch.Tensor] = []
-                    consumed: list[MultiDeviceBatch] = []
+                    consumed: list[Union[MultiDeviceBatch, CPUFallbackBatch]] = []
+                    cpu_consumed: list[CPUFallbackBatch] = []
                     pair_results: Dict[torch.device, list[GPUBatchRecord]] = {
                         dev: [] for dev in device_contexts
                     }
@@ -1455,6 +1576,20 @@ class GPUBPETrainer:
                     for batch in iterator:
                         multi_batch: Optional[MultiDeviceBatch]
                         try:
+                            if isinstance(batch, CPUFallbackBatch):
+                                consumed.append(batch)
+                                cpu_consumed.append(batch)
+                                tokens_cpu, valid_cpu, _lengths_cpu, _, _, _ = _unpack_cpu_batch(
+                                    batch
+                                )
+                                keys_cpu, counts_cpu = count_pairs_fastpath(tokens_cpu, valid_cpu)
+                                if keys_cpu.numel() > 0:
+                                    local_keys.append(keys_cpu.to(torch.long))
+                                    local_counts.append(counts_cpu.to(torch.int32))
+                                if self._enable_histogram_cache:
+                                    batch.pair_keys = keys_cpu.clone()
+                                    batch.pair_counts = counts_cpu.clone()
+                                continue
                             if isinstance(batch, MultiDeviceBatch):
                                 multi_batch = batch
                             else:
@@ -1504,13 +1639,19 @@ class GPUBPETrainer:
                         tail_batches: list[
                             Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], MultiDeviceBatch]
                         ] = list(iterator)
-                        sequences = _extract_sequences_from_gpu(consumed) if consumed else []
+                        sequences = _extract_sequences_from_gpu(
+                            [b for b in consumed if isinstance(b, MultiDeviceBatch)]
+                        )
+                        if cpu_consumed:
+                            sequences.extend(_extract_sequences_from_cpu(cpu_consumed))
                         if failed_cpu_batch is not None:
                             sequences.extend(_extract_sequences_from_cpu([failed_cpu_batch]))
                         if tail_batches:
                             sequences.extend(_collect_sequences_from_mixed(tail_batches))
                         prev_bs = scale_state.batch_size if scale_state is not None else None
-                        self.autoscaler.feedback(oom=True)
+                        self.autoscaler.feedback(
+                            oom=True, cpu_fallback_rate=self._last_cpu_fallback_ratio
+                        )
                         scale_state = self.autoscaler.state or scale_state
                         if scale_state is None:
                             raise RuntimeError("Autoscaler did not provide a state after OOM")
@@ -1519,9 +1660,15 @@ class GPUBPETrainer:
                             raise RuntimeError(
                                 "CUDA OOM could not be resolved by autoscaler batch size reduction"
                             )
-                        new_gpu_batches = _build_gpu_batches_from_sequences(sequences, new_bs)
+                        new_gpu_batches, fallback_batches = _build_gpu_batches_from_sequences(
+                            sequences, new_bs
+                        )
                         gpu_batches = new_gpu_batches
-                        current_batches = new_gpu_batches
+                        combined_batches: list[Union[MultiDeviceBatch, CPUFallbackBatch]] = []
+                        if fallback_batches:
+                            combined_batches.extend(fallback_batches)
+                        combined_batches.extend(new_gpu_batches)
+                        current_batches = combined_batches
                         batch_iter = current_batches
                         if on_batch_size_change is not None:
                             on_batch_size_change(new_bs)
@@ -1567,7 +1714,9 @@ class GPUBPETrainer:
                     else:
                         reduced_keys = None
                         reduced_counts = None
-                    gpu_batches = consumed
+                    gpu_batches = [
+                        batch for batch in consumed if isinstance(batch, MultiDeviceBatch)
+                    ]
                     if reduced_keys is None or reduced_counts is None:
                         cached_keys = torch.empty((0,), dtype=torch.long)
                         cached_counts = torch.empty((0,), dtype=torch.int32)
@@ -1581,21 +1730,30 @@ class GPUBPETrainer:
                     self._refresh_top_pairs_from_cache()
                     if not self._enable_histogram_cache:
                         self._invalidate_hist_cache()
+                    total_batches = max(1, len(consumed))
+                    self._cpu_fallback_batches += len(cpu_consumed)
+                    self._last_cpu_fallback_ratio = len(cpu_consumed) / float(total_batches)
                     return cached_keys, cached_counts, consumed
 
             def _apply_merge_gpu(
-                batch_iter: Iterable[MultiDeviceBatch],
+                batch_iter: Iterable[Union[MultiDeviceBatch, CPUFallbackBatch]],
                 a_id: int,
                 b_id: int,
                 new_id: int,
                 merge_idx: int,
                 force_sync: bool = False,
-            ) -> tuple[list[MultiDeviceBatch], bool, dict[str, object]]:
+            ) -> tuple[
+                list[Union[MultiDeviceBatch, CPUFallbackBatch]],
+                bool,
+                dict[str, object],
+            ]:
                 nonlocal current_batches, gpu_batches, scale_state
                 oom_seen = False
                 while True:
                     records = list(batch_iter)
-                    _mark_active_batches(records)
+                    gpu_records = [b for b in records if isinstance(b, MultiDeviceBatch)]
+                    cpu_records = [b for b in records if isinstance(b, CPUFallbackBatch)]
+                    _mark_active_batches(gpu_records)
                     need_sync = force_sync or (merge_idx % self.sync_every == 0)
                     pending_copy: Dict[torch.device, bool] = {
                         dev: False for dev in device_contexts
@@ -1605,7 +1763,13 @@ class GPUBPETrainer:
                     }
                     copied_bytes = 0
                     retry_required = False
-                    for batch in records:
+                    updated_cpu: list[Union[MultiDeviceBatch, CPUFallbackBatch]] = []
+                    if cpu_records:
+                        cpu_updates, _cpu_oom, _cpu_sync = _apply_merge_cpu(
+                            cpu_records, a_id, b_id, new_id
+                        )
+                        updated_cpu.extend(cpu_updates)
+                    for batch in gpu_records:
                         for dev, shard in batch.iter_shards():
                             ctx = device_contexts[dev]
                             try:
@@ -1728,9 +1892,11 @@ class GPUBPETrainer:
                         if retry_required:
                             break
                     if retry_required:
-                        sequences = _extract_sequences_from_gpu(records)
+                        sequences = _extract_sequences_from_gpu(gpu_records)
                         prev_bs = scale_state.batch_size if scale_state is not None else None
-                        self.autoscaler.feedback(oom=True)
+                        self.autoscaler.feedback(
+                            oom=True, cpu_fallback_rate=self._last_cpu_fallback_ratio
+                        )
                         scale_state = self.autoscaler.state or scale_state
                         if scale_state is None:
                             raise RuntimeError("Autoscaler did not provide a state after OOM")
@@ -1739,9 +1905,15 @@ class GPUBPETrainer:
                             raise RuntimeError(
                                 "CUDA OOM could not be resolved by autoscaler batch size reduction"
                             )
-                        new_gpu_batches = _build_gpu_batches_from_sequences(sequences, new_bs)
+                        new_gpu_batches, fallback_batches = _build_gpu_batches_from_sequences(
+                            sequences, new_bs
+                        )
                         gpu_batches = new_gpu_batches
-                        current_batches = new_gpu_batches
+                        combined_batches: list[Union[MultiDeviceBatch, CPUFallbackBatch]] = []
+                        if fallback_batches:
+                            combined_batches.extend(fallback_batches)
+                        combined_batches.extend(new_gpu_batches)
+                        current_batches = combined_batches
                         batch_iter = current_batches
                         if on_batch_size_change is not None:
                             on_batch_size_change(new_bs)
@@ -1753,7 +1925,7 @@ class GPUBPETrainer:
                     if need_sync:
                         for dev, ctx in device_contexts.items():
                             torch.cuda.current_stream(device=dev).wait_stream(ctx.copy_stream)
-                        for batch in records:
+                        for batch in gpu_records:
                             for _dev, shard in batch.iter_shards():
                                 shard.resolve_host()
                     if profile_streams:
@@ -1767,7 +1939,14 @@ class GPUBPETrainer:
                                     assert ctx.copy_stream.query(), "copy stream did not drain"
                                 if compute_pending:
                                     assert ctx.compute_stream.query(), "compute stream did not drain"
-                    return records, oom_seen, {"sync": need_sync and copied_bytes > 0, "bytes": copied_bytes}
+                    updated_records: list[Union[MultiDeviceBatch, CPUFallbackBatch]] = []
+                    if updated_cpu:
+                        updated_records.extend(updated_cpu)
+                    updated_records.extend(gpu_records)
+                    return updated_records, oom_seen, {
+                        "sync": need_sync and copied_bytes > 0,
+                        "bytes": copied_bytes,
+                    }
 
         warm_plan = warm_start_plan if warm_start_plan is not None else self._warm_start_plan
         if warm_plan is not None:
@@ -1858,7 +2037,11 @@ class GPUBPETrainer:
                         raise RuntimeError(
                             "CUDA out of memory encountered while applying warm-start merges"
                         )
-                    gpu_batches = list(current_batches)
+                    gpu_batches = [
+                        batch
+                        for batch in current_batches
+                        if isinstance(batch, MultiDeviceBatch)
+                    ]
                     self._interval_merges += 1
                     if sync_report.get("sync"):
                         self._close_sync_interval(step + 1, sync_report.get("bytes", 0))
@@ -1921,7 +2104,11 @@ class GPUBPETrainer:
                         global_counts,
                         consumed_batches,
                     ) = self._invoke_count_pairs_gpu(current_batches, _count_pairs_gpu)
-                    gpu_batches = consumed_batches
+                    gpu_batches = [
+                        batch
+                        for batch in consumed_batches
+                        if isinstance(batch, MultiDeviceBatch)
+                    ]
                 else:
                     (
                         global_keys,
@@ -1969,7 +2156,11 @@ class GPUBPETrainer:
                 current_batches, oom_seen, sync_report = _apply_merge_gpu(
                     current_batches, a_id, b_id, new_id, step + 1
                 )
-                gpu_batches = list(current_batches)
+                gpu_batches = [
+                    batch
+                    for batch in current_batches
+                    if isinstance(batch, MultiDeviceBatch)
+                ]
                 self._interval_merges += 1
                 if sync_report.get("sync"):
                     self._close_sync_interval(step + 1, sync_report.get("bytes", 0))
@@ -1979,7 +2170,11 @@ class GPUBPETrainer:
             if not use_cuda:
                 self._interval_merges = 0
             self._record_merge_snapshot(step)
-            self.autoscaler.feedback(step_time_s=time.time() - t0, oom=oom_seen)
+            self.autoscaler.feedback(
+                step_time_s=time.time() - t0,
+                oom=oom_seen,
+                cpu_fallback_rate=self._last_cpu_fallback_ratio,
+            )
         if use_cuda and gpu_batches is not None:
             final_bytes = _finalize_host_sync(gpu_batches)
             if self._interval_merges > 0:
@@ -2013,6 +2208,10 @@ class GPUBPETrainer:
                     if self.merge_transfer_log
                     else 0.0
                 ),
+                "cpu_fallback": {
+                    "batches": self._cpu_fallback_batches,
+                    "ratio": self._last_cpu_fallback_ratio,
+                },
             },
         }
 

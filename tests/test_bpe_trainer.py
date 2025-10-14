@@ -2,13 +2,21 @@ import pytest
 from types import MethodType
 
 torch = pytest.importorskip("torch")
+pytest.importorskip("torch.utils")
 
 from gpu_tokenizer import bpe_trainer as bt
-from gpu_tokenizer.autoscaler import ScaleState
+from gpu_tokenizer.autoscaler import AutoScaler, ScaleState
 from gpu_tokenizer.bpe_trainer import GPUBPETrainer, _aggregate_pair_keys
 from gpu_tokenizer.dtypes import length_storage_dtype
 from gpu_tokenizer.datasets import PackedBatcher
 from gpu_tokenizer.bpe_trainer import GPUBatchRecord
+from gpu_tokenizer.cpu_fastpath import (
+    FastPathWorkspaces,
+    apply_merge_fastpath,
+    count_pairs_fastpath,
+    should_route_to_cpu,
+)
+from gpu_tokenizer.utils import apply_merge_once, count_pairs
 
 
 def test_aggregate_pair_keys_repeated_counts():
@@ -65,6 +73,82 @@ def _make_batch(seqs: list[list[int]]):
         tokens = tokens.pin_memory()
         valid = valid.pin_memory()
     return tokens, valid, lengths
+
+
+def test_cpu_fastpath_pair_count_matches_baseline():
+    seqs = [[1, 2, 3, 4], [4, 3, 2, 1]]
+    tokens, valid, lengths = _make_batch(seqs)
+    tokens = tokens.clone()
+    valid = valid.clone()
+    B, L = tokens.shape
+    width = max(L - 1, 0)
+    capacity = max(B * width, 1)
+    pair_workspace = torch.empty((capacity, 2), dtype=tokens.dtype)
+    count_workspace = torch.empty((capacity,), dtype=torch.int32)
+    pair_length = torch.zeros((1,), dtype=torch.long)
+    count_pairs(tokens, valid, pair_workspace, count_workspace, pair_length)
+    length = int(pair_length.item())
+    baseline_pairs = pair_workspace[:length]
+    baseline_counts = count_workspace[:length]
+    baseline_keys = (
+        (baseline_pairs[:, 0].to(torch.long) << 32)
+        | baseline_pairs[:, 1].to(torch.long)
+    )
+
+    fast_keys, fast_counts = count_pairs_fastpath(tokens, valid)
+    assert torch.equal(torch.sort(baseline_keys)[0], torch.sort(fast_keys)[0])
+    assert torch.equal(
+        torch.sort(baseline_counts.to(torch.int32))[0],
+        torch.sort(fast_counts.to(torch.int32))[0],
+    )
+
+
+def test_cpu_fastpath_merge_matches_reference():
+    seqs = [[1, 2, 1, 2], [2, 1, 2, 1]]
+    tokens, valid, lengths = _make_batch(seqs)
+    tokens_fast = tokens.clone()
+    valid_fast = valid.clone()
+    lengths_fast = lengths.clone()
+    workspaces = FastPathWorkspaces()
+    apply_merge_fastpath(tokens_fast, valid_fast, lengths_fast, 1, 2, 260, workspaces)
+
+    tokens_ref = tokens.clone()
+    valid_ref = valid.clone()
+    lengths_ref = lengths.clone()
+    apply_merge_once(
+        tokens_ref,
+        valid_ref,
+        lengths_ref,
+        1,
+        2,
+        260,
+        None,
+        None,
+        None,
+        None,
+    )
+
+    assert torch.equal(tokens_fast, tokens_ref)
+    assert torch.equal(valid_fast, valid_ref)
+    assert torch.equal(lengths_fast.to(torch.int64), lengths_ref.to(torch.int64))
+
+
+def test_should_route_to_cpu_heuristic():
+    assert should_route_to_cpu(1, 10)
+    assert should_route_to_cpu(8, 0)
+    assert not should_route_to_cpu(32, 64)
+
+
+def test_autoscaler_cpu_fallback_feedback(monkeypatch):
+    scaler = AutoScaler(device="cuda")
+    scaler.state = ScaleState(batch_size=512, cpu_workers=4, h2d_mb=512, cpu_fallback_rate=0.0)
+
+    monkeypatch.setattr(scaler, "_gpu_caps", lambda: (900, 1000))
+    monkeypatch.setattr(scaler, "_cpu_caps", lambda: (8, 1 << 20, 1 << 20, 10.0))
+
+    scaler.feedback(step_time_s=0.1, cpu_fallback_rate=0.5)
+    assert pytest.approx(0.5, rel=1e-3) == scaler.state.cpu_fallback_rate
+    assert scaler.state.batch_size <= 512
 
 
 def test_gpu_batch_record_flags_overflow_for_uint16_lengths():
