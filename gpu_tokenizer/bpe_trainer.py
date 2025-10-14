@@ -12,6 +12,11 @@ import torch
 
 from .autoscaler import AutoScaler
 from .cuda_kernels import apply_merge_and_compact as cuda_apply_merge_and_compact
+from .dtypes import (
+    clamp_lengths_to_dtype,
+    length_storage_dtype,
+    promote_length_sum_dtype,
+)
 from .utils import aggregate_pair_keys, apply_merge_once, count_pairs, reduce_pair_histograms
 
 
@@ -41,6 +46,8 @@ class GPUBatchRecord:
     pair_counts_buffer: Optional[torch.Tensor] = None
     pair_count_length: Optional[torch.Tensor] = None
     merge_kernel_warm: bool = False
+    length_overflow: Optional[torch.Tensor] = None
+    host_length_overflow: Optional[torch.Tensor] = None
 
 
     @classmethod
@@ -51,12 +58,18 @@ class GPUBatchRecord:
         lengths_cpu: torch.Tensor,
         device: torch.device,
     ) -> "GPUBatchRecord":
+        storage_width = int(tokens_cpu.shape[1])
+        length_dtype = length_storage_dtype(storage_width)
         tokens_host = tokens_cpu.to(torch.int32).pin_memory()
         valid_host = valid_cpu.to(torch.uint8).pin_memory()
-        lengths_host = lengths_cpu.clone().pin_memory()
+        coerced_lengths, overflow = clamp_lengths_to_dtype(lengths_cpu, length_dtype)
+        lengths_host = coerced_lengths.pin_memory()
         tokens_dev = tokens_host.to(device=device, non_blocking=True)
         valid_dev = valid_host.to(device=device, non_blocking=True)
         lengths_dev = lengths_host.to(device=device, non_blocking=True)
+        overflow_dev: Optional[torch.Tensor] = None
+        if overflow is not None:
+            overflow_dev = overflow.to(device=device, non_blocking=True)
         record = cls(
             tokens=tokens_dev,
             valid=valid_dev,
@@ -65,6 +78,8 @@ class GPUBatchRecord:
             host_valid=valid_host,
             host_lengths=lengths_host,
             host_dirty=False,
+            length_overflow=overflow_dev,
+            host_length_overflow=overflow,
         )
         record.ensure_workspaces()
         return record
@@ -86,9 +101,22 @@ class GPUBatchRecord:
             self.merge_kernel_warm = False
         if width > 0 and (self.span_workspace is None or self.span_workspace.shape != (B, width)):
             self.span_workspace = torch.zeros((B, width), dtype=torch.bool, device=device)
-        if self.prefix_workspace is None or self.prefix_workspace.shape[0] != B:
-            self.prefix_workspace = torch.zeros((B,), dtype=torch.int32, device=device)
+        prefix_dtype = self.lengths.dtype
+        if (
+            self.prefix_workspace is None
+            or self.prefix_workspace.shape[0] != B
+            or self.prefix_workspace.dtype != prefix_dtype
+        ):
+            self.prefix_workspace = torch.zeros((B,), dtype=prefix_dtype, device=device)
             self.merge_kernel_warm = False
+        if (
+            self.length_overflow is None
+            or self.length_overflow.shape != (B,)
+            or self.length_overflow.device != device
+        ):
+            self.length_overflow = torch.zeros((B,), dtype=torch.bool, device=device)
+        else:
+            self.length_overflow.zero_()
         capacity = B * width
         if capacity == 0:
             if self.pair_keys_buffer is None or self.pair_keys_buffer.shape != (0, 2):
@@ -127,6 +155,13 @@ class GPUBatchRecord:
             or self.host_lengths.dtype != self.lengths.dtype
         ):
             self.host_lengths = torch.empty_like(self.lengths, device="cpu").pin_memory()
+        if (
+            self.host_length_overflow is None
+            or self.host_length_overflow.shape != self.lengths.shape
+        ):
+            self.host_length_overflow = torch.zeros(
+                self.lengths.shape, dtype=torch.bool, device="cpu"
+            ).pin_memory()
 
     def wait_for_device(self, stream: torch.cuda.Stream) -> None:
         """Ensure device computations affecting this batch are completed."""
@@ -162,11 +197,24 @@ class GPUBatchRecord:
         assert self.host_tokens is not None
         assert self.host_valid is not None
         self.wait_for_host()
-        lengths_cpu = self.host_valid.sum(dim=-1, dtype=self.lengths.dtype)
-        if self.host_lengths is None or self.host_lengths.shape != lengths_cpu.shape:
-            self.host_lengths = lengths_cpu.pin_memory()
+        sum_dtype = promote_length_sum_dtype(self.lengths.dtype)
+        lengths_cpu = self.host_valid.sum(dim=-1, dtype=sum_dtype)
+        coerced, overflow = clamp_lengths_to_dtype(lengths_cpu, self.lengths.dtype)
+        if self.host_lengths is None or self.host_lengths.shape != coerced.shape:
+            self.host_lengths = coerced.pin_memory()
         else:
-            self.host_lengths.copy_(lengths_cpu)
+            self.host_lengths.copy_(coerced)
+        if overflow is not None:
+            if self.host_length_overflow is None or self.host_length_overflow.shape != overflow.shape:
+                self.host_length_overflow = overflow.pin_memory()
+            else:
+                self.host_length_overflow.copy_(overflow)
+            if self.length_overflow is not None and self.length_overflow.shape == overflow.shape:
+                self.length_overflow.copy_(overflow.to(self.length_overflow.device))
+        elif self.host_length_overflow is not None:
+            self.host_length_overflow.zero_()
+            if self.length_overflow is not None:
+                self.length_overflow.zero_()
         self.host_dirty = False
         return self.host_tokens, self.host_valid, self.host_lengths
 
@@ -630,7 +678,8 @@ class GPUBPETrainer:
                 width = max(1, max_len)
                 tokens = torch.full((rows, width), -1, dtype=torch.int32)
                 valid = torch.zeros((rows, width), dtype=torch.uint8)
-                lengths = torch.zeros((rows,), dtype=torch.long)
+                length_dtype = length_storage_dtype(width)
+                lengths = torch.zeros((rows,), dtype=length_dtype)
                 for row, seq in enumerate(chunk):
                     if not seq:
                         continue
@@ -916,6 +965,7 @@ class GPUBPETrainer:
             pair_workspace: Optional[torch.Tensor] = None
             prefix_workspace: Optional[torch.Tensor] = None
             span_workspace: Optional[torch.Tensor] = None
+            overflow_workspace: Optional[torch.Tensor] = None
             for batch in batch_iter:
                 (
                     x_cpu,
@@ -930,10 +980,19 @@ class GPUBPETrainer:
                     width = max(L - 1, 0)
                     if pair_workspace is None or pair_workspace.shape != (B, width):
                         pair_workspace = torch.zeros((B, width), dtype=torch.bool, device=cpu_device)
-                    if prefix_workspace is None or prefix_workspace.shape[0] != B:
-                        prefix_workspace = torch.zeros((B,), dtype=torch.int32, device=cpu_device)
+                    prefix_dtype = lengths_cpu.dtype
+                    if (
+                        prefix_workspace is None
+                        or prefix_workspace.shape[0] != B
+                        or prefix_workspace.dtype != prefix_dtype
+                    ):
+                        prefix_workspace = torch.zeros((B,), dtype=prefix_dtype, device=cpu_device)
                     if span_workspace is None or span_workspace.shape != (B, width):
                         span_workspace = torch.zeros((B, width), dtype=torch.bool, device=cpu_device)
+                    if overflow_workspace is None or overflow_workspace.shape != (B,):
+                        overflow_workspace = torch.zeros((B,), dtype=torch.bool, device=cpu_device)
+                    else:
+                        overflow_workspace.zero_()
                     if (
                         self._enable_histogram_cache
                         and self._hist_cache_valid
@@ -957,6 +1016,7 @@ class GPUBPETrainer:
                         pair_workspace,
                         prefix_workspace,
                         span_workspace,
+                        overflow_workspace,
                     )
                     span_bool = span_mask.to(torch.bool).clone()
                     updated_spans = list(spans)
@@ -1263,12 +1323,16 @@ class GPUBPETrainer:
                                             int(sentinel),
                                             int(sentinel),
                                         )
-                                        if shard.lengths.dtype == shard.prefix_workspace.dtype:
-                                            shard.lengths.copy_(shard.prefix_workspace)
-                                        else:
+                                        prefix_vals = shard.prefix_workspace.to(torch.int64)
+                                        if shard.lengths.dtype == torch.uint16:
+                                            max_val = 65535
                                             shard.lengths.copy_(
-                                                shard.prefix_workspace.to(shard.lengths.dtype)
+                                                torch.clamp_max(prefix_vals, max_val).to(torch.uint16)
                                             )
+                                        else:
+                                            shard.lengths.copy_(prefix_vals.to(shard.lengths.dtype))
+                                        if shard.length_overflow is not None:
+                                            shard.length_overflow.zero_()
                                         shard.merge_kernel_warm = True
                                     if (
                                         self._enable_histogram_cache
@@ -1293,6 +1357,7 @@ class GPUBPETrainer:
                                         shard.pair_workspace,
                                         shard.prefix_workspace,
                                         shard.span_workspace,
+                                        shard.length_overflow,
                                     )
                                     span_bool = span_mask.to(torch.bool).clone()
                                     shard.span_history.append(span_bool)

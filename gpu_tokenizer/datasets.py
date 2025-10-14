@@ -8,6 +8,8 @@ import random
 
 import torch
 
+from .dtypes import length_storage_dtype
+
 
 class PackedBatcher:
     """Stream padded batches of integer token sequences using double buffers."""
@@ -21,6 +23,7 @@ class PackedBatcher:
         max_len = max((len(seq) for seq in self.sequences), default=0)
         # Allocate storage width of at least 1 to keep tensor shapes valid even when empty.
         self._storage_width = max(1, max_len)
+        self._length_dtype = length_storage_dtype(self._storage_width)
         self._buffers = [self._allocate_buffer() for _ in range(2)]
 
     def _allocate_buffer(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -33,7 +36,7 @@ class PackedBatcher:
         valid = torch.zeros(
             (self.bs, self._storage_width), dtype=torch.uint8, pin_memory=True
         )
-        lengths = torch.zeros((self.bs,), dtype=torch.long)
+        lengths = torch.zeros((self.bs,), dtype=self._length_dtype, pin_memory=True)
         return tokens, valid, lengths
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:

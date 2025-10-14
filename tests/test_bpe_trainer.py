@@ -5,7 +5,9 @@ torch = pytest.importorskip("torch")
 from gpu_tokenizer import bpe_trainer as bt
 from gpu_tokenizer.autoscaler import ScaleState
 from gpu_tokenizer.bpe_trainer import GPUBPETrainer, _aggregate_pair_keys
+from gpu_tokenizer.dtypes import length_storage_dtype
 from gpu_tokenizer.datasets import PackedBatcher
+from gpu_tokenizer.bpe_trainer import GPUBatchRecord
 
 
 def test_aggregate_pair_keys_repeated_counts():
@@ -47,7 +49,8 @@ def _make_batch(seqs: list[list[int]]):
     max_len = max(len(seq) for seq in seqs)
     tokens = torch.full((len(seqs), max_len), -1, dtype=torch.int32)
     valid = torch.zeros((len(seqs), max_len), dtype=torch.uint8)
-    lengths = torch.zeros(len(seqs), dtype=torch.long)
+    length_dtype = length_storage_dtype(max_len)
+    lengths = torch.zeros(len(seqs), dtype=length_dtype)
     for row, seq in enumerate(seqs):
         L = len(seq)
         if L == 0:
@@ -59,6 +62,24 @@ def _make_batch(seqs: list[list[int]]):
         tokens = tokens.pin_memory()
         valid = valid.pin_memory()
     return tokens, valid, lengths
+
+
+def test_gpu_batch_record_flags_overflow_for_uint16_lengths():
+    width = 65535
+    tokens = torch.zeros((1, width), dtype=torch.int32)
+    valid = torch.ones((1, width), dtype=torch.uint8)
+    lengths = torch.tensor([width + 10], dtype=torch.int64)
+    record = GPUBatchRecord.from_cpu(tokens, valid, lengths, torch.device("cpu"))
+
+    assert record.lengths.dtype == torch.uint16
+    assert record.length_overflow is not None
+    assert bool(record.length_overflow.item())
+
+    host_tokens, host_valid, host_lengths = record.resolve_host()
+    assert host_lengths.dtype == torch.uint16
+    assert host_tokens.data_ptr() == record.host_tokens.data_ptr()
+    assert host_valid.data_ptr() == record.host_valid.data_ptr()
+    assert bool(record.host_length_overflow is not None and record.host_length_overflow.item())
 
 
 def test_fit_supports_streaming_iterator():

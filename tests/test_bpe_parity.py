@@ -23,6 +23,7 @@ torch = pytest.importorskip("torch")
 import torch.multiprocessing as mp
 
 from gpu_tokenizer.bpe_trainer import GPUBPETrainer
+from gpu_tokenizer.dtypes import length_storage_dtype
 from gpu_tokenizer.utils import apply_merge_once
 from tests.adversarial_corpora import AdversarialCorpus, get_adversarial_corpora
 
@@ -59,7 +60,8 @@ def _build_tensor_batches(byte_sequences: Sequence[Sequence[int]]):
     width = max(1, max((len(seq) for seq in byte_sequences), default=0))
     tokens = torch.full((rows, width), -1, dtype=torch.int32)
     valid = torch.zeros((rows, width), dtype=torch.uint8)
-    lengths = torch.zeros((rows,), dtype=torch.long)
+    length_dtype = length_storage_dtype(width)
+    lengths = torch.zeros((rows,), dtype=length_dtype)
     for row, seq in enumerate(byte_sequences):
         if not seq:
             continue
