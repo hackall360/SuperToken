@@ -6,7 +6,8 @@ import argparse
 import glob
 import sys
 from pathlib import Path
-from typing import Iterable, Sequence
+from contextlib import ExitStack
+from typing import Iterable, Iterator, Sequence
 
 import torch
 
@@ -18,6 +19,7 @@ from gpu_tokenizer import (
     PackedBatcher,
     utils,
 )
+from gpu_tokenizer.io import MemoryMappedShard
 
 __all__ = [
     "AutoScaler",
@@ -42,13 +44,22 @@ def _expand_data_patterns(patterns: Sequence[str]) -> list[Path]:
     return files
 
 
-def _load_sequences(paths: Iterable[Path], bos: int | None, eos: int | None) -> list[list[int]]:
+def _load_sequences(
+    paths: Iterable[Path], bos: int | None, eos: int | None
+) -> Iterator[Iterator[int]]:
     packer = BytePacker(bos=bos, eos=eos)
-    return [packer.encode_file(str(path)) for path in paths]
+
+    def _generator() -> Iterator[Iterator[int]]:
+        with ExitStack() as stack:
+            for path in paths:
+                shard = stack.enter_context(MemoryMappedShard(path))
+                yield packer.encode_shard(shard)
+
+    return _generator()
 
 
 def _iter_packed_batches(
-    sequences: list[list[int]],
+    sequences: Iterable[Iterable[int]],
     batch_size: int,
     seed: int,
 ) -> Iterable[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
@@ -56,7 +67,7 @@ def _iter_packed_batches(
 
 
 def _build_unigram_batches(
-    sequences: list[list[int]],
+    sequences: Iterable[Iterable[int]],
     batch_size: int,
     seed: int,
 ) -> list[torch.Tensor]:
