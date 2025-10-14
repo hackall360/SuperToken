@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from .autoscaler import AutoScaler
 from .cpu_packer import BytePacker
-from .datasets import PackedBatcher
-from .io import MemoryMappedShard
+from .datasets import PackedBatcher, StreamingPackedBatcher
+from .io import CorpusStreamer, MemoryMappedShard
 from . import ngram_stats, utils
 
 try:  # pragma: no cover - optional torch dependency
@@ -25,7 +25,9 @@ __all__ = [
         "GPUUnigramTrainer",
         "BytePacker",
         "PackedBatcher",
+        "StreamingPackedBatcher",
         "MemoryMappedShard",
+        "CorpusStreamer",
         "AutoScaler",
         "ngram_stats",
         "utils",

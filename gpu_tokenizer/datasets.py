@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Iterable, Iterator, List, Sequence, Tuple
+from typing import Callable, Iterable, Iterator, List, Sequence, Tuple
 
 import random
 
 import torch
 
 from .dtypes import length_storage_dtype
+from .io import CorpusStreamer, DecodedShard
 
 
 class PackedBatcher:
@@ -80,3 +81,87 @@ class PackedBatcher:
                 lengths[:rows],
             )
             buf_idx = 1 - buf_idx
+
+
+class StreamingPackedBatcher:
+    """Pack batches from a :class:`CorpusStreamer` without preloading shards."""
+
+    def __init__(
+        self,
+        streamer: CorpusStreamer,
+        encode_view: Callable[[memoryview], Iterator[int]],
+        *,
+        batch_size: int = 1024,
+    ) -> None:
+        self.streamer = streamer
+        self.encode_view = encode_view
+        self.bs = batch_size
+        self._storage_width = 1
+        self._length_dtype = length_storage_dtype(self._storage_width)
+        self._buffers = [self._allocate_buffer() for _ in range(2)]
+
+    def _allocate_buffer(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        tokens = torch.full(
+            (self.bs, self._storage_width),
+            -1,
+            dtype=torch.int32,
+            pin_memory=True,
+        )
+        valid = torch.zeros((self.bs, self._storage_width), dtype=torch.uint8, pin_memory=True)
+        lengths = torch.zeros((self.bs,), dtype=self._length_dtype, pin_memory=True)
+        return tokens, valid, lengths
+
+    def _ensure_width(self, width: int) -> None:
+        width = max(1, width)
+        if width <= self._storage_width:
+            return
+        self._storage_width = width
+        self._length_dtype = length_storage_dtype(self._storage_width)
+        self._buffers = [self._allocate_buffer() for _ in range(2)]
+
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        buf_idx = 0
+        rows: list[list[int]] = []
+        shards: list[DecodedShard] = []
+        for decoded in self.streamer:
+            seq = list(self.encode_view(decoded.view))
+            rows.append(seq)
+            shards.append(decoded)
+            if len(rows) == self.bs:
+                yield from self._emit_batch(rows, shards, buf_idx)
+                buf_idx = 1 - buf_idx
+                rows = []
+                shards = []
+        if rows:
+            yield from self._emit_batch(rows, shards, buf_idx)
+
+    def _emit_batch(
+        self,
+        rows: list[list[int]],
+        shards: list[DecodedShard],
+        buf_idx: int,
+    ) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        max_len = max((len(r) for r in rows), default=0)
+        self._ensure_width(max_len)
+        tokens, valid, lengths = self._buffers[buf_idx]
+        count = len(rows)
+        tokens[:count].fill_(-1)
+        valid[:count].zero_()
+        lengths[:count].zero_()
+
+        for row_idx, seq in enumerate(rows):
+            if not seq:
+                lengths[row_idx] = 0
+                continue
+            L = len(seq)
+            lengths[row_idx] = L
+            vals = torch.as_tensor(seq, dtype=torch.long)
+            tokens[row_idx, :L] = vals.to(torch.int32)
+            valid[row_idx, :L] = 1
+
+        width = max(1, max_len)
+        try:
+            yield tokens[:count, :width], valid[:count, :width], lengths[:count]
+        finally:
+            for shard in shards:
+                shard.release()

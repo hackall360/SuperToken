@@ -17,9 +17,10 @@ from gpu_tokenizer import (
     GPUBPETrainer,
     GPUUnigramTrainer,
     PackedBatcher,
+    StreamingPackedBatcher,
     utils,
 )
-from gpu_tokenizer.io import MemoryMappedShard
+from gpu_tokenizer.io import CorpusStreamer, MemoryMappedShard
 
 __all__ = [
     "AutoScaler",
@@ -30,18 +31,6 @@ __all__ = [
     "utils",
     "main",
 ]
-
-
-def _expand_data_patterns(patterns: Sequence[str]) -> list[Path]:
-    files: list[Path] = []
-    for pattern in patterns:
-        for path in glob.glob(pattern, recursive=True):
-            p = Path(path)
-            if p.is_file():
-                files.append(p)
-    if not files:
-        raise SystemExit("No input files matched the provided --data globs")
-    return files
 
 
 def _load_sequences(
@@ -56,6 +45,18 @@ def _load_sequences(
                 yield packer.encode_shard(shard)
 
     return _generator()
+
+
+def _expand_data_patterns(patterns: Sequence[str]) -> list[Path]:
+    files: list[Path] = []
+    for pattern in patterns:
+        for path in glob.glob(pattern, recursive=True):
+            p = Path(path)
+            if p.is_file():
+                files.append(p)
+    if not files:
+        raise SystemExit("No input files matched the provided --data globs")
+    return files
 
 
 def _iter_packed_batches(
@@ -77,8 +78,6 @@ def _build_unigram_batches(
 
 def _cmd_train_bpe(args: argparse.Namespace) -> None:
     data_files = _expand_data_patterns(args.data)
-    sequences = _load_sequences(data_files, bos=args.bos, eos=args.eos)
-
     autoscaler = AutoScaler(
         target_util=args.target_util,
         min_bs=args.min_batch,
@@ -86,14 +85,38 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
     )
     suggestion = autoscaler.suggest(token_bytes_per_example=args.token_bytes)
     batch_size = min(args.max_batch, max(args.min_batch, suggestion.batch_size))
-    batches = _iter_packed_batches(sequences, batch_size=batch_size, seed=args.seed)
+    packer = BytePacker(bos=args.bos, eos=args.eos)
+
+    def _build_streamer() -> CorpusStreamer:
+        streamer = CorpusStreamer(
+            data_files,
+            compression=args.compression,
+            num_workers=args.io_workers,
+            max_prefetch=args.prefetch_batches,
+            autoscaler=autoscaler,
+        )
+        streamer.start()
+        return streamer
+
+    streamer = _build_streamer()
+    batches = StreamingPackedBatcher(
+        streamer,
+        packer.encode_view,
+        batch_size=batch_size,
+    )
     current_batch_size = batch_size
 
     def _handle_batch_resize(new_bs: int) -> None:
-        nonlocal batches, current_batch_size
+        nonlocal batches, current_batch_size, streamer
         if new_bs <= 0 or new_bs == current_batch_size:
             return
-        batches = _iter_packed_batches(sequences, batch_size=new_bs, seed=args.seed)
+        streamer.close()
+        streamer = _build_streamer()
+        batches = StreamingPackedBatcher(
+            streamer,
+            packer.encode_view,
+            batch_size=new_bs,
+        )
         current_batch_size = new_bs
 
     trainer = GPUBPETrainer(
@@ -102,7 +125,14 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
         device=args.device,
         autoscaler=autoscaler,
     )
-    meta = trainer.fit(batches, log_every=args.log_every, on_batch_size_change=_handle_batch_resize)
+    try:
+        meta = trainer.fit(
+            batches,
+            log_every=args.log_every,
+            on_batch_size_change=_handle_batch_resize,
+        )
+    finally:
+        streamer.close()
     if args.out_dir:
         trainer.save(args.out_dir)
     print(meta)
@@ -142,6 +172,25 @@ def _parser() -> argparse.ArgumentParser:
     common.add_argument("--eos", type=int, default=None, help="Optional EOS token id")
     common.add_argument("--seed", type=int, default=1337, help="Shuffle seed")
     common.add_argument("--device", type=str, default=None, help="Torch device override")
+    common.add_argument(
+        "--compression",
+        type=str,
+        default="none",
+        choices=["none", "zstd", "lz4"],
+        help="Compression codec for input shards",
+    )
+    common.add_argument(
+        "--io-workers",
+        type=int,
+        default=2,
+        help="Number of background workers for shard decoding",
+    )
+    common.add_argument(
+        "--prefetch-batches",
+        type=int,
+        default=4,
+        help="Maximum number of prefetched batches before backpressure engages",
+    )
 
     train_bpe = subparsers.add_parser("train-bpe", parents=[common], help="Train a BPE model")
     train_bpe.set_defaults(func=_cmd_train_bpe)
