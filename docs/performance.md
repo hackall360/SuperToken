@@ -62,3 +62,47 @@ async consumers via a bounded queue controlled by live GPU utilization, so
 prefetching automatically throttles when VRAM pressure climbs above the
 configured target. Use `--compression`, `--io-workers`, and
 `--prefetch-batches` to tailor throughput for your hardware.
+
+## Continuous benchmarking pipeline
+
+Automated performance tracking lives in [`.github/workflows/bench.yml`](../.github/workflows/bench.yml).
+Each run provisions Python 3.12 and the CUDA-enabled PyTorch wheel (`torch==2.5.1+cu118`),
+installs the plotting dependencies (`matplotlib`/`pandas`), and executes the synthetic
+benchmark with TorchScript disabled to avoid the `torch.nonzero` signature regression:
+
+```bash
+PYTORCH_JIT=0 python main.py benchmark \
+  --synthetic-docs 4 \
+  --synthetic-min-len 8 \
+  --synthetic-max-len 16 \
+  --synthetic-vocab 128 \
+  --bpe-merges 32 \
+  --bpe-batch-size 32 \
+  --bpe-log-every 0 \
+  --unigram-batch-size 32 \
+  --unigram-vocab 128 \
+  --unigram-epochs 2 \
+  --output-dir artifacts/benchmarks \
+  --device cpu
+```
+
+The raw JSON telemetry (e.g. `artifacts/benchmarks/benchmark_<timestamp>.json`) plus a
+`latest_summary.txt` capture of the CLI table are uploaded as workflow artifacts.  After the
+benchmark finishes, `benchmarks/trend_report.py` ingests the full history of stored JSON files
+to regenerate:
+
+* `trend_table.md` – a Markdown table that mirrors tokens/sec and wall-time trends.
+* `trend_plot.png` – a line chart visualizing both trainers' throughput over time.
+* `trend_manifest.json` – a machine-readable manifest enumerating every input snapshot.
+
+Every workflow run attaches these files to the **Benchmark results** artifact and surfaces the
+table directly in the run summary for quick inspection.  To review the trend plot locally,
+download the artifact from the run page, unpack it, and open `trend_plot.png`.  The same
+report can be regenerated for any directory of JSON snapshots by invoking:
+
+```bash
+python benchmarks/trend_report.py --input <path/to/json/dir> --output-dir <path/to/report>
+```
+
+Because the JSON history is version-controlled via workflow artifacts, spotting regressions
+becomes a matter of comparing the latest trend plot against previous runs.
