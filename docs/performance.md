@@ -52,3 +52,13 @@ WORLD_SIZE=4 torchrun --nproc_per_node=4 \
 Each rank must contribute identically shaped tensors to the reduction; the
 trainer handles padding internally, so no additional user code is required
 beyond the distributed initialization.
+
+## Streaming corpus ingestion
+
+`main.py` now wires the `CorpusStreamer` into the training loop. Shards are
+memory-mapped (or decompressed with `zstandard`/`lz4.frame`) on background
+workers before they reach the GPU packer. The streamer exposes both sync and
+async consumers via a bounded queue controlled by live GPU utilization, so
+prefetching automatically throttles when VRAM pressure climbs above the
+configured target. Use `--compression`, `--io-workers`, and
+`--prefetch-batches` to tailor throughput for your hardware.
