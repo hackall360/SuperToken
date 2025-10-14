@@ -1,4 +1,5 @@
 import pytest
+from types import MethodType
 
 torch = pytest.importorskip("torch")
 
@@ -169,6 +170,42 @@ def test_histogram_delta_recounts_expected_spans(monkeypatch):
     for entry in calls:
         assert entry["actual_remove"] == entry["expected_remove"]
         assert entry["actual_add"] == entry["expected_add"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_gpu_fast_path_reduces_full_recounts():
+    seqs = [
+        [1, 2] * 20 + [3],
+        [1, 2] * 18 + [4],
+        [1, 2] * 16 + [5],
+        [1, 2] * 15 + [6],
+    ]
+    fast_batch = _make_batch(seqs)
+    baseline_batch = _make_batch(seqs)
+
+    fast_trainer = GPUBPETrainer(base_vocab=256, merges=4, device="cuda")
+    baseline_trainer = GPUBPETrainer(base_vocab=256, merges=4, device="cuda")
+    baseline_trainer._top_pairs_limit = 0
+
+    fast_calls = {"count": 0}
+    baseline_calls = {"count": 0}
+
+    def _count_fast(self, batch_iter, impl):
+        fast_calls["count"] += 1
+        return impl(batch_iter)
+
+    def _count_baseline(self, batch_iter, impl):
+        baseline_calls["count"] += 1
+        return impl(batch_iter)
+
+    fast_trainer._invoke_count_pairs_gpu = MethodType(_count_fast, fast_trainer)
+    baseline_trainer._invoke_count_pairs_gpu = MethodType(_count_baseline, baseline_trainer)
+
+    fast_trainer.fit([fast_batch], log_every=100)
+    baseline_trainer.fit([baseline_batch], log_every=100)
+
+    assert fast_trainer.merges == baseline_trainer.merges
+    assert fast_calls["count"] < baseline_calls["count"]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
