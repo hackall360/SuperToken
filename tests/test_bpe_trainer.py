@@ -45,14 +45,14 @@ class OneShotIterable:
 
 def _make_batch(seqs: list[list[int]]):
     max_len = max(len(seq) for seq in seqs)
-    tokens = torch.full((len(seqs), max_len), -1, dtype=torch.long)
-    valid = torch.zeros((len(seqs), max_len), dtype=torch.long)
+    tokens = torch.full((len(seqs), max_len), -1, dtype=torch.int32)
+    valid = torch.zeros((len(seqs), max_len), dtype=torch.uint8)
     lengths = torch.zeros(len(seqs), dtype=torch.long)
     for row, seq in enumerate(seqs):
         L = len(seq)
         if L == 0:
             continue
-        tokens[row, :L] = torch.tensor(seq, dtype=torch.long)
+        tokens[row, :L] = torch.tensor(seq, dtype=torch.int32)
         valid[row, :L] = 1
         lengths[row] = L
     if torch.cuda.is_available():

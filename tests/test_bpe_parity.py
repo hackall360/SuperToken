@@ -57,14 +57,14 @@ def _build_tensor_batches(byte_sequences: Sequence[Sequence[int]]):
 
     rows = len(byte_sequences)
     width = max(1, max((len(seq) for seq in byte_sequences), default=0))
-    tokens = torch.full((rows, width), -1, dtype=torch.long)
-    valid = torch.zeros((rows, width), dtype=torch.long)
+    tokens = torch.full((rows, width), -1, dtype=torch.int32)
+    valid = torch.zeros((rows, width), dtype=torch.uint8)
     lengths = torch.zeros((rows,), dtype=torch.long)
     for row, seq in enumerate(byte_sequences):
         if not seq:
             continue
         length = len(seq)
-        tokens[row, :length] = torch.tensor(seq, dtype=torch.long)
+        tokens[row, :length] = torch.tensor(seq, dtype=torch.int32)
         valid[row, :length] = 1
         lengths[row] = length
     return [(tokens, valid, lengths)]

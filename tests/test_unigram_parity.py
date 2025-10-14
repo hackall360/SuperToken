@@ -78,11 +78,11 @@ def _build_gpu_batches(byte_sequences: Sequence[bytes]) -> List[torch.Tensor]:
         return []
 
     width = max(1, max((len(seq) for seq in byte_sequences), default=0))
-    tokens = torch.full((len(byte_sequences), width), -1, dtype=torch.long)
+    tokens = torch.full((len(byte_sequences), width), -1, dtype=torch.int32)
     for row, seq in enumerate(byte_sequences):
         if not seq:
             continue
-        tokens[row, : len(seq)] = torch.tensor(list(seq), dtype=torch.long)
+        tokens[row, : len(seq)] = torch.tensor(list(seq), dtype=torch.int32)
     return [tokens]
 
 
