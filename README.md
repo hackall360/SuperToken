@@ -16,6 +16,7 @@ SuperToken is a GPU-accelerated tokenizer toolkit that offers high-throughput by
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Command Reference](#command-reference)
+- [Benchmarking](#benchmarking)
 - [Project Layout](#project-layout)
 - [Documentation](#documentation)
 - [Contributing](#contributing)
@@ -70,6 +71,34 @@ The CLI is organized into subcommands that share a common set of arguments.
 | --- | --- | --- |
 | `train-bpe` | Trains a GPU-accelerated BPE tokenizer. | Autoscaled batch sizing, streaming ingestion, optional on-the-fly merges export. |
 | `train-unigram` | Trains a GPU-accelerated unigram tokenizer. | Epoch-based training with configurable vocab size and subword length. |
+| `benchmark` | Runs both trainers against synthetic and/or real corpora. | Emits comparative tables and JSON telemetry snapshots. |
+
+## Benchmarking
+
+Run the bundled benchmark to compare the BPE and unigram trainers with a single command. The example below synthesizes 2,000 sentences while also sampling up to 1,000 documents from your dataset globs:
+
+```bash
+python main.py benchmark \
+  --data "data/**/*.txt" \
+  --max-real-docs 1000 \
+  --synthetic-docs 2000 \
+  --synthetic-min-len 16 \
+  --synthetic-max-len 64 \
+  --output-dir ./artifacts/benchmarks
+```
+
+Sample output:
+
+```
+Corpus → 2500 sequences, 102400 tokens (max len 128)
+Trainer           | Wall time (s) | Tokens/s    | Final vocab
+------------------+---------------+-------------+------------
+GPUBPETrainer     | 12.84         | 7975.19     | 50256
+GPUUnigramTrainer | 8.42          | 12158.52    | 50000
+Saved benchmark metadata → artifacts/benchmarks/benchmark_20240101T120000Z.json
+```
+
+The benchmark will always emit a pretty-printed comparison table and serialize the full telemetry payloads into timestamped JSON files under the requested output directory. Those JSON artifacts capture the raw trainer metadata, corpus descriptors, and the CLI configuration so runs are fully reproducible.
 
 Common flags include:
 

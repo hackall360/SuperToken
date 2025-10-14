@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from typing import Dict, List, Tuple
 
 import torch
@@ -380,22 +381,60 @@ class GPUUnigramTrainer:
         logZ, exp = self._forward_backward_batch(batch_seq, valid)
         return logZ[0], exp[0]
 
-    def fit_epoch(self, batches: List[torch.Tensor]) -> dict[str, int]:
-        if len(self.id2piece) < self.target_vocab:
-            self._extend_candidates(batches[0])
-        V = len(self.id2piece)
-        exp_counts = torch.zeros((V,), device=self.device, dtype=torch.float32)
+    def fit_epoch(self, batches: List[torch.Tensor]) -> dict[str, object]:
+        epoch_start = time.perf_counter()
+        candidate_time = 0.0
+        batch_count = 0
+        token_count = 0
+        sequence_count = 0
+        forward_backward_time = 0.0
+        accumulation_time = 0.0
+
+        if batches:
+            if len(self.id2piece) < self.target_vocab:
+                t0 = time.perf_counter()
+                self._extend_candidates(batches[0])
+                candidate_time = time.perf_counter() - t0
+            V = len(self.id2piece)
+            exp_counts = torch.zeros((V,), device=self.device, dtype=torch.float32)
+        else:
+            V = len(self.id2piece)
+            exp_counts = torch.zeros((V,), device=self.device, dtype=torch.float32)
+
         for x in batches:
+            batch_count += 1
             x = x.to(self.device)
             valid = x >= 0
+            token_count += int(valid.sum().item())
+            sequence_count += int(x.shape[0])
             if x.numel() == 0:
                 continue
+            t_fb_start = time.perf_counter()
             _, exp = self._forward_backward_batch(x, valid)
+            forward_backward_time += time.perf_counter() - t_fb_start
+            t_accum_start = time.perf_counter()
             exp_counts += exp.sum(dim=0)
+            accumulation_time += time.perf_counter() - t_accum_start
+
+        t_update_start = time.perf_counter()
         smoothed = exp_counts + 1e-6
         logp = (smoothed / smoothed.sum()).clamp_min(1e-12).log()
         self.logp = logp
-        return {"vocab": len(self.id2piece)}
+        update_time = time.perf_counter() - t_update_start
+
+        total_time = time.perf_counter() - epoch_start
+        telemetry = {
+            "wall_time_s": total_time,
+            "candidate_extension_s": candidate_time,
+            "forward_backward_s": forward_backward_time,
+            "accumulation_s": accumulation_time,
+            "update_s": update_time,
+            "batches": batch_count,
+            "sequences": sequence_count,
+            "tokens": token_count,
+        }
+
+        return {"vocab": len(self.id2piece), "telemetry": telemetry}
 
 
 __all__ = ["GPUUnigramTrainer"]
