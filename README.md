@@ -101,4 +101,4 @@ Additional guides and API notes can be added under the `docs/` directory as the 
 4. Open a pull request describing your changes and include benchmark results when appropriate.
 
 ## License
-This project is distributed under the terms specified in the repository's license file.
+This project is licensed under the [Mozilla Public License 2.0](LICENSE).
