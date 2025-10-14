@@ -11,6 +11,7 @@ from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence,
 import torch
 
 from .autoscaler import AutoScaler
+from .cuda_kernels import apply_merge_and_compact as cuda_apply_merge_and_compact
 from .utils import aggregate_pair_keys, apply_merge_once, count_pairs, reduce_pair_histograms
 
 
@@ -36,6 +37,7 @@ class GPUBatchRecord:
     pair_keys_buffer: Optional[torch.Tensor] = None
     pair_counts_buffer: Optional[torch.Tensor] = None
     pair_count_length: Optional[torch.Tensor] = None
+    merge_kernel_warm: bool = False
 
 
     @classmethod
@@ -73,14 +75,17 @@ class GPUBatchRecord:
         if width == 0:
             if self.pair_workspace is None or self.pair_workspace.shape != (B, 0):
                 self.pair_workspace = torch.empty((B, 0), dtype=torch.bool, device=device)
+                self.merge_kernel_warm = False
             if self.span_workspace is None or self.span_workspace.shape != (B, 0):
                 self.span_workspace = torch.empty((B, 0), dtype=torch.bool, device=device)
         elif self.pair_workspace is None or self.pair_workspace.shape != (B, width):
             self.pair_workspace = torch.zeros((B, width), dtype=torch.bool, device=device)
+            self.merge_kernel_warm = False
         if width > 0 and (self.span_workspace is None or self.span_workspace.shape != (B, width)):
             self.span_workspace = torch.zeros((B, width), dtype=torch.bool, device=device)
         if self.prefix_workspace is None or self.prefix_workspace.shape[0] != B:
             self.prefix_workspace = torch.zeros((B,), dtype=torch.long, device=device)
+            self.merge_kernel_warm = False
         capacity = B * width
         if capacity == 0:
             if self.pair_keys_buffer is None or self.pair_keys_buffer.shape != (0, 2):
@@ -1244,6 +1249,24 @@ class GPUBPETrainer:
                                     shard.wait_for_device(ctx.compute_stream)
                                     shard.ensure_workspaces()
                                     width = max(shard.tokens.shape[1] - 1, 0)
+                                    if shard.tokens.is_cuda and not shard.merge_kernel_warm:
+                                        sentinel = torch.iinfo(shard.tokens.dtype).min
+                                        cuda_apply_merge_and_compact(
+                                            shard.tokens,
+                                            shard.valid,
+                                            shard.prefix_workspace,
+                                            shard.pair_workspace,
+                                            int(sentinel),
+                                            int(sentinel),
+                                            int(sentinel),
+                                        )
+                                        if shard.lengths.dtype == shard.prefix_workspace.dtype:
+                                            shard.lengths.copy_(shard.prefix_workspace)
+                                        else:
+                                            shard.lengths.copy_(
+                                                shard.prefix_workspace.to(shard.lengths.dtype)
+                                            )
+                                        shard.merge_kernel_warm = True
                                     if (
                                         self._enable_histogram_cache
                                         and self._hist_cache_valid

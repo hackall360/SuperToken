@@ -12,6 +12,7 @@ from torch.utils.cpp_extension import load_inline
 def _load_module() -> torch._C.ScriptModule:
     cuda_src = r"""
     #include <math.h>
+    #include <stdint.h>
 
     __device__ __forceinline__ float _log_add(float a, float b, const float neg_inf) {
         if (a <= neg_inf) {
@@ -209,6 +210,69 @@ def _load_module() -> torch._C.ScriptModule:
         }
     }
 
+    extern "C" __global__ void apply_merge_and_compact_int64(
+        int64_t* tokens,
+        int64_t* valid,
+        int64_t* prefix_workspace,
+        bool* pair_mask,
+        const int64_t B,
+        const int64_t L,
+        const int64_t width,
+        const int64_t a_id,
+        const int64_t b_id,
+        const int64_t new_id
+    ) {
+        int64_t row = static_cast<int64_t>(blockIdx.x);
+        if (row >= B) {
+            return;
+        }
+        int64_t* row_tokens = tokens + row * L;
+        int64_t* row_valid = valid + row * L;
+        bool* row_mask = nullptr;
+        if (width > 0 && pair_mask != nullptr) {
+            row_mask = pair_mask + row * width;
+        }
+
+        if (row_mask != nullptr) {
+            for (int64_t col = 0; col < width; ++col) {
+                bool left_valid = row_valid[col] != 0;
+                bool right_valid = row_valid[col + 1] != 0;
+                bool match = left_valid && right_valid && (row_tokens[col] == a_id) && (row_tokens[col + 1] == b_id);
+                row_mask[col] = match;
+            }
+            for (int64_t col = 0; col < width; ++col) {
+                if (row_mask[col]) {
+                    row_tokens[col] = new_id;
+                    row_valid[col + 1] = 0;
+                    row_tokens[col + 1] = 0;
+                }
+            }
+        }
+
+        int64_t length = 0;
+        for (int64_t col = 0; col < L; ++col) {
+            int64_t is_valid = row_valid[col];
+            if (is_valid != 0) {
+                int64_t value = row_tokens[col];
+                row_tokens[length] = value;
+                row_valid[length] = 1;
+                if (length != col) {
+                    row_tokens[col] = 0;
+                    row_valid[col] = 0;
+                }
+                length += 1;
+            } else {
+                row_tokens[col] = 0;
+                row_valid[col] = 0;
+            }
+        }
+        for (int64_t col = length; col < L; ++col) {
+            row_tokens[col] = 0;
+            row_valid[col] = 0;
+        }
+        prefix_workspace[row] = length;
+    }
+
     extern "C" __global__ void accumulate_expectations(
         const int32_t* sequences,
         const uint8_t* valid,
@@ -289,6 +353,7 @@ def _load_module() -> torch._C.ScriptModule:
             "forward_logz",
             "backward_logz",
             "accumulate_expectations",
+            "apply_merge_and_compact_int64",
         ],
         extra_cuda_cflags=["-lineinfo"],
     )
@@ -430,9 +495,72 @@ def accumulate_expectations(
     )
 
 
+def apply_merge_and_compact(
+    tokens: torch.Tensor,
+    valid: torch.Tensor,
+    prefix_workspace: torch.Tensor,
+    pair_workspace: torch.Tensor,
+    a_id: int,
+    b_id: int,
+    new_id: int,
+) -> None:
+    if not tokens.is_cuda or not valid.is_cuda:
+        raise RuntimeError("apply_merge_and_compact expects CUDA tensors")
+    if prefix_workspace is None or not prefix_workspace.is_cuda:
+        raise RuntimeError("prefix_workspace must be a CUDA tensor")
+    if pair_workspace is None or not pair_workspace.is_cuda:
+        raise RuntimeError("pair_workspace must be a CUDA tensor")
+
+    B, L = tokens.shape
+    width = max(L - 1, 0)
+
+    if prefix_workspace.shape[0] != B:
+        raise ValueError("prefix_workspace shape mismatch")
+    if width > 0 and (pair_workspace.shape[0] != B or pair_workspace.shape[1] != width):
+        raise ValueError("pair_workspace shape mismatch")
+    if width == 0 and pair_workspace.shape[0] != B:
+        raise ValueError("pair_workspace batch mismatch")
+
+    if tokens.dtype != torch.long or valid.dtype != torch.long:
+        raise TypeError("tokens and valid must use torch.long dtype for CUDA merge kernel")
+    if prefix_workspace.dtype != torch.long:
+        raise TypeError("prefix_workspace must use torch.long dtype")
+    if pair_workspace.dtype != torch.bool:
+        raise TypeError("pair_workspace must use torch.bool dtype")
+
+    if not tokens.is_contiguous() or not valid.is_contiguous():
+        raise RuntimeError("tokens and valid must be contiguous")
+    if not prefix_workspace.is_contiguous() or (pair_workspace.numel() > 0 and not pair_workspace.is_contiguous()):
+        raise RuntimeError("workspaces must be contiguous")
+
+    module = _load_module()
+
+    if B == 0:
+        prefix_workspace.zero_()
+        if pair_workspace.numel() > 0:
+            pair_workspace.zero_()
+        return
+
+    module.apply_merge_and_compact_int64(
+        tokens,
+        valid,
+        prefix_workspace,
+        pair_workspace,
+        B,
+        L,
+        width,
+        int(a_id),
+        int(b_id),
+        int(new_id),
+        grid=(B,),
+        block=(1,),
+    )
+
+
 __all__ = [
     "traverse_trie",
     "forward_logz",
     "backward_logz",
     "accumulate_expectations",
+    "apply_merge_and_compact",
 ]
