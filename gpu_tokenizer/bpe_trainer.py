@@ -319,6 +319,8 @@ class GPUBPETrainer:
         devices: Optional[Sequence[str]] = None,
         autoscaler: Optional[AutoScaler] = None,
         sync_every: int = 1,
+        warm_start_merges: Optional[Sequence[tuple[int, int]]] = None,
+        freeze_warm_start: bool = False,
     ) -> None:
         self.base_vocab = base_vocab
         self.target_merges = merges
@@ -340,6 +342,21 @@ class GPUBPETrainer:
         self.device = str(self.devices[0])
         self.vocab_size = base_vocab
         self.merges: List[Tuple[int, int]] = []
+        self._seed_warm_start_merges: list[tuple[int, int]] = (
+            list(warm_start_merges) if warm_start_merges is not None else []
+        )
+        self.freeze_warm_start = freeze_warm_start
+        self._warm_start_plan: Optional[dict[str, object]] = (
+            {
+                "merges": list(self._seed_warm_start_merges),
+                "counts": None,
+                "source": "constructor" if self._seed_warm_start_merges else None,
+            }
+            if self._seed_warm_start_merges
+            else None
+        )
+        self._warm_start_applied: bool = False
+        self._frozen_pair_keys: set[int] = set()
         self.autoscaler = autoscaler or AutoScaler()
         self.sync_every = max(sync_every, 1)
         # Host↔device transfer accounting, populated during ``fit``.
@@ -542,6 +559,95 @@ class GPUBPETrainer:
         keys, counts = cls._merge_histogram(keys, counts, add_keys, add_counts, 1)
         return keys, counts
 
+    @classmethod
+    def precompute_warm_start_plan(
+        cls,
+        batches: Iterable[
+            Tuple[torch.Tensor, torch.Tensor]
+            | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+            | GPUBatchRecord
+        ],
+        top_k: int,
+        device: Optional[torch.device] = None,
+    ) -> dict[str, object]:
+        """Select warm-start merges from n-gram histograms.
+
+        Args:
+            batches: Iterable of batch-like inputs compatible with
+                :func:`compute_ngram_histograms`.
+            top_k: Number of bigrams to seed.
+            device: Optional device override for histogram computation.
+
+        Returns:
+            Dictionary describing the warm-start plan, including the selected
+            merges and their counts.
+        """
+
+        if top_k is None or top_k <= 0:
+            return {
+                "merges": [],
+                "counts": [],
+                "top_k": 0,
+                "requested_top_k": int(top_k or 0),
+                "order": 2,
+                "histogram_size": 0,
+                "source": "ngram",
+            }
+
+        from .ngram_stats import compute_ngram_histograms
+
+        histograms = compute_ngram_histograms(batches, max_order=2, device=device)
+        bigram_keys, bigram_counts = histograms.get(2, (None, None))
+        if bigram_keys is None or bigram_counts is None or bigram_keys.numel() == 0:
+            return {
+                "merges": [],
+                "counts": [],
+                "top_k": 0,
+                "requested_top_k": int(top_k),
+                "order": 2,
+                "histogram_size": 0,
+                "source": "ngram",
+            }
+
+        limit = min(int(top_k), int(bigram_keys.numel()))
+        if limit <= 0:
+            return {
+                "merges": [],
+                "counts": [],
+                "top_k": 0,
+                "requested_top_k": int(top_k),
+                "order": 2,
+                "histogram_size": int(bigram_keys.numel()),
+                "source": "ngram",
+            }
+
+        values, indices = torch.topk(bigram_counts, k=limit, largest=True, sorted=True)
+        seen: set[tuple[int, int]] = set()
+        merges: list[tuple[int, int]] = []
+        counts: list[int] = []
+        for idx, count_val in zip(indices.tolist(), values.tolist()):
+            key_val = int(bigram_keys[idx].item())
+            a_id = int(key_val >> 32)
+            b_id = int(key_val & ((1 << 32) - 1))
+            pair = (a_id, b_id)
+            if pair in seen:
+                continue
+            seen.add(pair)
+            merges.append(pair)
+            counts.append(int(count_val))
+            if len(merges) >= limit:
+                break
+
+        return {
+            "merges": merges,
+            "counts": counts,
+            "top_k": len(merges),
+            "requested_top_k": int(top_k),
+            "order": 2,
+            "histogram_size": int(bigram_keys.numel()),
+            "source": "ngram",
+        }
+
     def _reset_top_pairs(self) -> None:
         self._top_pairs_heap = []
         self._top_pairs_index = {}
@@ -565,6 +671,9 @@ class GPUBPETrainer:
         self._cleanup_top_heap()
 
     def _insert_top_pair(self, key: int, count: int) -> None:
+        if self.freeze_warm_start and key in self._frozen_pair_keys:
+            self._top_pairs_index.pop(key, None)
+            return
         if self._top_pairs_limit <= 0 or count <= 0:
             if count <= 0:
                 self._top_pairs_index.pop(key, None)
@@ -633,7 +742,9 @@ class GPUBPETrainer:
                 deltas[int(key)] = deltas.get(int(key), 0) + int(count)
         for key, delta in deltas.items():
             new_total = self._pair_count_lookup.get(key, 0) + delta
-            if new_total <= 0:
+            if new_total <= 0 or (
+                self.freeze_warm_start and key in self._frozen_pair_keys
+            ):
                 self._pair_count_lookup.pop(key, None)
                 self._top_pairs_index.pop(key, None)
             else:
@@ -723,12 +834,20 @@ class GPUBPETrainer:
         log_every: int = 100,
         profile_streams: bool = False,
         on_batch_size_change: Optional[Callable[[int], None]] = None,
+        warm_start_merges: Optional[Sequence[tuple[int, int]]] = None,
+        freeze_warm_start: Optional[bool] = None,
+        warm_start_plan: Optional[dict[str, object]] = None,
+        warm_start_ngrams: Optional[int] = None,
+        warm_start_device: Optional[torch.device] = None,
     ) -> dict[str, object]:
         """Train merges using a pipelined GPU workflow when possible."""
 
         self._reset_transfer_counters()
         self._reset_histogram_cache()
         self._active_batch_size = None
+        if freeze_warm_start is not None:
+            self.freeze_warm_start = freeze_warm_start
+        self._frozen_pair_keys.clear()
         step = 0
         current_batches: Iterable[
             Union[
@@ -1650,6 +1769,126 @@ class GPUBPETrainer:
                                     assert ctx.compute_stream.query(), "compute stream did not drain"
                     return records, oom_seen, {"sync": need_sync and copied_bytes > 0, "bytes": copied_bytes}
 
+        warm_plan = warm_start_plan if warm_start_plan is not None else self._warm_start_plan
+        if warm_plan is not None:
+            warm_plan = {
+                "merges": list(warm_plan.get("merges", [])),
+                "counts": (
+                    list(warm_plan.get("counts", []))
+                    if warm_plan.get("counts") is not None
+                    else None
+                ),
+                "source": warm_plan.get("source"),
+                "order": warm_plan.get("order"),
+                "top_k": warm_plan.get("top_k"),
+                "requested_top_k": warm_plan.get("requested_top_k"),
+                "histogram_size": warm_plan.get("histogram_size"),
+            }
+        else:
+            warm_plan = None
+
+        if warm_start_merges is not None:
+            merges_override = [tuple(map(int, pair)) for pair in warm_start_merges]
+            if warm_plan is None:
+                warm_plan = {"merges": merges_override, "counts": None, "source": "fit"}
+            else:
+                warm_plan["merges"] = merges_override
+
+        requested_top_k = warm_plan.get("requested_top_k") if warm_plan else None
+        warm_counts = warm_plan.get("counts") if warm_plan else None
+        warm_source = warm_plan.get("source") if warm_plan else None
+
+        if (warm_plan is None or not warm_plan.get("merges")) and warm_start_ngrams:
+            computed_plan = self.precompute_warm_start_plan(
+                batches,
+                warm_start_ngrams,
+                device=warm_start_device or device,
+            )
+            warm_plan = computed_plan
+            warm_counts = computed_plan.get("counts")
+            warm_source = computed_plan.get("source")
+            requested_top_k = computed_plan.get("requested_top_k")
+
+        warm_merges_to_apply: list[tuple[int, int]] = []
+        if warm_plan is not None and warm_plan.get("merges"):
+            seen_pairs: set[tuple[int, int]] = set()
+            for pair in warm_plan.get("merges", []):
+                a_id, b_id = int(pair[0]), int(pair[1])
+                normalized = (a_id, b_id)
+                if normalized in seen_pairs:
+                    continue
+                seen_pairs.add(normalized)
+                warm_merges_to_apply.append(normalized)
+        warm_counts_list: list[int] | None = None
+        if warm_counts is not None:
+            warm_counts_list = [int(val) for val in warm_counts][: len(warm_merges_to_apply)]
+
+        warm_meta: dict[str, object] = {
+            "merges": warm_merges_to_apply,
+            "counts": warm_counts_list,
+            "frozen": bool(self.freeze_warm_start),
+            "source": warm_source,
+            "requested_top_k": requested_top_k,
+        }
+
+        if warm_merges_to_apply and not self._warm_start_applied:
+            warm_limit = max(self.target_merges - step, 0)
+            if warm_limit <= 0:
+                warm_merges_to_apply = []
+            elif len(warm_merges_to_apply) > warm_limit:
+                warm_merges_to_apply = warm_merges_to_apply[:warm_limit]
+                if warm_counts_list is not None:
+                    warm_counts_list = warm_counts_list[: len(warm_merges_to_apply)]
+                warm_meta["merges"] = warm_merges_to_apply
+                warm_meta["counts"] = warm_counts_list
+
+        if warm_merges_to_apply and not self._warm_start_applied:
+            applied_merges: list[tuple[int, int]] = []
+            for idx, (a_id, b_id) in enumerate(warm_merges_to_apply, start=1):
+                new_id = self.vocab_size
+                if max(a_id, b_id, new_id) > UINT32_MAX:
+                    raise OverflowError(
+                        f"Token id overflow during warm start: encountered id above UINT32_MAX (limit {UINT32_MAX})."
+                    )
+                if use_cuda:
+                    current_batches, oom_seen, sync_report = _apply_merge_gpu(
+                        current_batches, a_id, b_id, new_id, step + 1, force_sync=True
+                    )
+                    if oom_seen:
+                        raise RuntimeError(
+                            "CUDA out of memory encountered while applying warm-start merges"
+                        )
+                    gpu_batches = list(current_batches)
+                    self._interval_merges += 1
+                    if sync_report.get("sync"):
+                        self._close_sync_interval(step + 1, sync_report.get("bytes", 0))
+                else:
+                    current_batches, _oom_seen, _ = _apply_merge_cpu(
+                        current_batches, a_id, b_id, new_id
+                    )
+                self.merges.append((a_id, b_id))
+                self.vocab_size += 1
+                step += 1
+                applied_merges.append((a_id, b_id))
+                if self.freeze_warm_start:
+                    key = (int(a_id) << 32) | int(b_id)
+                    self._frozen_pair_keys.add(key)
+                self._record_merge_snapshot(step)
+            warm_meta["applied"] = applied_merges
+            self._warm_start_applied = True
+            if use_cuda:
+                self._interval_merges = 0
+            self._invalidate_hist_cache()
+        else:
+            warm_meta["applied"] = []
+
+        if warm_plan is not None:
+            warm_meta["order"] = warm_plan.get("order")
+            warm_meta["top_k"] = warm_plan.get("top_k")
+            warm_meta["histogram_size"] = warm_plan.get("histogram_size")
+        self._warm_start_plan = warm_plan
+        self._seed_warm_start_merges = warm_merges_to_apply
+
         while step < self.target_merges:
             scale_state = self.autoscaler.suggest(token_bytes_per_example=int(8 * 1024))
             if self._active_batch_size is None:
@@ -1760,6 +1999,7 @@ class GPUBPETrainer:
             "base_vocab": self.base_vocab,
             "vocab_size": self.vocab_size,
             "merges": self.merges,
+            "warm_start": warm_meta,
             "transfer_metrics": {
                 "bytes_h2d": self.bytes_h2d,
                 "bytes_d2h": self.bytes_d2h,
