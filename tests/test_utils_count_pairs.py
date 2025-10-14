@@ -2,7 +2,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from gpu_tokenizer.utils import count_pairs
+import gpu_tokenizer.utils as utils
+from gpu_tokenizer.utils import aggregate_pair_keys, count_pairs, reduce_pair_histograms
 
 
 def _allocate_pair_buffers(seqs: torch.Tensor):
@@ -11,7 +12,7 @@ def _allocate_pair_buffers(seqs: torch.Tensor):
     device = seqs.device
     dtype = seqs.dtype
     pair_keys_buffer = torch.empty((capacity, 2), dtype=dtype, device=device)
-    pair_counts_buffer = torch.empty((capacity,), dtype=torch.long, device=device)
+    pair_counts_buffer = torch.empty((capacity,), dtype=torch.int32, device=device)
     pair_count_length = torch.zeros((1,), dtype=torch.long, device=device)
     return pair_keys_buffer, pair_counts_buffer, pair_count_length
 
@@ -37,12 +38,12 @@ def _cpu_reference_count_pairs(seqs: torch.Tensor, valid: torch.Tensor):
     if not counts:
         return (
             torch.empty((0, 2), dtype=seqs.dtype),
-            torch.empty((0,), dtype=torch.long),
+            torch.empty((0,), dtype=torch.int32),
         )
 
     ordered_items = sorted(counts.items())
     pairs = torch.tensor([p for p, _ in ordered_items], dtype=seqs.dtype)
-    freq = torch.tensor([c for _, c in ordered_items], dtype=torch.long)
+    freq = torch.tensor([c for _, c in ordered_items], dtype=torch.int32)
     return pairs, freq
 
 
@@ -79,3 +80,47 @@ def test_count_pairs_device_matches_input():
         assert counts_cuda.device.type == "cuda"
         assert torch.equal(pairs, pairs_cuda.cpu())
         assert torch.equal(counts, counts_cuda.cpu())
+
+
+def test_count_pairs_saturates_and_logs(monkeypatch, caplog):
+    monkeypatch.setattr(utils, "INT32_MAX", 5)
+    caplog.set_level("WARNING", logger="gpu_tokenizer.utils")
+
+    seqs = torch.ones((1, 12), dtype=torch.int32)
+    valid = torch.ones_like(seqs, dtype=torch.uint8)
+
+    pairs, counts, _, _, _ = _run_count_pairs(seqs, valid)
+
+    assert counts.dtype == torch.int32
+    assert counts.tolist() == [5]
+    assert any("count_pairs" in record.message for record in caplog.records)
+
+
+def test_aggregate_pair_keys_saturates(monkeypatch, caplog):
+    monkeypatch.setattr(utils, "INT32_MAX", 5)
+    caplog.set_level("WARNING", logger="gpu_tokenizer.utils")
+
+    keys = torch.tensor([1, 1, 1], dtype=torch.long)
+    counts = torch.tensor([4, 4, 4], dtype=torch.int64)
+
+    aggregated_keys, aggregated_counts = aggregate_pair_keys(keys, counts)
+
+    assert aggregated_keys.tolist() == [1]
+    assert aggregated_counts.dtype == torch.int32
+    assert aggregated_counts.tolist() == [5]
+    assert any("aggregate_pair_keys" in record.message for record in caplog.records)
+
+
+def test_reduce_pair_histograms_matches_clipped_reference(monkeypatch, caplog):
+    monkeypatch.setattr(utils, "INT32_MAX", 5)
+    caplog.set_level("WARNING", logger="gpu_tokenizer.utils")
+
+    keys = torch.tensor([1, 2, 2, 3], dtype=torch.long)
+    counts = torch.tensor([3, 4, 4, 7], dtype=torch.int64)
+
+    reduced_keys, reduced_counts = reduce_pair_histograms(keys, counts)
+
+    assert reduced_keys.tolist() == [1, 2, 3]
+    assert reduced_counts.dtype == torch.int32
+    assert reduced_counts.tolist() == [3, 5, 5]
+    assert any("aggregate_pair_keys" in record.message for record in caplog.records)
