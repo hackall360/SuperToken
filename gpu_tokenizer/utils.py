@@ -7,6 +7,8 @@ from typing import Optional, Tuple
 import torch
 import torch.distributed as dist
 
+from .cuda_kernels import apply_merge_and_compact as cuda_apply_merge_and_compact
+
 
 def device_of(x: torch.Tensor) -> torch.device:
     """Return the device hosting ``x``."""
@@ -55,7 +57,6 @@ def compact_tokens_inplace(
         lengths.copy_(prefix_workspace.to(lengths.dtype))
 
 
-@torch.jit.script
 def apply_merge_once(
     seqs: torch.Tensor,
     valid: torch.Tensor,
@@ -81,15 +82,50 @@ def apply_merge_once(
     B, L = seqs.shape
     device = seqs.device
     width = max(L - 1, 0)
-    empty_span = seqs.new_zeros((B, width), dtype=torch.bool)
+    empty_span = torch.zeros((B, width), dtype=torch.bool, device=device)
 
     if B == 0:
+        if lengths.numel() == B:
+            lengths.zero_()
         return seqs, valid, lengths, empty_span
 
     if L <= 1:
         if lengths.numel() == B:
             lengths.copy_(valid.sum(dim=-1, dtype=lengths.dtype))
+        if span_workspace is not None and span_workspace.shape == empty_span.shape:
+            span_workspace.zero_()
+            return seqs, valid, lengths, span_workspace
         return seqs, valid, lengths, empty_span
+
+    if seqs.is_cuda:
+        if pair_workspace is None or pair_workspace.shape != (B, width):
+            pair_workspace = torch.zeros((B, width), dtype=torch.bool, device=device)
+        if prefix_workspace is None or prefix_workspace.shape[0] != B:
+            prefix_workspace = torch.zeros((B,), dtype=torch.long, device=device)
+
+        cuda_apply_merge_and_compact(
+            seqs,
+            valid,
+            prefix_workspace,
+            pair_workspace,
+            int(a_id),
+            int(b_id),
+            int(new_id),
+        )
+
+        if lengths.dtype == prefix_workspace.dtype:
+            lengths.copy_(prefix_workspace)
+        else:
+            lengths.copy_(prefix_workspace.to(lengths.dtype))
+
+        spans: torch.Tensor = pair_workspace
+        if span_workspace is not None and span_workspace.shape == pair_workspace.shape:
+            if span_workspace.dtype != torch.bool:
+                span_workspace.copy_(pair_workspace.to(span_workspace.dtype))
+            else:
+                span_workspace.copy_(pair_workspace)
+            spans = span_workspace
+        return seqs, valid, lengths, spans
 
     if pair_workspace is None or pair_workspace.size(0) != B or pair_workspace.size(1) != width:
         pair_workspace = torch.zeros((B, width), dtype=torch.bool, device=device)
