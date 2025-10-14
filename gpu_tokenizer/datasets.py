@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterator, List, Sequence, Tuple
+from typing import Iterable, Iterator, List, Sequence, Tuple
 
 import random
 
@@ -14,7 +14,12 @@ from .dtypes import length_storage_dtype
 class PackedBatcher:
     """Stream padded batches of integer token sequences using double buffers."""
 
-    def __init__(self, sequences: Sequence[Sequence[int]], batch_size: int = 1024, seed: int = 1337):
+    def __init__(
+        self,
+        sequences: Iterable[Sequence[int]] | Sequence[Sequence[int]],
+        batch_size: int = 1024,
+        seed: int = 1337,
+    ):
         self.sequences: List[List[int]] = [list(seq) for seq in sequences]
         self.bs = batch_size
         rng = random.Random(seed)

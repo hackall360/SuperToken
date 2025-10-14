@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import glob
-from typing import List
+from contextlib import ExitStack
+from typing import Iterable, Iterator, List
 
 from .autoscaler import AutoScaler
 from .bpe_trainer import GPUBPETrainer
 from .cpu_packer import BytePacker
 from .datasets import PackedBatcher
+from .io import MemoryMappedShard
 
 
 def main() -> None:
@@ -39,7 +41,14 @@ def main() -> None:
     paths: List[str] = []
     for pattern in args.data:
         paths.extend(glob.glob(pattern, recursive=True))
-    seqs = [packer.encode_file(path) for path in paths]
+
+    def _iter_sequences() -> Iterator[Iterator[int]]:
+        with ExitStack() as stack:
+            for path in paths:
+                shard = stack.enter_context(MemoryMappedShard(path))
+                yield packer.encode_shard(shard)
+
+    seqs: Iterable[Iterable[int]] = _iter_sequences()
 
     scaler = AutoScaler(target_util=0.80)
     init = scaler.suggest(token_bytes_per_example=8 * 1024)
