@@ -210,6 +210,33 @@ def test_histogram_cache_matches_baseline():
     assert baseline_trainer.vocab_size == delta_trainer.vocab_size
 
 
+def test_fit_reports_telemetry_and_transfers():
+    seqs = [
+        [1, 2, 3, 1, 2, 3],
+        [1, 2, 4, 2, 4, 2],
+        [1, 2, 1, 2, 5, 6],
+    ]
+    batch = _make_batch(seqs)
+    trainer = GPUBPETrainer(base_vocab=256, merges=2, device="cpu")
+
+    result = trainer.fit([batch], log_every=10)
+
+    telemetry = result["telemetry"]
+    assert "timings" in telemetry
+    for stage_name in ("pair_count", "apply_merge", "host_sync"):
+        assert stage_name in telemetry["timings"]
+        stage_payload = telemetry["timings"][stage_name]
+        assert stage_payload["stage"] == stage_name
+        assert "count" in stage_payload
+        assert "total_s" in stage_payload
+    autoscaler_payload = telemetry["autoscaler"]
+    assert "device" in autoscaler_payload
+    assert "state" in autoscaler_payload
+    transfer_metrics = result["transfer_metrics"]
+    assert "per_stage" in transfer_metrics
+    assert "pair_count" in transfer_metrics["per_stage"]
+
+
 def test_warm_start_plan_reduces_counts(monkeypatch):
     seqs = [
         [1, 2, 1, 2, 3],
