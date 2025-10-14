@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import heapq
 import json
 import os
 import time
@@ -356,6 +357,10 @@ class GPUBPETrainer:
         self._cached_pair_counts: torch.Tensor = torch.empty((0,), dtype=torch.int32)
         self._hist_cache_valid: bool = False
         self._force_recount: bool = True
+        self._top_pairs_limit: int = 512
+        self._top_pairs_heap: list[tuple[int, int]] = []
+        self._top_pairs_index: dict[int, int] = {}
+        self._pair_count_lookup: dict[int, int] = {}
 
     # ------------------------------------------------------------------
     # Transfer accounting helpers
@@ -430,10 +435,12 @@ class GPUBPETrainer:
         self._cached_pair_counts = torch.empty((0,), dtype=torch.int32)
         self._hist_cache_valid = False
         self._force_recount = True
+        self._reset_top_pairs()
 
     def _invalidate_hist_cache(self) -> None:
         self._hist_cache_valid = False
         self._force_recount = True
+        self._reset_top_pairs()
 
     def _expand_recount_spans(self, span_mask: torch.Tensor) -> torch.Tensor:
         if span_mask.numel() == 0:
@@ -535,6 +542,71 @@ class GPUBPETrainer:
         keys, counts = cls._merge_histogram(keys, counts, add_keys, add_counts, 1)
         return keys, counts
 
+    def _reset_top_pairs(self) -> None:
+        self._top_pairs_heap = []
+        self._top_pairs_index = {}
+        self._pair_count_lookup = {}
+
+    def _cleanup_top_heap(self) -> None:
+        while self._top_pairs_heap:
+            neg_count, key = self._top_pairs_heap[0]
+            lookup = self._top_pairs_index.get(key)
+            if lookup is not None and lookup == -neg_count:
+                break
+            heapq.heappop(self._top_pairs_heap)
+
+    def _enforce_top_limit(self) -> None:
+        limit = self._top_pairs_limit
+        if limit <= 0:
+            return
+        while len(self._top_pairs_index) > limit:
+            worst_key, _ = min(self._top_pairs_index.items(), key=lambda kv: (kv[1], kv[0]))
+            self._top_pairs_index.pop(worst_key, None)
+        self._cleanup_top_heap()
+
+    def _insert_top_pair(self, key: int, count: int) -> None:
+        if self._top_pairs_limit <= 0 or count <= 0:
+            if count <= 0:
+                self._top_pairs_index.pop(key, None)
+            return
+        self._top_pairs_index[key] = count
+        heapq.heappush(self._top_pairs_heap, (-count, key))
+        self._enforce_top_limit()
+
+    def _select_top_candidate(self) -> tuple[Optional[int], int, int]:
+        if not self._enable_histogram_cache or self._top_pairs_limit <= 0:
+            return None, 0, 0
+        best_seen = 0
+        while self._top_pairs_heap:
+            neg_count, key = self._top_pairs_heap[0]
+            lookup = self._top_pairs_index.get(key)
+            if lookup is not None:
+                best_seen = max(best_seen, lookup)
+            if lookup is None or lookup != -neg_count:
+                heapq.heappop(self._top_pairs_heap)
+                continue
+            return key, lookup, best_seen
+        return None, 0, best_seen
+
+    def _refresh_top_pairs_from_cache(self) -> None:
+        self._reset_top_pairs()
+        if not self._enable_histogram_cache:
+            return
+        keys = self._cached_pair_keys
+        counts = self._cached_pair_counts
+        if keys.numel() == 0:
+            return
+        keys_list = keys.cpu().tolist()
+        counts_list = counts.cpu().tolist()
+        for key_val, count_val in zip(keys_list, counts_list):
+            count_int = int(count_val)
+            if count_int <= 0:
+                continue
+            key_int = int(key_val)
+            self._pair_count_lookup[key_int] = count_int
+            self._insert_top_pair(key_int, count_int)
+        self._cleanup_top_heap()
+
     def _update_global_histogram(
         self,
         remove_keys: torch.Tensor,
@@ -550,6 +622,100 @@ class GPUBPETrainer:
             add_keys,
             add_counts,
         )
+        if not self._enable_histogram_cache:
+            return
+        deltas: dict[int, int] = {}
+        if remove_keys.numel() > 0:
+            for key, count in zip(remove_keys.cpu().tolist(), remove_counts.cpu().tolist()):
+                deltas[int(key)] = deltas.get(int(key), 0) - int(count)
+        if add_keys.numel() > 0:
+            for key, count in zip(add_keys.cpu().tolist(), add_counts.cpu().tolist()):
+                deltas[int(key)] = deltas.get(int(key), 0) + int(count)
+        for key, delta in deltas.items():
+            new_total = self._pair_count_lookup.get(key, 0) + delta
+            if new_total <= 0:
+                self._pair_count_lookup.pop(key, None)
+                self._top_pairs_index.pop(key, None)
+            else:
+                self._pair_count_lookup[key] = new_total
+                self._insert_top_pair(key, new_total)
+        if deltas:
+            self._cleanup_top_heap()
+
+    def _invoke_count_pairs_gpu(
+        self,
+        batch_iter: Iterable[
+            Union[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], MultiDeviceBatch]
+        ],
+        impl: Callable[
+            [
+                Iterable[
+                    Union[
+                        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                        MultiDeviceBatch,
+                    ]
+                ]
+            ],
+            tuple[Optional[torch.Tensor], Optional[torch.Tensor], list[MultiDeviceBatch]],
+        ],
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], list[MultiDeviceBatch]]:
+        return impl(batch_iter)
+
+    def _invoke_count_pairs_cpu(
+        self,
+        batch_iter: Iterable[
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+            | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+            | Tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                list[torch.Tensor],
+                Optional[tuple[torch.Tensor, torch.Tensor]],
+            ],
+        ],
+        impl: Callable[
+            [
+                Iterable[
+                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+                    | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+                    | Tuple[
+                        torch.Tensor,
+                        torch.Tensor,
+                        torch.Tensor,
+                        list[torch.Tensor],
+                        Optional[tuple[torch.Tensor, torch.Tensor]],
+                    ]
+                ]
+            ],
+            tuple[
+                Optional[torch.Tensor],
+                Optional[torch.Tensor],
+                list[
+                    tuple[
+                        torch.Tensor,
+                        torch.Tensor,
+                        torch.Tensor,
+                        list[torch.Tensor],
+                        Optional[tuple[torch.Tensor, torch.Tensor]],
+                    ]
+                ],
+            ],
+        ],
+    ) -> tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        list[
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                list[torch.Tensor],
+                Optional[tuple[torch.Tensor, torch.Tensor]],
+            ]
+        ],
+    ]:
+        return impl(batch_iter)
 
     def fit(
         self,
@@ -951,6 +1117,7 @@ class GPUBPETrainer:
             self._cached_pair_counts = reduced_counts.clone()
             self._hist_cache_valid = True
             self._force_recount = False
+            self._refresh_top_pairs_from_cache()
             if not self._enable_histogram_cache:
                 self._invalidate_hist_cache()
             return reduced_keys.clone(), reduced_counts.clone(), consumed
@@ -1292,6 +1459,7 @@ class GPUBPETrainer:
                     self._cached_pair_counts = cached_counts.clone()
                     self._hist_cache_valid = True
                     self._force_recount = False
+                    self._refresh_top_pairs_from_cache()
                     if not self._enable_histogram_cache:
                         self._invalidate_hist_cache()
                     return cached_keys, cached_counts, consumed
@@ -1490,26 +1658,58 @@ class GPUBPETrainer:
                 _reconfigure_batches(scale_state.batch_size)
                 self._active_batch_size = scale_state.batch_size
             t0 = time.time()
-            if use_cuda:
-                global_keys, global_counts, consumed_batches = _count_pairs_gpu(current_batches)
-                gpu_batches = consumed_batches
+            candidate_key: Optional[int] = None
+            candidate_count = 0
+            best_seen = 0
+            if (
+                self._enable_histogram_cache
+                and self._hist_cache_valid
+                and not self._force_recount
+            ):
+                candidate_key, candidate_count, best_seen = self._select_top_candidate()
+            use_fast_path = (
+                candidate_key is not None and candidate_count >= best_seen and candidate_count > 0
+            )
+            best_key_value: Optional[int] = None
+            best_count = 0
+            if use_fast_path:
+                best_key_value = int(candidate_key) if candidate_key is not None else None
+                best_count = int(candidate_count)
             else:
-                global_keys, global_counts, consumed_batches = _count_pairs_cpu(current_batches)
-            if global_keys is None or global_keys.numel() == 0:
+                if use_cuda:
+                    (
+                        global_keys,
+                        global_counts,
+                        consumed_batches,
+                    ) = self._invoke_count_pairs_gpu(current_batches, _count_pairs_gpu)
+                    gpu_batches = consumed_batches
+                else:
+                    (
+                        global_keys,
+                        global_counts,
+                        consumed_batches,
+                    ) = self._invoke_count_pairs_cpu(current_batches, _count_pairs_cpu)
+                if global_keys is None or global_keys.numel() == 0:
+                    print("No pairs left to merge.")
+                    break
+                current_batches = consumed_batches
+                agg_keys, agg_counts = aggregate_pair_keys(global_keys, global_counts)
+                best_tensor_count = torch.max(agg_counts)
+                candidate_indices = torch.nonzero(
+                    agg_counts == best_tensor_count, as_tuple=False
+                ).flatten()
+                if candidate_indices.numel() == 1:
+                    best_idx = candidate_indices[0]
+                else:
+                    best_idx = candidate_indices[torch.argmin(agg_keys[candidate_indices])]
+                best_key = agg_keys[best_idx]
+                best_key_value = int(best_key.item())
+                best_count = int(best_tensor_count.item())
+            if best_key_value is None:
                 print("No pairs left to merge.")
                 break
-            current_batches = consumed_batches
-            agg_keys, agg_counts = aggregate_pair_keys(global_keys, global_counts)
-            best_count = torch.max(agg_counts)
-            candidate_indices = torch.nonzero(agg_counts == best_count, as_tuple=False).flatten()
-            if candidate_indices.numel() == 1:
-                best_idx = candidate_indices[0]
-            else:
-                best_idx = candidate_indices[torch.argmin(agg_keys[candidate_indices])]
-            best_key = agg_keys[best_idx]
-            a_id = int((best_key >> 32).item())
-            b_id = int((best_key & ((1 << 32) - 1)).item())
-            best_count = int(best_count.item())
+            a_id = int(best_key_value >> 32)
+            b_id = int(best_key_value & ((1 << 32) - 1))
             if best_count <= 1:
                 print("Stopping: no frequent pairs.")
                 break
