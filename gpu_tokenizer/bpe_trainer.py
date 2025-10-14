@@ -31,6 +31,31 @@ UINT32_MAX = (1 << 32) - 1
 
 
 @dataclass
+class StageTiming:
+    """Accumulates timing samples for a named stage."""
+
+    name: str
+    samples: list[float] = field(default_factory=list)
+
+    def record(self, duration_s: float) -> None:
+        if duration_s < 0:
+            return
+        self.samples.append(float(duration_s))
+
+    def summary(self) -> dict[str, object]:
+        total = float(sum(self.samples))
+        count = len(self.samples)
+        avg = total / count if count else 0.0
+        return {
+            "stage": self.name,
+            "count": count,
+            "total_s": total,
+            "avg_s": avg,
+            "samples": list(self.samples),
+        }
+
+
+@dataclass
 class GPUBatchRecord:
     """Container for GPU-resident batch state with optional host mirrors."""
 
@@ -247,9 +272,62 @@ class DeviceContext:
     h2d_events: int = 0
     d2h_events: int = 0
     active_batches: list[GPUBatchRecord] = field(default_factory=list)
+    stage_transfers: dict[str, dict[str, int]] = field(default_factory=dict)
+    memory_snapshots: list[dict[str, object]] = field(default_factory=list)
+    utilization_samples: list[dict[str, float]] = field(default_factory=list)
 
     def reset_activity(self) -> None:
         self.active_batches.clear()
+
+    def log_transfer(self, stage: str, direction: str, amount: int) -> None:
+        stage_key = stage or "general"
+        entry = self.stage_transfers.setdefault(stage_key, {"h2d": 0, "d2h": 0})
+        if direction == "h2d":
+            entry["h2d"] += int(amount)
+        elif direction == "d2h":
+            entry["d2h"] += int(amount)
+
+    def capture_snapshot(self, stage: str) -> dict[str, object]:
+        timestamp = time.time()
+        snapshot: dict[str, object] = {
+            "stage": stage,
+            "timestamp": timestamp,
+        }
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            try:
+                with torch.cuda.device(self.device):
+                    free, total = torch.cuda.mem_get_info(self.device)
+                    snapshot["memory"] = {
+                        "free_bytes": int(free),
+                        "total_bytes": int(total),
+                        "used_bytes": int(max(0, total - free)),
+                    }
+                    snapshot["allocated_bytes"] = int(
+                        torch.cuda.memory_allocated(self.device)
+                    )
+                    snapshot["reserved_bytes"] = int(
+                        torch.cuda.memory_reserved(self.device)
+                    )
+                    util_fn = getattr(torch.cuda, "utilization", None)
+                    utilization: float | None = None
+                    if callable(util_fn):
+                        try:
+                            utilization = float(util_fn(self.device))
+                        except Exception:
+                            utilization = None
+                    if utilization is not None:
+                        snapshot["utilization"] = utilization
+                        self.utilization_samples.append(
+                            {
+                                "stage": stage,
+                                "timestamp": timestamp,
+                                "utilization": utilization,
+                            }
+                        )
+            except RuntimeError:
+                pass
+        self.memory_snapshots.append(snapshot)
+        return snapshot
 
 
 @dataclass
@@ -399,6 +477,7 @@ class GPUBPETrainer:
         self._interval_merges: int = 0
         self._active_batch_size: int | None = None
         self._device_contexts: Dict[torch.device, DeviceContext] = {}
+        self._transfer_stage_totals: dict[str, dict[str, int]] = {}
         self._enable_histogram_cache: bool = True
         self._cached_pair_keys: torch.Tensor = torch.empty((0,), dtype=torch.long)
         self._cached_pair_counts: torch.Tensor = torch.empty((0,), dtype=torch.int32)
@@ -423,40 +502,60 @@ class GPUBPETrainer:
         self._interval_merges = 0
         self._cpu_fallback_batches = 0
         self._last_cpu_fallback_ratio = 0.0
+        self._transfer_stage_totals = {}
         for ctx in self._device_contexts.values():
             ctx.bytes_h2d = 0
             ctx.bytes_d2h = 0
             ctx.h2d_events = 0
             ctx.d2h_events = 0
             ctx.reset_activity()
+            ctx.stage_transfers = {}
+            ctx.memory_snapshots = []
+            ctx.utilization_samples = []
 
     def _record_h2d(
-        self, *tensors: torch.Tensor, device: torch.device | None = None
+        self,
+        *tensors: torch.Tensor,
+        device: torch.device | None = None,
+        stage: str = "general",
     ) -> None:
         if not tensors:
             return
         total = sum(int(t.nbytes) for t in tensors)
         self.bytes_h2d += total
         self.h2d_events += 1
+        stage_totals = self._transfer_stage_totals.setdefault(
+            stage or "general", {"h2d": 0, "d2h": 0}
+        )
+        stage_totals["h2d"] += total
         if device is not None:
             ctx = self._device_contexts.get(device)
             if ctx is not None:
                 ctx.bytes_h2d += total
                 ctx.h2d_events += 1
+                ctx.log_transfer(stage, "h2d", total)
 
     def _record_d2h(
-        self, *tensors: torch.Tensor, device: torch.device | None = None
+        self,
+        *tensors: torch.Tensor,
+        device: torch.device | None = None,
+        stage: str = "general",
     ) -> int:
         if not tensors:
             return 0
         total = sum(int(t.nbytes) for t in tensors)
         self.bytes_d2h += total
         self.d2h_events += 1
+        stage_totals = self._transfer_stage_totals.setdefault(
+            stage or "general", {"h2d": 0, "d2h": 0}
+        )
+        stage_totals["d2h"] += total
         if device is not None:
             ctx = self._device_contexts.get(device)
             if ctx is not None:
                 ctx.bytes_d2h += total
                 ctx.d2h_events += 1
+                ctx.log_transfer(stage, "d2h", total)
         return total
 
     def _record_merge_snapshot(self, merge_idx: int) -> None:
@@ -902,6 +1001,15 @@ class GPUBPETrainer:
 
         cpu_device = torch.device("cpu")
 
+        stage_timings: dict[str, StageTiming] = {
+            "pair_count": StageTiming("pair_count"),
+            "apply_merge": StageTiming("apply_merge"),
+            "host_sync": StageTiming("host_sync"),
+        }
+        stage_event_log: list[dict[str, object]] = []
+        host_sync_events: list[dict[str, object]] = []
+        device_snapshot_log: list[dict[str, object]] = []
+
         def _unpack_cpu_batch(
             batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
             | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
@@ -1099,8 +1207,22 @@ class GPUBPETrainer:
 
         device = torch.device(self.device)
 
+        def _capture_device_snapshots(stage_label: str) -> None:
+            if not use_cuda:
+                return
+            for dev, ctx in device_contexts.items():
+                snapshot = ctx.capture_snapshot(stage_label)
+                snapshot["device"] = str(dev)
+                device_snapshot_log.append(snapshot)
+
         def _record_new_batch(ctx: DeviceContext, record: GPUBatchRecord) -> None:
-            self._record_h2d(record.tokens, record.valid, record.lengths, device=ctx.device)
+            self._record_h2d(
+                record.tokens,
+                record.valid,
+                record.lengths,
+                device=ctx.device,
+                stage="initial_load",
+            )
 
         def _register_batch(batch: MultiDeviceBatch) -> None:
             for dev, record in batch.iter_shards():
@@ -1503,16 +1625,21 @@ class GPUBPETrainer:
             return new_batches, oom_seen, {"sync": True, "bytes": 0}
 
         if use_cuda:
-            def _finalize_host_sync(records: list[MultiDeviceBatch]) -> int:
+            def _finalize_host_sync(records: list[MultiDeviceBatch]) -> tuple[int, float]:
+                sync_start = time.perf_counter()
                 copied_bytes = 0
                 pending_copy = False
+                _capture_device_snapshots("host_sync:final:start")
                 _mark_active_batches(records)
                 for batch in records:
                     for dev, shard in batch.iter_shards():
                         ctx = device_contexts[dev]
                         if shard.host_dirty:
                             copied_bytes += self._record_d2h(
-                                shard.tokens, shard.valid, device=dev
+                                shard.tokens,
+                                shard.valid,
+                                device=dev,
+                                stage="host_sync",
                             )
                             with torch.cuda.device(dev):
                                 shard.schedule_host_sync(ctx.copy_stream)
@@ -1529,7 +1656,10 @@ class GPUBPETrainer:
                 for batch in records:
                     for _dev, shard in batch.iter_shards():
                         shard.resolve_host()
-                return copied_bytes
+                elapsed = time.perf_counter() - sync_start if pending_copy else 0.0
+                if pending_copy:
+                    _capture_device_snapshots("host_sync:final:end")
+                return copied_bytes, elapsed
 
             def _count_pairs_gpu(
                 batch_iter: Iterable[
@@ -1877,7 +2007,10 @@ class GPUBPETrainer:
                                 pending_compute[dev] = True
                                 if need_sync:
                                     copied_bytes += self._record_d2h(
-                                        shard.tokens, shard.valid, device=dev
+                                        shard.tokens,
+                                        shard.valid,
+                                        device=dev,
+                                        stage="host_sync",
                                     )
                                     with torch.cuda.device(dev):
                                         shard.schedule_host_sync(ctx.copy_stream)
@@ -1889,8 +2022,8 @@ class GPUBPETrainer:
                                     torch.cuda.empty_cache()
                                     break
                                 raise
-                        if retry_required:
-                            break
+                    if retry_required:
+                        break
                     if retry_required:
                         sequences = _extract_sequences_from_gpu(gpu_records)
                         prev_bs = scale_state.batch_size if scale_state is not None else None
@@ -1922,12 +2055,20 @@ class GPUBPETrainer:
                         continue
                     for dev, ctx in device_contexts.items():
                         torch.cuda.current_stream(device=dev).wait_stream(ctx.compute_stream)
+                    sync_duration = 0.0
                     if need_sync:
+                        _capture_device_snapshots("host_sync:merge:start")
+                        sync_start = time.perf_counter()
                         for dev, ctx in device_contexts.items():
                             torch.cuda.current_stream(device=dev).wait_stream(ctx.copy_stream)
                         for batch in gpu_records:
                             for _dev, shard in batch.iter_shards():
                                 shard.resolve_host()
+                        sync_duration = (
+                            time.perf_counter() - sync_start if copied_bytes > 0 else 0.0
+                        )
+                        if copied_bytes > 0:
+                            _capture_device_snapshots("host_sync:merge:end")
                     if profile_streams:
                         for dev, ctx in device_contexts.items():
                             compute_pending = pending_compute.get(dev, False)
@@ -1946,6 +2087,7 @@ class GPUBPETrainer:
                     return updated_records, oom_seen, {
                         "sync": need_sync and copied_bytes > 0,
                         "bytes": copied_bytes,
+                        "duration_s": sync_duration,
                     }
 
         warm_plan = warm_start_plan if warm_start_plan is not None else self._warm_start_plan
@@ -2030,8 +2172,22 @@ class GPUBPETrainer:
                         f"Token id overflow during warm start: encountered id above UINT32_MAX (limit {UINT32_MAX})."
                     )
                 if use_cuda:
+                    _capture_device_snapshots("apply_merge:warm:start")
+                    warm_merge_start = time.perf_counter()
                     current_batches, oom_seen, sync_report = _apply_merge_gpu(
                         current_batches, a_id, b_id, new_id, step + 1, force_sync=True
+                    )
+                    merge_duration = time.perf_counter() - warm_merge_start
+                    stage_timings["apply_merge"].record(merge_duration)
+                    stage_event_log.append(
+                        {
+                            "stage": "apply_merge",
+                            "duration_s": merge_duration,
+                            "mode": "gpu",
+                            "merge": step,
+                            "type": "warm_start",
+                            "timestamp": time.time(),
+                        }
                     )
                     if oom_seen:
                         raise RuntimeError(
@@ -2045,9 +2201,35 @@ class GPUBPETrainer:
                     self._interval_merges += 1
                     if sync_report.get("sync"):
                         self._close_sync_interval(step + 1, sync_report.get("bytes", 0))
+                    if sync_report.get("duration_s", 0.0) > 0:
+                        sync_duration = float(sync_report.get("duration_s", 0.0))
+                        stage_timings["host_sync"].record(sync_duration)
+                        host_sync_events.append(
+                            {
+                                "merge": step,
+                                "bytes": sync_report.get("bytes", 0),
+                                "duration_s": sync_duration,
+                                "type": "warm_start",
+                                "timestamp": time.time(),
+                            }
+                        )
+                    _capture_device_snapshots("apply_merge:warm:end")
                 else:
+                    warm_merge_start = time.perf_counter()
                     current_batches, _oom_seen, _ = _apply_merge_cpu(
                         current_batches, a_id, b_id, new_id
+                    )
+                    merge_duration = time.perf_counter() - warm_merge_start
+                    stage_timings["apply_merge"].record(merge_duration)
+                    stage_event_log.append(
+                        {
+                            "stage": "apply_merge",
+                            "duration_s": merge_duration,
+                            "mode": "cpu",
+                            "merge": step,
+                            "type": "warm_start",
+                            "timestamp": time.time(),
+                        }
                     )
                 self.merges.append((a_id, b_id))
                 self.vocab_size += 1
@@ -2099,22 +2281,50 @@ class GPUBPETrainer:
                 best_count = int(candidate_count)
             else:
                 if use_cuda:
+                    _capture_device_snapshots("pair_count:start")
+                    count_start = time.perf_counter()
                     (
                         global_keys,
                         global_counts,
                         consumed_batches,
                     ) = self._invoke_count_pairs_gpu(current_batches, _count_pairs_gpu)
+                    count_duration = time.perf_counter() - count_start
+                    stage_timings["pair_count"].record(count_duration)
+                    stage_event_log.append(
+                        {
+                            "stage": "pair_count",
+                            "duration_s": count_duration,
+                            "mode": "gpu",
+                            "merge": step,
+                            "type": "merge",
+                            "timestamp": time.time(),
+                        }
+                    )
                     gpu_batches = [
                         batch
                         for batch in consumed_batches
                         if isinstance(batch, MultiDeviceBatch)
                     ]
+                    _capture_device_snapshots("pair_count:end")
                 else:
+                    count_start = time.perf_counter()
                     (
                         global_keys,
                         global_counts,
                         consumed_batches,
                     ) = self._invoke_count_pairs_cpu(current_batches, _count_pairs_cpu)
+                    count_duration = time.perf_counter() - count_start
+                    stage_timings["pair_count"].record(count_duration)
+                    stage_event_log.append(
+                        {
+                            "stage": "pair_count",
+                            "duration_s": count_duration,
+                            "mode": "cpu",
+                            "merge": step,
+                            "type": "merge",
+                            "timestamp": time.time(),
+                        }
+                    )
                 if global_keys is None or global_keys.numel() == 0:
                     print("No pairs left to merge.")
                     break
@@ -2153,8 +2363,22 @@ class GPUBPETrainer:
                     f"Vocabulary size exceeded UINT32_MAX (limit {UINT32_MAX})."
                 )
             if use_cuda:
+                _capture_device_snapshots("apply_merge:start")
+                merge_start = time.perf_counter()
                 current_batches, oom_seen, sync_report = _apply_merge_gpu(
                     current_batches, a_id, b_id, new_id, step + 1
+                )
+                merge_duration = time.perf_counter() - merge_start
+                stage_timings["apply_merge"].record(merge_duration)
+                stage_event_log.append(
+                    {
+                        "stage": "apply_merge",
+                        "duration_s": merge_duration,
+                        "mode": "gpu",
+                        "merge": step,
+                        "type": "merge",
+                        "timestamp": time.time(),
+                    }
                 )
                 gpu_batches = [
                     batch
@@ -2164,8 +2388,34 @@ class GPUBPETrainer:
                 self._interval_merges += 1
                 if sync_report.get("sync"):
                     self._close_sync_interval(step + 1, sync_report.get("bytes", 0))
+                if sync_report.get("duration_s", 0.0) > 0:
+                    sync_duration = float(sync_report.get("duration_s", 0.0))
+                    stage_timings["host_sync"].record(sync_duration)
+                    host_sync_events.append(
+                        {
+                            "merge": step,
+                            "bytes": sync_report.get("bytes", 0),
+                            "duration_s": sync_duration,
+                            "type": "merge",
+                            "timestamp": time.time(),
+                        }
+                    )
+                _capture_device_snapshots("apply_merge:end")
             else:
+                merge_start = time.perf_counter()
                 current_batches, oom_seen, _ = _apply_merge_cpu(current_batches, a_id, b_id, new_id)
+                merge_duration = time.perf_counter() - merge_start
+                stage_timings["apply_merge"].record(merge_duration)
+                stage_event_log.append(
+                    {
+                        "stage": "apply_merge",
+                        "duration_s": merge_duration,
+                        "mode": "cpu",
+                        "merge": step,
+                        "type": "merge",
+                        "timestamp": time.time(),
+                    }
+                )
             step += 1
             if not use_cuda:
                 self._interval_merges = 0
@@ -2176,7 +2426,18 @@ class GPUBPETrainer:
                 cpu_fallback_rate=self._last_cpu_fallback_ratio,
             )
         if use_cuda and gpu_batches is not None:
-            final_bytes = _finalize_host_sync(gpu_batches)
+            final_bytes, final_duration = _finalize_host_sync(gpu_batches)
+            if final_duration > 0:
+                stage_timings["host_sync"].record(final_duration)
+                host_sync_events.append(
+                    {
+                        "merge": step,
+                        "bytes": final_bytes,
+                        "duration_s": final_duration,
+                        "timestamp": time.time(),
+                        "type": "final",
+                    }
+                )
             if self._interval_merges > 0:
                 self._close_sync_interval(step, final_bytes)
         per_device_metrics = {
@@ -2185,11 +2446,25 @@ class GPUBPETrainer:
                 "bytes_d2h": ctx.bytes_d2h,
                 "h2d_events": ctx.h2d_events,
                 "d2h_events": ctx.d2h_events,
+                "stage_breakdown": dict(ctx.stage_transfers),
+                "memory_snapshots": list(ctx.memory_snapshots),
+                "utilization_samples": list(ctx.utilization_samples),
             }
             for device, ctx in self._device_contexts.items()
         }
         for ctx in self._device_contexts.values():
             ctx.reset_activity()
+        autoscaler_metrics = self.autoscaler.snapshot_metrics()
+        timings_summary = {
+            name: timing.summary() for name, timing in stage_timings.items()
+        }
+        telemetry_summary = {
+            "timings": timings_summary,
+            "events": stage_event_log,
+            "host_sync_events": host_sync_events,
+            "device_snapshots": device_snapshot_log,
+            "autoscaler": autoscaler_metrics,
+        }
         return {
             "base_vocab": self.base_vocab,
             "vocab_size": self.vocab_size,
@@ -2203,6 +2478,7 @@ class GPUBPETrainer:
                 "merge_stats": self.merge_transfer_log,
                 "sync_intervals": self.sync_intervals,
                 "per_device": per_device_metrics,
+                "per_stage": self._transfer_stage_totals,
                 "avg_d2h_bytes_per_merge": (
                     self.bytes_d2h / len(self.merge_transfer_log)
                     if self.merge_transfer_log
@@ -2213,6 +2489,7 @@ class GPUBPETrainer:
                     "ratio": self._last_cpu_fallback_ratio,
                 },
             },
+            "telemetry": telemetry_summary,
         }
 
     def save(self, out_dir: str) -> None:

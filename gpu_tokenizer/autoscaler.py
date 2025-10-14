@@ -7,7 +7,7 @@ import logging
 import math
 import os
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Deque, Optional
 
 try:  # pragma: no cover - optional dependency
@@ -215,6 +215,21 @@ class AutoScaler:
             h2d_mb=new_h2d,
             cpu_fallback_rate=fallback_rate,
         )
+
+    def snapshot_metrics(self) -> dict[str, object]:
+        state_dict = asdict(self.state) if self.state is not None else None
+        mean_step, var_step = self._stats(self._step_times)
+        mean_vram, var_vram = self._stats(self._vram_fracs)
+        return {
+            "device": self.device,
+            "target_util": self.tu,
+            "window_size": self._window_size,
+            "state": state_dict,
+            "step_times": list(self._step_times),
+            "step_stats": {"mean": mean_step, "variance": var_step},
+            "vram_utilization": list(self._vram_fracs),
+            "vram_stats": {"mean": mean_vram, "variance": var_vram},
+        }
 
     def _log_adjustment(
         self,
