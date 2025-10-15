@@ -1,5 +1,6 @@
 import pytest
 from types import MethodType
+import time
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("torch.utils")
@@ -589,3 +590,72 @@ def test_multi_gpu_autoscaler_updates_contexts(monkeypatch):
     per_device = result["transfer_metrics"]["per_device"]
     assert set(per_device.keys()) == {"cuda:0", "cuda:1"}
     assert all(metrics["bytes_h2d"] > 0 for metrics in per_device.values())
+
+
+def test_checkpoint_resume_matches_uninterrupted(tmp_path, monkeypatch):
+    clock = {"perf": 0.0, "wall": 0.0}
+
+    def reset_clock() -> None:
+        clock["perf"] = 0.0
+        clock["wall"] = 0.0
+
+    def fake_perf_counter() -> float:
+        clock["perf"] += 0.001
+        return clock["perf"]
+
+    def fake_time() -> float:
+        clock["wall"] += 1.0
+        return clock["wall"]
+
+    monkeypatch.setattr(time, "perf_counter", fake_perf_counter)
+    monkeypatch.setattr(time, "time", fake_time)
+
+    seq_batches = [
+        [[1, 2, 1, 2], [1, 2, 3, 4]],
+        [[2, 3, 2, 3], [3, 4, 3, 4]],
+    ]
+    base_batches = [_make_batch(seqs) for seqs in seq_batches]
+
+    def fresh_batches():
+        cloned = []
+        for tokens, valid, lengths in base_batches:
+            cloned.append((tokens.clone(), valid.clone(), lengths.clone()))
+        return cloned
+
+    reset_clock()
+    trainer_full = GPUBPETrainer(base_vocab=256, merges=4, device="cpu")
+    result_full = trainer_full.fit(fresh_batches(), log_every=10)
+
+    reset_clock()
+    trainer_partial = GPUBPETrainer(base_vocab=256, merges=4, device="cpu")
+    ckpt_dir = tmp_path / "ckpt"
+    save_calls = {"count": 0}
+    original_save = trainer_partial.save_checkpoint
+
+    def intercept(path, include_batches=True, **kwargs):
+        save_calls["count"] += 1
+        state = original_save(path, include_batches=include_batches, **kwargs)
+        if save_calls["count"] == 1:
+            raise RuntimeError("checkpoint interrupt")
+        return state
+
+    monkeypatch.setattr(trainer_partial, "save_checkpoint", intercept)
+    with pytest.raises(RuntimeError, match="checkpoint interrupt"):
+        trainer_partial.fit(
+            fresh_batches(),
+            log_every=10,
+            checkpoint_interval=2,
+            checkpoint_dir=str(ckpt_dir),
+        )
+
+    trainer_resume = GPUBPETrainer(base_vocab=256, merges=4, device="cpu")
+    resume_state = trainer_resume.load_checkpoint(str(ckpt_dir))
+    resumed_result = trainer_resume.fit(
+        [],
+        log_every=10,
+        resume_state=resume_state,
+    )
+
+    assert trainer_resume.merges == trainer_full.merges
+    assert resumed_result["transfer_metrics"] == result_full["transfer_metrics"]
+    assert resumed_result["telemetry"] == result_full["telemetry"]

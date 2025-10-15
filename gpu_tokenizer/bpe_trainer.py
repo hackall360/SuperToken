@@ -6,12 +6,13 @@ import heapq
 import json
 import os
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
 import torch
 
-from .autoscaler import AutoScaler
+from .autoscaler import AutoScaler, ScaleState
 from .cuda_kernels import apply_merge_and_compact as cuda_apply_merge_and_compact
 from .cpu_fastpath import (
     FastPathWorkspaces,
@@ -489,6 +490,7 @@ class GPUBPETrainer:
         self._pair_count_lookup: dict[int, int] = {}
         self._cpu_fallback_batches: int = 0
         self._last_cpu_fallback_ratio: float = 0.0
+        self._merge_step: int = 0
 
     # ------------------------------------------------------------------
     # Transfer accounting helpers
@@ -557,6 +559,654 @@ class GPUBPETrainer:
                 ctx.d2h_events += 1
                 ctx.log_transfer(stage, "d2h", total)
         return total
+
+    # ------------------------------------------------------------------
+    # Batch serialization helpers
+    def _unpack_cpu_batch(
+        self,
+        batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+        | Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            list[torch.Tensor],
+            Optional[tuple[torch.Tensor, torch.Tensor]],
+        ]
+        | CPUFallbackBatch,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        list[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
+        if isinstance(batch, CPUFallbackBatch):
+            return (
+                batch.tokens,
+                batch.valid,
+                batch.lengths,
+                list(batch.spans),
+                batch.pair_keys,
+                batch.pair_counts,
+            )
+        tokens_cpu = batch[0]
+        valid_cpu = batch[1]
+        lengths_cpu = batch[2]
+        spans = batch[3] if len(batch) > 3 else []
+        if not isinstance(spans, list):
+            spans = list(spans)
+        pair_keys: Optional[torch.Tensor] = None
+        pair_counts: Optional[torch.Tensor] = None
+        if len(batch) > 4 and batch[4] is not None:
+            pair_keys, pair_counts = batch[4]
+        return tokens_cpu, valid_cpu, lengths_cpu, spans, pair_keys, pair_counts
+
+    def _pack_cpu_batch(
+        self,
+        tokens_cpu: torch.Tensor,
+        valid_cpu: torch.Tensor,
+        lengths_cpu: torch.Tensor,
+        spans: list[torch.Tensor] | None = None,
+        pair_keys: Optional[torch.Tensor] = None,
+        pair_counts: Optional[torch.Tensor] = None,
+        *,
+        as_fallback: bool = False,
+        workspaces: Optional[FastPathWorkspaces] = None,
+    ) -> (
+        tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            list[torch.Tensor],
+            Optional[tuple[torch.Tensor, torch.Tensor]],
+        ]
+        | CPUFallbackBatch
+    ):
+        pair_tuple: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+        if pair_keys is not None and pair_counts is not None:
+            pair_tuple = (pair_keys, pair_counts)
+        if as_fallback:
+            return CPUFallbackBatch(
+                tokens=tokens_cpu,
+                valid=valid_cpu,
+                lengths=lengths_cpu,
+                spans=[] if spans is None else list(spans),
+                pair_keys=None if pair_keys is None else pair_keys,
+                pair_counts=None if pair_counts is None else pair_counts,
+                workspaces=workspaces or FastPathWorkspaces(),
+            )
+        return (
+            tokens_cpu,
+            valid_cpu,
+            lengths_cpu,
+            [] if spans is None else spans,
+            pair_tuple,
+        )
+
+    def _extract_sequences_from_cpu_batches(
+        self,
+        cpu_batches: Iterable[
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+            | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+            | Tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                list[torch.Tensor],
+                Optional[tuple[torch.Tensor, torch.Tensor]],
+            ]
+            | CPUFallbackBatch,
+        ],
+    ) -> list[list[int]]:
+        sequences: list[list[int]] = []
+        for batch in cpu_batches:
+            tokens_cpu, _valid_cpu, lengths_cpu, _spans, _pair_keys, _pair_counts = (
+                self._unpack_cpu_batch(batch)
+            )
+            rows = int(tokens_cpu.shape[0])
+            for row in range(rows):
+                length = int(lengths_cpu[row].item())
+                if length <= 0:
+                    sequences.append([])
+                    continue
+                seq = tokens_cpu[row, :length].to(torch.long).tolist()
+                sequences.append(seq)
+        return sequences
+
+    def _extract_sequences_from_gpu_records(
+        self, records: Iterable[MultiDeviceBatch]
+    ) -> list[list[int]]:
+        sequences: list[list[int]] = []
+        for record in records:
+            sequences.extend(record.sequences())
+        return sequences
+
+    def _iter_cpu_batches_from_sequences(
+        self, sequences: list[list[int]], batch_size: int, pin: bool
+    ) -> Iterator[
+        tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            list[torch.Tensor],
+            Optional[tuple[torch.Tensor, torch.Tensor]],
+        ]
+    ]:
+        if batch_size <= 0:
+            return
+        for start in range(0, len(sequences), batch_size):
+            chunk = sequences[start : start + batch_size]
+            if not chunk:
+                continue
+            rows = len(chunk)
+            max_len = max((len(seq) for seq in chunk), default=0)
+            width = max(1, max_len)
+            tokens = torch.full((rows, width), -1, dtype=torch.int32)
+            valid = torch.zeros((rows, width), dtype=torch.uint8)
+            length_dtype = length_storage_dtype(width)
+            lengths = torch.zeros((rows,), dtype=length_dtype)
+            for row, seq in enumerate(chunk):
+                if not seq:
+                    continue
+                L = len(seq)
+                tokens[row, :L] = torch.tensor(seq, dtype=torch.int32)
+                valid[row, :L] = 1
+                lengths[row] = L
+            if pin:
+                tokens = tokens.pin_memory()
+                valid = valid.pin_memory()
+            yield tokens, valid, lengths, [], None
+
+    def _collect_sequences_from_batches(
+        self,
+        batches_iter: Iterable[
+            Union[
+                Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]],
+                MultiDeviceBatch,
+                CPUFallbackBatch,
+            ]
+        ],
+    ) -> list[list[int]]:
+        sequences: list[list[int]] = []
+        cpu_batches: list[
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+            | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+            | Tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                list[torch.Tensor],
+                Optional[tuple[torch.Tensor, torch.Tensor]],
+            ]
+            | CPUFallbackBatch
+        ] = []
+        gpu_records: list[MultiDeviceBatch] = []
+        for batch in batches_iter:
+            if isinstance(batch, MultiDeviceBatch):
+                gpu_records.append(batch)
+            else:
+                cpu_batches.append(batch)
+        if gpu_records:
+            sequences.extend(self._extract_sequences_from_gpu_records(gpu_records))
+        if cpu_batches:
+            sequences.extend(self._extract_sequences_from_cpu_batches(cpu_batches))
+        return sequences
+
+    def _build_gpu_batches_from_sequences(
+        self,
+        sequences: list[list[int]],
+        batch_size: int,
+        device_contexts: Dict[torch.device, DeviceContext],
+        record_new_batch: Callable[[DeviceContext, GPUBatchRecord], None],
+    ) -> tuple[list[MultiDeviceBatch], list[CPUFallbackBatch]]:
+        new_records: list[MultiDeviceBatch] = []
+        cpu_fallbacks: list[CPUFallbackBatch] = []
+        if batch_size <= 0 or not sequences or not device_contexts:
+            return new_records, cpu_fallbacks
+        for cpu_batch in self._iter_cpu_batches_from_sequences(sequences, batch_size, pin=True):
+            (
+                tokens_cpu,
+                valid_cpu,
+                lengths_cpu,
+                spans,
+                pair_keys,
+                pair_counts,
+            ) = self._unpack_cpu_batch(cpu_batch)
+            multi_batch = MultiDeviceBatch.from_cpu_batch(
+                tokens_cpu, valid_cpu, lengths_cpu, device_contexts, record_new_batch
+            )
+            B, L = tokens_cpu.shape
+            width = max(L - 1, 0)
+            if should_route_to_cpu(int(B), int(width)):
+                fallback = self._pack_cpu_batch(
+                    tokens_cpu.clone().to("cpu"),
+                    valid_cpu.clone().to("cpu"),
+                    lengths_cpu.clone().to("cpu"),
+                    spans=list(spans),
+                    pair_keys=None if pair_keys is None else pair_keys.clone(),
+                    pair_counts=None if pair_counts is None else pair_counts.clone(),
+                    as_fallback=True,
+                )
+                if isinstance(fallback, CPUFallbackBatch):
+                    cpu_fallbacks.append(fallback)
+                continue
+            new_records.append(multi_batch)
+        self._mark_active_batches(new_records, device_contexts)
+        return new_records, cpu_fallbacks
+
+    def _mark_active_batches(
+        self,
+        batches_to_mark: Iterable[MultiDeviceBatch],
+        device_contexts: Dict[torch.device, DeviceContext],
+    ) -> None:
+        for ctx in device_contexts.values():
+            ctx.reset_activity()
+        for batch in batches_to_mark:
+            for dev, record in batch.iter_shards():
+                ctx = device_contexts.get(dev)
+                if ctx is not None:
+                    ctx.active_batches.append(record)
+
+    def _serialize_batches(
+        self,
+        current_batches: Optional[
+            Iterable[
+                Union[
+                    MultiDeviceBatch,
+                    CPUFallbackBatch,
+                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]],
+                    Tuple[
+                        torch.Tensor,
+                        torch.Tensor,
+                        torch.Tensor,
+                        list[torch.Tensor],
+                        Optional[tuple[torch.Tensor, torch.Tensor]],
+                    ],
+                ]
+            ]
+        ],
+    ) -> Optional[dict[str, object]]:
+        if current_batches is None:
+            return None
+        has_gpu = False
+        sequences: list[list[int]] = []
+        cpu_batches: list[
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+            | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
+            | Tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                list[torch.Tensor],
+                Optional[tuple[torch.Tensor, torch.Tensor]],
+            ]
+            | CPUFallbackBatch
+        ] = []
+        for batch in current_batches:
+            if isinstance(batch, MultiDeviceBatch):
+                has_gpu = True
+                sequences.extend(self._extract_sequences_from_gpu_records([batch]))
+            else:
+                cpu_batches.append(batch)
+        if cpu_batches:
+            sequences.extend(self._extract_sequences_from_cpu_batches(cpu_batches))
+        return {
+            "sequences": [[int(token) for token in seq] for seq in sequences],
+            "has_gpu": has_gpu,
+            "active_batch_size": self._active_batch_size,
+        }
+
+    def _deserialize_batches(
+        self,
+        serialized: Optional[dict[str, object]],
+        *,
+        device_contexts: Optional[Dict[torch.device, DeviceContext]] = None,
+        use_cuda: bool = False,
+    ) -> tuple[
+        Optional[
+            list[
+                Union[
+                    MultiDeviceBatch,
+                    CPUFallbackBatch,
+                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]],
+                    Tuple[
+                        torch.Tensor,
+                        torch.Tensor,
+                        torch.Tensor,
+                        list[torch.Tensor],
+                        Optional[tuple[torch.Tensor, torch.Tensor]],
+                    ],
+                ]
+            ]
+        ],
+        Optional[list[MultiDeviceBatch]],
+    ]:
+        if not serialized:
+            return None, None
+        sequences_raw = serialized.get("sequences", [])
+        sequences: list[list[int]] = []
+        if isinstance(sequences_raw, list):
+            for seq in sequences_raw:
+                if isinstance(seq, list):
+                    sequences.append([int(tok) for tok in seq])
+        active_batch_size = int(serialized.get("active_batch_size") or 0)
+        if active_batch_size <= 0 and sequences:
+            active_batch_size = len(sequences)
+        if active_batch_size <= 0:
+            active_batch_size = self._active_batch_size or 0
+        has_gpu = bool(serialized.get("has_gpu")) and use_cuda and device_contexts
+        if has_gpu and device_contexts is not None:
+            new_records, cpu_fallbacks = self._build_gpu_batches_from_sequences(
+                sequences,
+                active_batch_size,
+                device_contexts,
+                lambda _ctx, _record: None,
+            )
+            combined: list[
+                Union[
+                    MultiDeviceBatch,
+                    CPUFallbackBatch,
+                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]],
+                    Tuple[
+                        torch.Tensor,
+                        torch.Tensor,
+                        torch.Tensor,
+                        list[torch.Tensor],
+                        Optional[tuple[torch.Tensor, torch.Tensor]],
+                    ],
+                ]
+            ] = []
+            if cpu_fallbacks:
+                combined.extend(cpu_fallbacks)
+            combined.extend(new_records)
+            return combined, new_records
+        cpu_batches = list(
+            self._iter_cpu_batches_from_sequences(
+                sequences,
+                active_batch_size if active_batch_size > 0 else len(sequences) or 0,
+                pin=False,
+            )
+        )
+        return cpu_batches if cpu_batches else None, None
+
+    # ------------------------------------------------------------------
+    # State serialization
+    def state_dict(
+        self,
+        *,
+        current_batches: Optional[
+            Iterable[
+                Union[
+                    MultiDeviceBatch,
+                    CPUFallbackBatch,
+                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]],
+                    Tuple[
+                        torch.Tensor,
+                        torch.Tensor,
+                        torch.Tensor,
+                        list[torch.Tensor],
+                        Optional[tuple[torch.Tensor, torch.Tensor]],
+                    ],
+                ]
+            ]
+        ] = None,
+        include_batches: bool = True,
+        stage_timings: Optional[dict[str, StageTiming]] = None,
+        stage_event_log: Optional[list[dict[str, object]]] = None,
+        host_sync_events: Optional[list[dict[str, object]]] = None,
+        device_snapshot_log: Optional[list[dict[str, object]]] = None,
+    ) -> dict[str, object]:
+        metadata: dict[str, object] = {
+            "base_vocab": int(self.base_vocab),
+            "target_merges": int(self.target_merges),
+            "vocab_size": int(self.vocab_size),
+            "merges": [list(map(int, pair)) for pair in self.merges],
+            "merge_step": int(self._merge_step),
+            "warm_start_plan": (
+                {k: v for k, v in self._warm_start_plan.items()}
+                if self._warm_start_plan is not None
+                else None
+            ),
+            "warm_start_applied": bool(self._warm_start_applied),
+            "freeze_warm_start": bool(self.freeze_warm_start),
+            "seed_warm_start_merges": [
+                list(map(int, pair)) for pair in self._seed_warm_start_merges
+            ],
+            "frozen_pair_keys": [int(key) for key in sorted(self._frozen_pair_keys)],
+            "histogram_cache": {
+                "enable": bool(self._enable_histogram_cache),
+                "valid": bool(self._hist_cache_valid),
+                "force_recount": bool(self._force_recount),
+            },
+            "cached_histogram_sizes": {
+                "keys": int(self._cached_pair_keys.numel()),
+                "counts": int(self._cached_pair_counts.numel()),
+            },
+            "bytes_h2d": int(self.bytes_h2d),
+            "bytes_d2h": int(self.bytes_d2h),
+            "h2d_events": int(self.h2d_events),
+            "d2h_events": int(self.d2h_events),
+            "merge_transfer_log": [dict(entry) for entry in self.merge_transfer_log],
+            "sync_intervals": [dict(entry) for entry in self.sync_intervals],
+            "transfer_stage_totals": {
+                key: {"h2d": int(val.get("h2d", 0)), "d2h": int(val.get("d2h", 0))}
+                for key, val in self._transfer_stage_totals.items()
+            },
+            "cpu_fallback_batches": int(self._cpu_fallback_batches),
+            "last_cpu_fallback_ratio": float(self._last_cpu_fallback_ratio),
+            "active_batch_size": (
+                int(self._active_batch_size)
+                if self._active_batch_size is not None
+                else None
+            ),
+            "autoscaler": self.autoscaler.snapshot_metrics(),
+        }
+        if include_batches and current_batches is not None:
+            serialized_batches = self._serialize_batches(current_batches)
+            metadata["batches"] = serialized_batches
+        telemetry_progress: dict[str, object] = {}
+        if stage_timings is not None:
+            telemetry_progress["stage_timings"] = {
+                name: list(timing.samples) for name, timing in stage_timings.items()
+            }
+        if stage_event_log is not None:
+            telemetry_progress["stage_event_log"] = [dict(evt) for evt in stage_event_log]
+        if host_sync_events is not None:
+            telemetry_progress["host_sync_events"] = [dict(evt) for evt in host_sync_events]
+        if device_snapshot_log is not None:
+            telemetry_progress["device_snapshot_log"] = [dict(evt) for evt in device_snapshot_log]
+        if telemetry_progress:
+            metadata["telemetry_progress"] = telemetry_progress
+        tensors: dict[str, torch.Tensor] = {}
+        tensors["cached_pair_keys"] = self._cached_pair_keys.detach().clone().cpu()
+        tensors["cached_pair_counts"] = self._cached_pair_counts.detach().clone().cpu()
+        return {"metadata": metadata, "tensors": tensors}
+
+    def load_state_dict(
+        self,
+        state_dict: dict[str, object],
+        *,
+        device_contexts: Optional[Dict[torch.device, DeviceContext]] = None,
+        use_cuda: bool = False,
+    ) -> dict[str, object]:
+        if not state_dict:
+            return {
+                "current_batches": None,
+                "gpu_batches": None,
+                "scale_state": self.autoscaler.state,
+                "step": len(self.merges),
+                "stage_timings": None,
+                "stage_event_log": [],
+                "host_sync_events": [],
+                "device_snapshot_log": [],
+            }
+        metadata = dict(state_dict.get("metadata", {}))
+        tensors = state_dict.get("tensors", {})
+        self.base_vocab = int(metadata.get("base_vocab", self.base_vocab))
+        self.target_merges = int(metadata.get("target_merges", self.target_merges))
+        merges_raw = metadata.get("merges", [])
+        self.merges = [tuple(map(int, pair)) for pair in merges_raw]
+        self.vocab_size = int(metadata.get("vocab_size", self.vocab_size))
+        self._merge_step = int(metadata.get("merge_step", len(self.merges)))
+        warm_plan = metadata.get("warm_start_plan")
+        self._warm_start_plan = warm_plan
+        self._warm_start_applied = bool(metadata.get("warm_start_applied", self._warm_start_applied))
+        self.freeze_warm_start = bool(metadata.get("freeze_warm_start", self.freeze_warm_start))
+        self._seed_warm_start_merges = [
+            tuple(map(int, pair))
+            for pair in metadata.get(
+                "seed_warm_start_merges", list(self._seed_warm_start_merges)
+            )
+        ]
+        self._frozen_pair_keys = set(
+            int(key) for key in metadata.get("frozen_pair_keys", list(self._frozen_pair_keys))
+        )
+        hist_meta = metadata.get("histogram_cache", {})
+        self._enable_histogram_cache = bool(
+            hist_meta.get("enable", self._enable_histogram_cache)
+        )
+        self._hist_cache_valid = bool(hist_meta.get("valid", self._hist_cache_valid))
+        self._force_recount = bool(hist_meta.get("force_recount", self._force_recount))
+        cached_keys = tensors.get("cached_pair_keys")
+        cached_counts = tensors.get("cached_pair_counts")
+        if cached_keys is not None and cached_counts is not None:
+            self._cached_pair_keys = cached_keys.detach().clone().to(torch.long)
+            self._cached_pair_counts = cached_counts.detach().clone().to(torch.int32)
+        else:
+            self._cached_pair_keys = torch.empty((0,), dtype=torch.long)
+            self._cached_pair_counts = torch.empty((0,), dtype=torch.int32)
+            self._hist_cache_valid = False
+        if self._hist_cache_valid:
+            self._refresh_top_pairs_from_cache()
+        else:
+            self._reset_top_pairs()
+        self.bytes_h2d = int(metadata.get("bytes_h2d", self.bytes_h2d))
+        self.bytes_d2h = int(metadata.get("bytes_d2h", self.bytes_d2h))
+        self.h2d_events = int(metadata.get("h2d_events", self.h2d_events))
+        self.d2h_events = int(metadata.get("d2h_events", self.d2h_events))
+        self.merge_transfer_log = [dict(entry) for entry in metadata.get("merge_transfer_log", self.merge_transfer_log)]
+        self.sync_intervals = [dict(entry) for entry in metadata.get("sync_intervals", self.sync_intervals)]
+        stage_totals_raw = metadata.get("transfer_stage_totals", {})
+        self._transfer_stage_totals = {
+            key: {"h2d": int(val.get("h2d", 0)), "d2h": int(val.get("d2h", 0))}
+            for key, val in stage_totals_raw.items()
+        }
+        self._cpu_fallback_batches = int(
+            metadata.get("cpu_fallback_batches", self._cpu_fallback_batches)
+        )
+        self._last_cpu_fallback_ratio = float(
+            metadata.get("last_cpu_fallback_ratio", self._last_cpu_fallback_ratio)
+        )
+        active_batch_size = metadata.get("active_batch_size")
+        self._active_batch_size = int(active_batch_size) if active_batch_size is not None else None
+        autoscaler_meta = metadata.get("autoscaler") or {}
+        scale_state = self.autoscaler.state
+        if autoscaler_meta:
+            self.autoscaler.device = autoscaler_meta.get("device", self.autoscaler.device)
+            self.autoscaler.tu = float(autoscaler_meta.get("target_util", self.autoscaler.tu))
+            window_size = int(autoscaler_meta.get("window_size", self.autoscaler._window_size))
+            self.autoscaler._window_size = window_size
+            step_times = autoscaler_meta.get("step_times", [])
+            vram_util = autoscaler_meta.get("vram_utilization", [])
+            self.autoscaler._step_times = deque(step_times, maxlen=window_size)
+            self.autoscaler._vram_fracs = deque(vram_util, maxlen=window_size)
+            state_payload = autoscaler_meta.get("state")
+            if state_payload is not None:
+                scale_state = ScaleState(
+                    batch_size=int(state_payload.get("batch_size", 0)),
+                    cpu_workers=int(state_payload.get("cpu_workers", 0)),
+                    h2d_mb=int(state_payload.get("h2d_mb", 0)),
+                    cpu_fallback_rate=float(state_payload.get("cpu_fallback_rate", 0.0)),
+                )
+                self.autoscaler.state = scale_state
+            else:
+                self.autoscaler.state = None
+        batches_payload = metadata.get("batches")
+        current_batches, gpu_batches = self._deserialize_batches(
+            batches_payload,
+            device_contexts=device_contexts,
+            use_cuda=use_cuda,
+        )
+        telemetry_progress = metadata.get("telemetry_progress") or {}
+        stage_timings_data = telemetry_progress.get("stage_timings")
+        stage_event_log = telemetry_progress.get("stage_event_log", [])
+        host_sync_events = telemetry_progress.get("host_sync_events", [])
+        device_snapshot_log = telemetry_progress.get("device_snapshot_log", [])
+        return {
+            "current_batches": current_batches,
+            "gpu_batches": gpu_batches,
+            "scale_state": scale_state,
+            "step": self._merge_step,
+            "stage_timings": stage_timings_data,
+            "stage_event_log": stage_event_log,
+            "host_sync_events": host_sync_events,
+            "device_snapshot_log": device_snapshot_log,
+        }
+
+    def save_checkpoint(
+        self,
+        path: str,
+        include_batches: bool = True,
+        *,
+        current_batches: Optional[
+            Iterable[
+                Union[
+                    MultiDeviceBatch,
+                    CPUFallbackBatch,
+                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]],
+                    Tuple[
+                        torch.Tensor,
+                        torch.Tensor,
+                        torch.Tensor,
+                        list[torch.Tensor],
+                        Optional[tuple[torch.Tensor, torch.Tensor]],
+                    ],
+                ]
+            ]
+        ] = None,
+        stage_timings: Optional[dict[str, StageTiming]] = None,
+        stage_event_log: Optional[list[dict[str, object]]] = None,
+        host_sync_events: Optional[list[dict[str, object]]] = None,
+        device_snapshot_log: Optional[list[dict[str, object]]] = None,
+    ) -> dict[str, object]:
+        state = self.state_dict(
+            current_batches=current_batches,
+            include_batches=include_batches,
+            stage_timings=stage_timings,
+            stage_event_log=stage_event_log,
+            host_sync_events=host_sync_events,
+            device_snapshot_log=device_snapshot_log,
+        )
+        os.makedirs(path, exist_ok=True)
+        meta_path = os.path.join(path, "state.json")
+        tensor_path = os.path.join(path, "tensors.pt")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(state["metadata"], f, indent=2, sort_keys=True)
+        tensor_payload = {
+            name: tensor.detach().clone().cpu() for name, tensor in state["tensors"].items()
+        }
+        torch.save(tensor_payload, tensor_path)
+        return state
+
+    def load_checkpoint(self, path: str) -> dict[str, object]:
+        meta_path = os.path.join(path, "state.json")
+        tensor_path = os.path.join(path, "tensors.pt")
+        with open(meta_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+        tensors: dict[str, torch.Tensor] = {}
+        if os.path.exists(tensor_path):
+            loaded = torch.load(tensor_path, map_location="cpu")
+            if isinstance(loaded, dict):
+                tensors = loaded
+        return {"metadata": metadata, "tensors": tensors}
 
     def _record_merge_snapshot(self, merge_idx: int) -> None:
         self.merge_transfer_log.append(
@@ -972,8 +1622,18 @@ class GPUBPETrainer:
         warm_start_plan: Optional[dict[str, object]] = None,
         warm_start_ngrams: Optional[int] = None,
         warm_start_device: Optional[torch.device] = None,
+        checkpoint_interval: Optional[int] = None,
+        checkpoint_dir: Optional[str] = None,
+        resume_state: Optional[dict[str, object]] = None,
     ) -> dict[str, object]:
         """Train merges using a pipelined GPU workflow when possible."""
+
+        if checkpoint_interval is not None:
+            checkpoint_interval = int(checkpoint_interval)
+            if checkpoint_interval <= 0:
+                checkpoint_interval = None
+        if checkpoint_interval is not None and checkpoint_dir is None:
+            raise ValueError("checkpoint_dir must be provided when using checkpoint_interval")
 
         self._reset_transfer_counters()
         self._reset_histogram_cache()
@@ -998,6 +1658,9 @@ class GPUBPETrainer:
         ] = batches
         gpu_batches: Optional[list[MultiDeviceBatch]] = None
         scale_state = None
+
+        self._merge_step = len(self.merges)
+        checkpoint_dir_path = os.fspath(checkpoint_dir) if checkpoint_dir is not None else None
 
         cpu_device = torch.device("cpu")
 
@@ -1029,26 +1692,7 @@ class GPUBPETrainer:
             Optional[torch.Tensor],
             Optional[torch.Tensor],
         ]:
-            if isinstance(batch, CPUFallbackBatch):
-                return (
-                    batch.tokens,
-                    batch.valid,
-                    batch.lengths,
-                    list(batch.spans),
-                    batch.pair_keys,
-                    batch.pair_counts,
-                )
-            tokens_cpu = batch[0]
-            valid_cpu = batch[1]
-            lengths_cpu = batch[2]
-            spans = batch[3] if len(batch) > 3 else []
-            if not isinstance(spans, list):
-                spans = list(spans)
-            pair_keys: Optional[torch.Tensor] = None
-            pair_counts: Optional[torch.Tensor] = None
-            if len(batch) > 4 and batch[4] is not None:
-                pair_keys, pair_counts = batch[4]
-            return tokens_cpu, valid_cpu, lengths_cpu, spans, pair_keys, pair_counts
+            return self._unpack_cpu_batch(batch)
 
         def _pack_cpu_batch(
             tokens_cpu: torch.Tensor,
@@ -1070,25 +1714,15 @@ class GPUBPETrainer:
             ]
             | CPUFallbackBatch
         ):
-            pair_tuple: Optional[tuple[torch.Tensor, torch.Tensor]] = None
-            if pair_keys is not None and pair_counts is not None:
-                pair_tuple = (pair_keys, pair_counts)
-            if as_fallback:
-                return CPUFallbackBatch(
-                    tokens=tokens_cpu,
-                    valid=valid_cpu,
-                    lengths=lengths_cpu,
-                    spans=[] if spans is None else list(spans),
-                    pair_keys=None if pair_keys is None else pair_keys,
-                    pair_counts=None if pair_counts is None else pair_counts,
-                    workspaces=workspaces or FastPathWorkspaces(),
-                )
-            return (
+            return self._pack_cpu_batch(
                 tokens_cpu,
                 valid_cpu,
                 lengths_cpu,
-                [] if spans is None else spans,
-                pair_tuple,
+                spans,
+                pair_keys,
+                pair_counts,
+                as_fallback=as_fallback,
+                workspaces=workspaces,
             )
 
         def _extract_sequences_from_cpu(
@@ -1097,26 +1731,12 @@ class GPUBPETrainer:
                 | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
             ]
         ) -> list[list[int]]:
-            sequences: list[list[int]] = []
-            for batch in cpu_batches:
-                tokens_cpu, _valid_cpu, lengths_cpu, _, _, _ = _unpack_cpu_batch(batch)
-                rows = int(tokens_cpu.shape[0])
-                for row in range(rows):
-                    length = int(lengths_cpu[row].item())
-                    if length <= 0:
-                        sequences.append([])
-                        continue
-                    seq = tokens_cpu[row, :length].to(torch.long).tolist()
-                    sequences.append(seq)
-            return sequences
+            return self._extract_sequences_from_cpu_batches(cpu_batches)
 
         def _extract_sequences_from_gpu(
             records: Iterable[MultiDeviceBatch],
         ) -> list[list[int]]:
-            sequences: list[list[int]] = []
-            for record in records:
-                sequences.extend(record.sequences())
-            return sequences
+            return self._extract_sequences_from_gpu_records(records)
 
         def _iter_cpu_batches_from_sequences(
             sequences: list[list[int]],
@@ -1131,30 +1751,7 @@ class GPUBPETrainer:
                 Optional[tuple[torch.Tensor, torch.Tensor]],
             ]
         ]:
-            if batch_size <= 0:
-                return
-            for start in range(0, len(sequences), batch_size):
-                chunk = sequences[start : start + batch_size]
-                if not chunk:
-                    continue
-                rows = len(chunk)
-                max_len = max((len(seq) for seq in chunk), default=0)
-                width = max(1, max_len)
-                tokens = torch.full((rows, width), -1, dtype=torch.int32)
-                valid = torch.zeros((rows, width), dtype=torch.uint8)
-                length_dtype = length_storage_dtype(width)
-                lengths = torch.zeros((rows,), dtype=length_dtype)
-                for row, seq in enumerate(chunk):
-                    if not seq:
-                        continue
-                    L = len(seq)
-                    tokens[row, :L] = torch.tensor(seq, dtype=torch.int32)
-                    valid[row, :L] = 1
-                    lengths[row] = L
-                if pin:
-                    tokens = tokens.pin_memory()
-                    valid = valid.pin_memory()
-                yield tokens, valid, lengths, [], None
+            yield from self._iter_cpu_batches_from_sequences(sequences, batch_size, pin)
 
         def _collect_sequences_from_mixed(
             batches_iter: Iterable[
@@ -1165,22 +1762,7 @@ class GPUBPETrainer:
                 ]
             ]
         ) -> list[list[int]]:
-            sequences: list[list[int]] = []
-            cpu_batches: list[
-                Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-                | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
-            ] = []
-            gpu_records: list[MultiDeviceBatch] = []
-            for batch in batches_iter:
-                if isinstance(batch, MultiDeviceBatch):
-                    gpu_records.append(batch)
-                else:
-                    cpu_batches.append(batch)
-            if gpu_records:
-                sequences.extend(_extract_sequences_from_gpu(gpu_records))
-            if cpu_batches:
-                sequences.extend(_extract_sequences_from_cpu(cpu_batches))
-            return sequences
+            return self._collect_sequences_from_batches(batches_iter)
 
         gpu_devices = [dev for dev in self.devices if dev.type == "cuda"]
         if gpu_devices and not torch.cuda.is_available():
@@ -1207,6 +1789,51 @@ class GPUBPETrainer:
 
         device = torch.device(self.device)
 
+        resume_payload: Optional[dict[str, object]] = None
+        resumed = False
+        if resume_state is not None:
+            resume_payload = self.load_state_dict(
+                resume_state,
+                device_contexts=device_contexts if use_cuda else None,
+                use_cuda=use_cuda,
+            )
+            restored_batches = resume_payload.get("current_batches")
+            if restored_batches is not None:
+                current_batches = restored_batches
+                resumed = True
+            restored_gpu = resume_payload.get("gpu_batches")
+            if use_cuda and restored_gpu is not None:
+                gpu_batches = restored_gpu
+                resumed = True
+            stage_timings_data = resume_payload.get("stage_timings")
+            if isinstance(stage_timings_data, dict):
+                for name, samples in stage_timings_data.items():
+                    if name in stage_timings and isinstance(samples, list):
+                        stage_timings[name].samples = [float(val) for val in samples]
+            stage_event_log.extend(
+                [dict(evt) for evt in resume_payload.get("stage_event_log", [])]
+            )
+            host_sync_events.extend(
+                [dict(evt) for evt in resume_payload.get("host_sync_events", [])]
+            )
+            device_snapshot_log.extend(
+                [dict(evt) for evt in resume_payload.get("device_snapshot_log", [])]
+            )
+            loaded_scale_state = resume_payload.get("scale_state")
+            if loaded_scale_state is not None:
+                scale_state = loaded_scale_state
+                if self.autoscaler.state is None:
+                    self.autoscaler.state = loaded_scale_state
+            step = int(resume_payload.get("step", len(self.merges)))
+            self._merge_step = step
+            if checkpoint_interval is not None and checkpoint_dir_path is not None:
+                os.makedirs(checkpoint_dir_path, exist_ok=True)
+        else:
+            resumed = False
+
+        if scale_state is None and self.autoscaler.state is not None:
+            scale_state = self.autoscaler.state
+
         def _capture_device_snapshots(stage_label: str) -> None:
             if not use_cuda:
                 return
@@ -1231,45 +1858,19 @@ class GPUBPETrainer:
                     ctx.active_batches.append(record)
 
         def _mark_active_batches(batches_to_mark: Iterable[MultiDeviceBatch]) -> None:
-            for ctx in device_contexts.values():
-                ctx.reset_activity()
-            for batch in batches_to_mark:
-                _register_batch(batch)
+            self._mark_active_batches(batches_to_mark, device_contexts)
 
         def _build_gpu_batches_from_sequences(
             sequences: list[list[int]], batch_size: int
         ) -> tuple[list[MultiDeviceBatch], list[CPUFallbackBatch]]:
-            new_records: list[MultiDeviceBatch] = []
-            cpu_fallbacks: list[CPUFallbackBatch] = []
-            if batch_size <= 0 or not sequences or not use_cuda:
-                return new_records, cpu_fallbacks
-            for cpu_batch in _iter_cpu_batches_from_sequences(
-                sequences, batch_size, pin=True
-            ):
-                tokens_cpu, valid_cpu, lengths_cpu, spans, pair_keys, pair_counts = _unpack_cpu_batch(
-                    cpu_batch
-                )
-                multi_batch = MultiDeviceBatch.from_cpu_batch(
-                    tokens_cpu, valid_cpu, lengths_cpu, device_contexts, _record_new_batch
-                )
-                B, L = tokens_cpu.shape
-                width = max(L - 1, 0)
-                if should_route_to_cpu(int(B), int(width)):
-                    fallback = _pack_cpu_batch(
-                        tokens_cpu.clone().to("cpu"),
-                        valid_cpu.clone().to("cpu"),
-                        lengths_cpu.clone().to("cpu"),
-                        spans=list(spans),
-                        pair_keys=None if pair_keys is None else pair_keys.clone(),
-                        pair_counts=None if pair_counts is None else pair_counts.clone(),
-                        as_fallback=True,
-                    )
-                    if isinstance(fallback, CPUFallbackBatch):
-                        cpu_fallbacks.append(fallback)
-                    continue
-                new_records.append(multi_batch)
-            _mark_active_batches(new_records)
-            return new_records, cpu_fallbacks
+            if not use_cuda:
+                return [], []
+            return self._build_gpu_batches_from_sequences(
+                sequences,
+                batch_size,
+                device_contexts,
+                _record_new_batch,
+            )
 
         def _reconfigure_batches(batch_size: int) -> None:
             nonlocal current_batches, gpu_batches
@@ -2119,7 +2720,11 @@ class GPUBPETrainer:
         warm_counts = warm_plan.get("counts") if warm_plan else None
         warm_source = warm_plan.get("source") if warm_plan else None
 
-        if (warm_plan is None or not warm_plan.get("merges")) and warm_start_ngrams:
+        if (
+            (warm_plan is None or not warm_plan.get("merges"))
+            and warm_start_ngrams
+            and not resumed
+        ):
             computed_plan = self.precompute_warm_start_plan(
                 batches,
                 warm_start_ngrams,
@@ -2417,6 +3022,7 @@ class GPUBPETrainer:
                     }
                 )
             step += 1
+            self._merge_step = step
             if not use_cuda:
                 self._interval_merges = 0
             self._record_merge_snapshot(step)
@@ -2425,6 +3031,20 @@ class GPUBPETrainer:
                 oom=oom_seen,
                 cpu_fallback_rate=self._last_cpu_fallback_ratio,
             )
+            if (
+                checkpoint_interval is not None
+                and checkpoint_dir_path is not None
+                and step % checkpoint_interval == 0
+            ):
+                self.save_checkpoint(
+                    checkpoint_dir_path,
+                    include_batches=True,
+                    current_batches=current_batches,
+                    stage_timings=stage_timings,
+                    stage_event_log=stage_event_log,
+                    host_sync_events=host_sync_events,
+                    device_snapshot_log=device_snapshot_log,
+                )
         if use_cuda and gpu_batches is not None:
             final_bytes, final_duration = _finalize_host_sync(gpu_batches)
             if final_duration > 0:
