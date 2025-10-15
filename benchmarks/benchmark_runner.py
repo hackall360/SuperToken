@@ -46,6 +46,49 @@ def synthesize_corpus(
     vocab_size: int,
     seed: int,
 ) -> list[list[int]]:
+    """Create a synthetic integer-token corpus for benchmarking.
+
+    The helper draws uniformly random token IDs in the ``[0, vocab_size)`` range
+    for ``documents`` pseudo-documents. Each document length is sampled from the
+    inclusive range between ``min_length`` and ``max_length``. The sampling is
+    deterministic for a given ``seed`` so that synthetic corpora can be shared
+    across benchmark runs.
+
+    Parameters
+    ----------
+    documents:
+        Number of documents (sequences) to generate. ``0`` or negative values
+        short-circuit to an empty corpus.
+    min_length:
+        Inclusive lower bound on the number of tokens per document. Values less
+        than ``1`` are treated as ``1`` to ensure non-empty sequences when
+        documents are requested.
+    max_length:
+        Inclusive upper bound on the number of tokens per document. When
+        ``max_length`` is smaller than ``min_length`` the effective bounds are
+        adjusted so both become ``min_length``.
+    vocab_size:
+        Size of the synthetic vocabulary. Tokens are sampled from
+        ``range(vocab_size)``.
+    seed:
+        Seed forwarded to :class:`random.Random` for deterministic sampling.
+
+    Returns
+    -------
+    list[list[int]]
+        A list containing one integer sequence per generated document. The list
+        is empty if ``documents`` is ``0`` or negative.
+
+    Side Effects
+    ------------
+    None.
+
+    Raises
+    ------
+    ValueError
+        Never raised directly; caller should ensure ``vocab_size`` is positive
+        to avoid an implicit ``ValueError`` from ``randrange``.
+    """
     if documents <= 0:
         return []
     rng = random.Random(seed)
@@ -74,6 +117,45 @@ def load_real_corpus(
     eos: int | None,
     limit: int | None,
 ) -> list[list[int]]:
+    """Load token sequences from byte-packed shards on disk.
+
+    Each path is memory mapped via :class:`gpu_tokenizer.io.MemoryMappedShard`
+    and decoded with :class:`gpu_tokenizer.BytePacker`. Optional beginning of
+    sequence (``bos``) and end of sequence (``eos``) IDs can be provided to
+    prepend/append to every decoded sequence. When ``limit`` is provided the
+    loader stops as soon as ``limit`` sequences have been read.
+
+    Parameters
+    ----------
+    paths:
+        Sequence of shard paths. An empty sequence returns an empty corpus
+        without touching the filesystem.
+    bos, eos:
+        Optional integer IDs inserted at the beginning/end of each sequence.
+        Use ``None`` to disable the corresponding token. Defaults are implicit
+        ``None`` because the function only accepts keyword arguments.
+    limit:
+        Optional maximum number of sequences to load. ``None`` means no limit.
+
+    Returns
+    -------
+    list[list[int]]
+        Token sequences decoded from the provided shards. The order matches the
+        order of ``paths``.
+
+    Side Effects
+    ------------
+    Opens each provided shard path and keeps it memory mapped for the duration
+    of the load. The function closes all file handles before returning thanks to
+    :class:`contextlib.ExitStack`.
+
+    Raises
+    ------
+    FileNotFoundError
+        If any shard path is missing.
+    OSError
+        If the underlying memory-mapped file cannot be opened.
+    """
     if not paths:
         return []
     packer = BytePacker(bos=bos, eos=eos)
@@ -93,6 +175,31 @@ def summarize_corpus(
     *,
     sources: list[dict[str, object]] | None = None,
 ) -> CorpusSummary:
+    """Compute high-level statistics for a tokenized corpus.
+
+    Parameters
+    ----------
+    sequences:
+        Iterable of token sequences to summarize.
+    sources:
+        Optional metadata describing how the corpus was created. When ``None``
+        an empty list is stored in the summary. The default is ``None`` to avoid
+        sharing mutable state between calls.
+
+    Returns
+    -------
+    CorpusSummary
+        Dataclass containing the number of sequences, total token count, the
+        maximum sequence length, and the preserved ``sources`` metadata.
+
+    Side Effects
+    ------------
+    None.
+
+    Raises
+    ------
+    None.
+    """
     total_tokens = sum(len(seq) for seq in sequences)
     max_len = max((len(seq) for seq in sequences), default=0)
     return CorpusSummary(
@@ -109,6 +216,33 @@ def _build_bpe_batches(
     batch_size: int,
     seed: int,
 ) -> PackedBatcher:
+    """Create a :class:`PackedBatcher` suited for BPE training.
+
+    The packed batcher preserves padding metadata and yields packed tensors and
+    sequence descriptors when iterated.
+
+    Parameters
+    ----------
+    sequences:
+        Token sequences to batch.
+    batch_size:
+        Number of sequences per packed batch.
+    seed:
+        Seed used to shuffle sequences before packing for reproducibility.
+
+    Returns
+    -------
+    PackedBatcher
+        The ready-to-iterate batcher.
+
+    Side Effects
+    ------------
+    None, aside from any lazy work performed when the batcher is iterated.
+
+    Raises
+    ------
+    None directly; construction errors from :class:`PackedBatcher` propagate.
+    """
     return PackedBatcher(sequences, batch_size=batch_size, seed=seed)
 
 
@@ -118,6 +252,34 @@ def _build_unigram_batches(
     batch_size: int,
     seed: int,
 ) -> list[torch.Tensor]:
+    """Pack sequences and materialize tensors for unigram training.
+
+    Parameters
+    ----------
+    sequences:
+        Token sequences to batch.
+    batch_size:
+        Number of sequences per packed batch.
+    seed:
+        Seed used to shuffle sequences before packing.
+
+    Returns
+    -------
+    list[torch.Tensor]
+        List of cloned token tensors, one per packed batch. Cloning detaches the
+        tensors from the underlying memory map so that the unigram trainer can
+        freely modify them.
+
+    Side Effects
+    ------------
+    Creates cloned tensors, increasing memory usage relative to the lazy BPE
+    iteration.
+
+    Raises
+    ------
+    None directly; errors from :class:`PackedBatcher` or tensor cloning
+    propagate.
+    """
     packed = PackedBatcher(sequences, batch_size=batch_size, seed=seed)
     return [tokens.clone() for tokens, _valid, _lengths in packed]
 
@@ -132,6 +294,63 @@ def run_bpe_benchmark(
     seed: int,
     log_every: int,
 ) -> dict[str, object]:
+    """Benchmark :class:`GPUBPETrainer` on the provided sequences.
+
+    The function configures an :class:`AutoScaler` to keep the batch size fixed
+    for reproducible benchmarking, constructs packed batches, trains the BPE
+    model and returns profiling metadata.
+
+    Parameters
+    ----------
+    sequences:
+        Token sequences to train on.
+    base_vocab:
+        Initial vocabulary size passed to the trainer.
+    merges:
+        Number of merge operations to perform.
+    batch_size:
+        Number of sequences per packed batch.
+    device:
+        Optional CUDA device (e.g. ``"cuda:0"``). ``None`` lets the trainer
+        decide.
+    seed:
+        Shuffle seed provided to :func:`_build_bpe_batches`.
+    log_every:
+        Step interval for logging internal trainer metrics.
+
+    Returns
+    -------
+    dict[str, object]
+        Dictionary capturing the configuration, wall-clock time in seconds, and
+        the metadata returned by :meth:`GPUBPETrainer.fit`.
+
+    Side Effects
+    ------------
+    Performs GPU work and logs through the trainer as configured.
+
+    Raises
+    ------
+    RuntimeError
+        If GPU-enabled trainers are unavailable (see
+        :func:`_ensure_trainers_available`).
+
+    Examples
+    --------
+    Train with already packed sequences:
+
+    >>> sequences = [[1, 2, 3], [4, 5]]
+    >>> result = run_bpe_benchmark(
+    ...     sequences,
+    ...     base_vocab=256,
+    ...     merges=1000,
+    ...     batch_size=2,
+    ...     device="cuda:0",
+    ...     seed=42,
+    ...     log_every=50,
+    ... )
+    >>> result["config"]["merges"]
+    1000
+    """
     _ensure_trainers_available()
     autoscaler = AutoScaler(min_bs=batch_size, max_bs=batch_size, device=device)
     batches = _build_bpe_batches(sequences, batch_size=batch_size, seed=seed)
@@ -168,6 +387,57 @@ def run_unigram_benchmark(
     device: str | None,
     seed: int,
 ) -> dict[str, object]:
+    """Benchmark :class:`GPUUnigramTrainer` across multiple epochs.
+
+    Parameters
+    ----------
+    sequences:
+        Token sequences to train on.
+    base_vocab:
+        Initial vocabulary size supplied to the trainer.
+    vocab_size:
+        Target vocabulary size.
+    max_subword_len:
+        Maximum length of candidate subwords.
+    batch_size:
+        Number of sequences per packed batch.
+    epochs:
+        Number of training epochs to run.
+    device:
+        Optional CUDA device string. ``None`` lets the trainer decide.
+    seed:
+        Shuffle seed used for batching.
+
+    Returns
+    -------
+    dict[str, object]
+        Dictionary containing the configuration, wall-clock time in seconds, and
+        per-epoch metrics returned from :meth:`GPUUnigramTrainer.fit_epoch`.
+
+    Side Effects
+    ------------
+    Performs GPU work and mutates the internal state of the unigram trainer. The
+    cloned batch tensors are also retained until Python reclaims them.
+
+    Raises
+    ------
+    RuntimeError
+        If GPU-enabled trainers are unavailable.
+
+    Examples
+    --------
+    >>> run_unigram_benchmark(
+    ...     sequences=[[1, 2, 3], [4, 5]],
+    ...     base_vocab=256,
+    ...     vocab_size=512,
+    ...     max_subword_len=16,
+    ...     batch_size=2,
+    ...     epochs=3,
+    ...     device=None,
+    ...     seed=123,
+    ... )
+    {"config": {...}, "wall_time_s": ..., "epochs": [...]}
+    """
     _ensure_trainers_available()
     trainer = GPUUnigramTrainer(
         base_vocab=base_vocab,
@@ -199,6 +469,29 @@ def run_unigram_benchmark(
 
 
 def format_summary_table(rows: Sequence[Sequence[str]], headers: Sequence[str]) -> str:
+    """Create a simple ASCII table summarizing benchmark results.
+
+    Parameters
+    ----------
+    rows:
+        Sequence of string rows representing table body values.
+    headers:
+        Sequence of column headers.
+
+    Returns
+    -------
+    str
+        ASCII table with column-aligned values.
+
+    Side Effects
+    ------------
+    None.
+
+    Raises
+    ------
+    ValueError
+        Propagated if ``rows`` contain columns mismatching ``headers`` length.
+    """
     columns = list(zip(*([headers] + list(rows))))
     widths = [max(len(cell) for cell in column) for column in columns]
     def _fmt(row: Sequence[str]) -> str:
@@ -215,6 +508,33 @@ def emit_benchmark_summary(
     bpe_result: dict[str, object],
     unigram_result: dict[str, object],
 ) -> str:
+    """Format a human-readable summary of benchmark runs.
+
+    Parameters
+    ----------
+    corpus:
+        Summary statistics for the dataset used in training.
+    bpe_result:
+        Benchmark results dictionary produced by :func:`run_bpe_benchmark`.
+    unigram_result:
+        Benchmark results dictionary produced by :func:`run_unigram_benchmark`.
+
+    Returns
+    -------
+    str
+        Multi-line textual summary including a table of wall-clock times and
+        tokens-per-second metrics.
+
+    Side Effects
+    ------------
+    None.
+
+    Raises
+    ------
+    KeyError
+        If the expected keys are missing from ``bpe_result`` or
+        ``unigram_result``.
+    """
     rows = [
         [
             "GPUBPETrainer",
@@ -245,6 +565,39 @@ def serialize_run(
     bpe: dict[str, object],
     unigram: dict[str, object],
 ) -> Path:
+    """Persist benchmark inputs and outputs to JSON for later analysis.
+
+    Parameters
+    ----------
+    output_dir:
+        Directory that will contain the serialized run. Created if missing.
+    corpus:
+        Summary data describing the training corpus.
+    config:
+        Top-level configuration (e.g., command-line arguments).
+    bpe:
+        Result dictionary from :func:`run_bpe_benchmark`.
+    unigram:
+        Result dictionary from :func:`run_unigram_benchmark`.
+
+    Returns
+    -------
+    Path
+        File path of the written JSON file. The name encodes the UTC timestamp
+        of serialization.
+
+    Side Effects
+    ------------
+    Creates ``output_dir`` as needed and writes a JSON document to disk.
+
+    Raises
+    ------
+    OSError
+        If the directory cannot be created or the file cannot be written.
+    TypeError
+        If the payload contains unsupported objects for JSON serialization and
+        ``_json_default`` cannot handle them.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     payload = {
