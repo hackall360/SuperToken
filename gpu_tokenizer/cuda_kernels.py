@@ -7,6 +7,17 @@ from functools import lru_cache
 import torch
 from torch.utils.cpp_extension import load_inline
 
+try:  # pragma: no cover - Triton is optional
+    from .triton_kernels import (
+        apply_merge_and_compact as triton_apply_merge_and_compact,
+        can_use_triton_apply_merge,
+    )
+except Exception:  # pragma: no cover - fallback to CUDA implementation only
+    triton_apply_merge_and_compact = None
+
+    def can_use_triton_apply_merge(*_args, **_kwargs) -> bool:
+        return False
+
 
 @lru_cache(maxsize=1)
 def _load_module() -> torch._C.ScriptModule:
@@ -572,6 +583,23 @@ def apply_merge_and_compact(
     b_id: int,
     new_id: int,
 ) -> None:
+    if triton_apply_merge_and_compact is not None and can_use_triton_apply_merge(
+        tokens,
+        valid,
+        prefix_workspace,
+        pair_workspace,
+    ):
+        triton_apply_merge_and_compact(
+            tokens,
+            valid,
+            prefix_workspace,
+            pair_workspace,
+            a_id,
+            b_id,
+            new_id,
+        )
+        return
+
     if not tokens.is_cuda or not valid.is_cuda:
         raise RuntimeError("apply_merge_and_compact expects CUDA tensors")
     if prefix_workspace is None or not prefix_workspace.is_cuda:

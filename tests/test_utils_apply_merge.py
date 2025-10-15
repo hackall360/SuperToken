@@ -5,7 +5,10 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+import gpu_tokenizer.cuda_kernels as cuda_kernels
+
 from gpu_tokenizer.dtypes import length_storage_dtype
+from gpu_tokenizer import triton_kernels
 from gpu_tokenizer.utils import apply_merge_once
 
 
@@ -192,3 +195,117 @@ def test_apply_merge_matches_between_uint16_and_int32():
     assert torch.equal(tokens_u16, tokens_i32)
     assert torch.equal(valid_u16, valid_i32)
     assert torch.equal(lengths_u16.to(torch.int32), lengths_i32)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA for GPU parity check")
+@pytest.mark.skipif(
+    not triton_kernels.is_triton_available(),
+    reason="requires Triton for GPU parity check",
+)
+def test_apply_merge_gpu_uses_triton_kernel(monkeypatch):
+    merges = [(1, 2, 256), (256, 3, 300), (300, 1, 301)]
+    seqs = [[1, 2, 3, 1, 2, 3], [1, 1, 2, 3, 1, 2]]
+
+    tokens_cpu, valid_cpu, lengths_cpu = _prepare_batch(seqs)
+    pair_cpu = torch.zeros((tokens_cpu.size(0), max(tokens_cpu.size(1) - 1, 0)), dtype=torch.bool)
+    prefix_cpu = torch.zeros((tokens_cpu.size(0),), dtype=lengths_cpu.dtype)
+
+    for a_id, b_id, new_id in merges:
+        apply_merge_once(
+            tokens_cpu,
+            valid_cpu,
+            lengths_cpu,
+            a_id,
+            b_id,
+            new_id,
+            pair_cpu,
+            prefix_cpu,
+        )
+
+    tokens_gpu = tokens_cpu.clone().to("cuda")
+    valid_gpu = valid_cpu.clone().to("cuda")
+    lengths_gpu = lengths_cpu.clone().to("cuda")
+    width = max(tokens_gpu.size(1) - 1, 0)
+    pair_gpu = torch.zeros((tokens_gpu.size(0), width), dtype=torch.bool, device="cuda")
+    prefix_gpu = torch.zeros((tokens_gpu.size(0),), dtype=lengths_gpu.dtype, device="cuda")
+
+    call_count = {"value": 0}
+    original_kernel = triton_kernels.apply_merge_and_compact
+
+    def _wrapped(*args, **kwargs):
+        call_count["value"] += 1
+        return original_kernel(*args, **kwargs)
+
+    monkeypatch.setattr(triton_kernels, "apply_merge_and_compact", _wrapped)
+    monkeypatch.setattr(cuda_kernels, "triton_apply_merge_and_compact", _wrapped)
+
+    for a_id, b_id, new_id in merges:
+        apply_merge_once(
+            tokens_gpu,
+            valid_gpu,
+            lengths_gpu,
+            a_id,
+            b_id,
+            new_id,
+            pair_gpu,
+            prefix_gpu,
+        )
+
+    assert call_count["value"] == len(merges)
+    assert torch.equal(tokens_cpu, tokens_gpu.cpu())
+    assert torch.equal(valid_cpu, valid_gpu.cpu())
+    assert torch.equal(lengths_cpu, lengths_gpu.cpu())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA for GPU parity check")
+def test_apply_merge_gpu_falls_back_without_triton(monkeypatch):
+    merges = [(1, 2, 256), (256, 3, 300)]
+    seqs = [[1, 2, 3, 4, 5], [5, 4, 3, 2, 1]]
+
+    tokens_cpu, valid_cpu, lengths_cpu = _prepare_batch(seqs)
+    pair_cpu = torch.zeros((tokens_cpu.size(0), max(tokens_cpu.size(1) - 1, 0)), dtype=torch.bool)
+    prefix_cpu = torch.zeros((tokens_cpu.size(0),), dtype=lengths_cpu.dtype)
+
+    for a_id, b_id, new_id in merges:
+        apply_merge_once(
+            tokens_cpu,
+            valid_cpu,
+            lengths_cpu,
+            a_id,
+            b_id,
+            new_id,
+            pair_cpu,
+            prefix_cpu,
+        )
+
+    tokens_gpu = tokens_cpu.clone().to("cuda")
+    valid_gpu = valid_cpu.clone().to("cuda")
+    lengths_gpu = lengths_cpu.clone().to("cuda")
+    width = max(tokens_gpu.size(1) - 1, 0)
+    pair_gpu = torch.zeros((tokens_gpu.size(0), width), dtype=torch.bool, device="cuda")
+    prefix_gpu = torch.zeros((tokens_gpu.size(0),), dtype=lengths_gpu.dtype, device="cuda")
+
+    monkeypatch.setattr(triton_kernels, "can_use_triton_apply_merge", lambda *args, **kwargs: False)
+    monkeypatch.setattr(cuda_kernels, "can_use_triton_apply_merge", lambda *args, **kwargs: False)
+
+    def _unexpected(*_args, **_kwargs):  # pragma: no cover - should not be invoked
+        pytest.fail("Triton kernel should not run when disabled")
+
+    monkeypatch.setattr(triton_kernels, "apply_merge_and_compact", _unexpected)
+    monkeypatch.setattr(cuda_kernels, "triton_apply_merge_and_compact", _unexpected)
+
+    for a_id, b_id, new_id in merges:
+        apply_merge_once(
+            tokens_gpu,
+            valid_gpu,
+            lengths_gpu,
+            a_id,
+            b_id,
+            new_id,
+            pair_gpu,
+            prefix_gpu,
+        )
+
+    assert torch.equal(tokens_cpu, tokens_gpu.cpu())
+    assert torch.equal(valid_cpu, valid_gpu.cpu())
+    assert torch.equal(lengths_cpu, lengths_gpu.cpu())
