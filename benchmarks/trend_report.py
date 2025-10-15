@@ -57,8 +57,11 @@ def _load_point(path: Path) -> TrendPoint:
     Notes
     -----
     The payload is expected to contain ``timestamp``, ``corpus.tokens``,
-    ``bpe.wall_time_s``, and ``unigram.wall_time_s`` fields. When the timestamp
-    is missing or uses an unknown format we fall back to the file's mtime.
+    ``bpe.wall_time_s``, and ``unigram.wall_time_s`` fields stored as JSON
+    numbers/strings consistent with :func:`benchmarks.benchmark_runner.serialize_run`.
+    The function reads the file from disk but has no other side effects. When
+    the timestamp is missing or uses an unknown format we fall back to the file's
+    mtime.
     """
     payload = json.loads(path.read_text(encoding="utf-8"))
     timestamp_raw = payload.get("timestamp")
@@ -92,6 +95,11 @@ def load_history(inputs: Iterable[Path]) -> list[TrendPoint]:
     list[TrendPoint]
         Benchmark points sorted chronologically and secondarily by filename to
         provide a stable ordering.
+
+    Notes
+    -----
+    Files are read from ``inputs`` using :func:`_load_point`; no new files are
+    created or modified.
     """
     points = [_load_point(path) for path in inputs]
     points.sort(key=lambda p: (p.timestamp, p.source.name))
@@ -138,7 +146,8 @@ def render_table(points: Sequence[TrendPoint], output: Path) -> Path:
     The table contains token counts, wall-clock durations, and derived tokens
     per second metrics for both the BPE and unigram trainers. When ``points``
     is empty the file contains the sentence ``_No benchmarks found._`` for
-    easier downstream rendering.
+    easier downstream rendering. The function overwrites ``output`` with the
+    Markdown content each time it is invoked.
     """
     headers = [
         "Timestamp",
@@ -188,6 +197,7 @@ def render_plot(points: Sequence[TrendPoint], output: Path) -> Path:
     The module configures matplotlib to use the ``Agg`` backend so the plot can
     be rendered in headless environments. When ``points`` is empty an empty
     file is produced so downstream automation can detect the absence of data.
+    The function always writes (or truncates) ``output`` with PNG bytes.
     """
     if not points:
         output.write_bytes(b"")
@@ -221,7 +231,8 @@ def build_parser() -> argparse.ArgumentParser:
         Parser defining ``--input`` (directory of ``benchmark_*.json`` files),
         ``--output-dir`` (destination directory), ``--table-name``, and
         ``--plot-name`` options. All paths are interpreted relative to the
-        current working directory when invoked from the shell.
+        current working directory when invoked from the shell. This helper has
+        no filesystem side effects.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -267,7 +278,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     The command expects ``benchmark_*.json`` files in ``--input`` and writes a
     Markdown table, a PNG chart, and a ``trend_manifest.json`` manifest into
     ``--output-dir``. The manifest records resolved input paths and the derived
-    metrics, which makes integration with automation pipelines easier.
+    metrics, which makes integration with automation pipelines easier. Existing
+    files with matching names are overwritten.
     """
     parser = build_parser()
     args = parser.parse_args(argv)

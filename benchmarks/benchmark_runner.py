@@ -83,6 +83,11 @@ def synthesize_corpus(
     ------------
     None.
 
+    Notes
+    -----
+    The routine performs purely CPU-side random number generation; GPU hardware
+    is not consulted.
+
     Raises
     ------
     ValueError
@@ -104,6 +109,28 @@ def _iter_shard_sequences(
     shard: MemoryMappedShard,
     packer: BytePacker,
 ) -> Iterator[list[int]]:
+    """Yield decoded token sequences from a memory-mapped shard.
+
+    Parameters
+    ----------
+    shard:
+        Open :class:`gpu_tokenizer.io.MemoryMappedShard` providing access to the
+        byte-packed corpus contents.
+    packer:
+        :class:`gpu_tokenizer.BytePacker` configured with the desired BOS/EOS
+        settings.
+
+    Returns
+    -------
+    Iterator[list[int]]
+        Iterator producing one list of integer token IDs per stored sequence.
+
+    Notes
+    -----
+    The helper streams data directly from the memory map without requiring GPU
+    availability. Callers are responsible for keeping the ``shard`` context
+    alive for as long as iteration continues.
+    """
     encoded = packer.encode_shard(shard)
     seq = list(encoded)
     if seq:
@@ -148,6 +175,11 @@ def load_real_corpus(
     Opens each provided shard path and keeps it memory mapped for the duration
     of the load. The function closes all file handles before returning thanks to
     :class:`contextlib.ExitStack`.
+
+    Notes
+    -----
+    Decoding takes place entirely on the CPU; GPU availability is irrelevant at
+    this stage of the pipeline.
 
     Raises
     ------
@@ -196,6 +228,11 @@ def summarize_corpus(
     ------------
     None.
 
+    Notes
+    -----
+    The summary is computed with standard Python iteration and arithmetic; GPU
+    devices are not involved.
+
     Raises
     ------
     None.
@@ -239,6 +276,11 @@ def _build_bpe_batches(
     ------------
     None, aside from any lazy work performed when the batcher is iterated.
 
+    Notes
+    -----
+    Packing operates on CPU tensors only and therefore does not require GPU
+    availability.
+
     Raises
     ------
     None directly; construction errors from :class:`PackedBatcher` propagate.
@@ -274,6 +316,11 @@ def _build_unigram_batches(
     ------------
     Creates cloned tensors, increasing memory usage relative to the lazy BPE
     iteration.
+
+    Notes
+    -----
+    All tensors are materialised on the CPU; GPU availability is not required
+    until the batches are fed to a trainer.
 
     Raises
     ------
@@ -327,6 +374,12 @@ def run_bpe_benchmark(
     Side Effects
     ------------
     Performs GPU work and logs through the trainer as configured.
+
+    Notes
+    -----
+    Requires a CUDA-capable PyTorch installation; otherwise
+    :func:`_ensure_trainers_available` raises :class:`RuntimeError` before any
+    training begins.
 
     Raises
     ------
@@ -418,6 +471,12 @@ def run_unigram_benchmark(
     ------------
     Performs GPU work and mutates the internal state of the unigram trainer. The
     cloned batch tensors are also retained until Python reclaims them.
+
+    Notes
+    -----
+    Requires a CUDA-capable PyTorch installation; otherwise
+    :func:`_ensure_trainers_available` raises :class:`RuntimeError` before any
+    training begins.
 
     Raises
     ------
