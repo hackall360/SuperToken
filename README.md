@@ -139,7 +139,10 @@ Run `python main.py --help` for a full list of options.
 ```
 
 ## Documentation
-- [Performance notes and benchmarks](docs/performance.md)
+- [Architecture overview](docs/architecture.md): High-level map of the CLI, core modules, and benchmarks so you can navigate th
+e codebase quickly.
+- [Performance notes and benchmarks](docs/performance.md): Guidance on measuring throughput, interpreting telemetry, and tuning
+ GPU utilization.
 
 Additional guides and API notes can be added under the `docs/` directory as the project grows.
 
