@@ -22,6 +22,8 @@ SuperToken is a GPU-accelerated tokenizer toolkit that offers high-throughput by
 - [Documentation](#documentation)
   - [Module Guide](docs/modules.md)
   - [Architecture overview](docs/architecture.md)
+  - [CLI usage guide](docs/cli.md)
+  - [API reference](docs/api.md)
   - [Performance notes and benchmarks](docs/performance.md)
 - [Contributing](#contributing)
 - [License](#license)
@@ -157,10 +159,11 @@ Future deep dives will land in the `docs/` directory (see [`docs/architecture.md
 ```
 
 ## Documentation
-- [Architecture & API Overview](#architecture--api-overview): Start here for a quick summary of major modules, CLI extension points, and benchmarking utilities.
-- [Architecture overview](docs/architecture.md): High-level map of the CLI, core modules, and benchmarks so you can navigate the codebase quickly.
-- [Performance notes and benchmarks](docs/performance.md): Guidance on measuring throughput, interpreting telemetry, and tuning GPU utilization.
-- [Module guide](docs/modules.md): Deeper dives into the trainers, autoscaler, and streaming I/O stack with extension tips.
+- [Architecture overview](docs/architecture.md): Understand the end-to-end trainer pipeline, autoscaler lifecycle, and how datasets stream into GPU kernels.
+- [CLI usage guide](docs/cli.md): Learn the subcommands, shared flags, and example workflows for training, resuming, and benchmarking tokenizers.
+- [API reference](docs/api.md): Dive into the primary Python entry points, including trainers, autoscaler hooks, dataset utilities, and benchmarking helpers.
+- [Module guide](docs/modules.md): Browse the module-by-module breakdown of the codebase for deeper implementation details.
+- [Performance notes and benchmarks](docs/performance.md): Review methodology and representative throughput numbers, plus tips for reproducing measurements.
 
 ### Module Primers
 - **Trainers** – `GPUBPETrainer` and `GPUUnigramTrainer` coordinate packing, kernel launches, and checkpointing. See the [Module guide → Trainers](docs/modules.md#trainers) section for configuration hints and extension hooks.
