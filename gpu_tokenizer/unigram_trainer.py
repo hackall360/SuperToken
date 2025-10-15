@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 import time
+from os import PathLike
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
@@ -435,6 +437,71 @@ class GPUUnigramTrainer:
         }
 
         return {"vocab": len(self.id2piece), "telemetry": telemetry}
+
+    def save(self, path: str | PathLike[str]) -> Path:
+        """Serialize the unigram model to a SentencePiece ``.model`` file.
+
+        The resulting artifact can be consumed directly by
+        :class:`sentencepiece.SentencePieceProcessor`.  If ``path`` points to a
+        directory, the model is written to ``unigram.model`` within that
+        directory.  When ``path`` includes a filename, the parent directory is
+        created automatically and the model is stored at the exact location.
+        """
+
+        try:
+            from sentencepiece import sentencepiece_model_pb2 as sp_pb2  # type: ignore
+        except Exception as exc:  # pragma: no cover - exercised only when dependency missing
+            raise RuntimeError(
+                "Saving a SentencePiece model requires the `sentencepiece` package"
+            ) from exc
+
+        output_path = Path(path)
+        if output_path.suffix:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            model_path = output_path
+        else:
+            output_path.mkdir(parents=True, exist_ok=True)
+            model_path = output_path / "unigram.model"
+
+        def _encode_piece(piece: bytes) -> str:
+            text = piece.decode("latin-1")
+            return text.replace(" ", "▁")
+
+        log_probs = self.logp.detach().cpu().tolist()
+        vocab_size = len(self.id2piece)
+
+        model = sp_pb2.ModelProto()
+        model.model_type = sp_pb2.ModelProto.UNIGRAM
+        trainer_spec = model.trainer_spec
+        trainer_spec.model_type = sp_pb2.TrainerSpec.UNIGRAM
+        trainer_spec.vocab_size = vocab_size
+        trainer_spec.character_coverage = 1.0
+        trainer_spec.byte_fallback = True
+        trainer_spec.max_sentencepiece_length = self.max_len
+        trainer_spec.add_dummy_prefix = False
+        trainer_spec.remove_extra_whitespaces = False
+        trainer_spec.split_by_whitespace = False
+        trainer_spec.pad_id = -1
+        trainer_spec.unk_id = -1
+        trainer_spec.bos_id = -1
+        trainer_spec.eos_id = -1
+        trainer_spec.shuffle_input_sentence = False
+        trainer_spec.seed_sentencepiece_size = 0
+        trainer_spec.input_sentence_size = 0
+
+        normalizer_spec = model.normalizer_spec
+        normalizer_spec.name = "identity"
+        normalizer_spec.precompiled_charsmap = b""
+
+        for idx in range(vocab_size):
+            piece = model.pieces.add()
+            piece.piece = _encode_piece(self.id2piece[idx])
+            piece.score = float(log_probs[idx])
+            piece.type = sp_pb2.ModelProto.SentencePiece.NORMAL
+
+        model_path.write_bytes(model.SerializeToString())
+        print(f"Saved SentencePiece model → {model_path}")
+        return model_path
 
 
 __all__ = ["GPUUnigramTrainer"]

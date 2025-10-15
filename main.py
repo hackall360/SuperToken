@@ -369,13 +369,7 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
         stats = trainer.fit_epoch(batches)
         print(f"epoch {epoch + 1}: {stats}")
     if args.out_dir:
-        out_path = Path(args.out_dir)
-        out_path.mkdir(parents=True, exist_ok=True)
-        vocab_file = out_path / "unigram_vocab.txt"
-        with vocab_file.open("w", encoding="utf-8") as f:
-            for idx, piece in trainer.id2piece.items():
-                f.write(f"{idx}\t{piece.hex()}\n")
-        print(f"Saved unigram vocab → {vocab_file}")
+        trainer.save(args.out_dir)
 
 
 def _parser() -> argparse.ArgumentParser:
