@@ -51,9 +51,9 @@ def _load_sequences(
         document in the provided shards.
 
     Side Effects:
-        Opens :class:`MemoryMappedShard` instances for the lifetime of the
-        returned iterator so that shard data remains memory-mapped while being
-        consumed.
+        Opens :class:`MemoryMappedShard` handles via an :class:`ExitStack` so
+        shard files stay memory-mapped for the duration of the returned
+        generator.
     """
     packer = BytePacker(bos=bos, eos=eos)
 
@@ -77,8 +77,10 @@ def _expand_data_patterns(patterns: Sequence[str]) -> list[Path]:
         order they were discovered.
 
     Side Effects:
-        Raises :class:`SystemExit` when no files are found so the caller can
-        surface a user-facing error immediately.
+        Touches the filesystem to discover matching shard files.
+
+    Raises:
+        SystemExit: If no input files match the provided glob patterns.
     """
     files: list[Path] = []
     for pattern in patterns:
@@ -106,6 +108,9 @@ def _iter_packed_batches(
     Returns:
         Iterable that yields ``(tokens, mask, lengths)`` tensors suitable for
         GPU consumption.
+
+    Side Effects:
+        None.
     """
     return PackedBatcher(sequences, batch_size=batch_size, seed=seed)
 
@@ -127,8 +132,8 @@ def _build_unigram_batches(
         each packed batch.
 
     Side Effects:
-        Loads the entire packed representation into memory so batches can be
-        replayed across epochs without rebuilding.
+        Loads the entire packed representation into host memory so batches can
+        be replayed across epochs without rebuilding.
     """
     packed = PackedBatcher(sequences, batch_size=batch_size, seed=seed)
     return [x for (x, _mask, _lengths) in packed]
@@ -148,6 +153,9 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
         Generates synthetic corpora when requested, reads optional datasets,
         writes benchmark summaries under ``args.output_dir``, and prints a
         human-readable summary to stdout.
+
+    Raises:
+        SystemExit: If no synthetic or real corpora are supplied for the run.
     """
     sequences: list[list[int]] = []
     sources: list[dict[str, object]] = []
@@ -257,8 +265,15 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
         starts a :class:`CorpusStreamer` that must be closed when training
         completes, and loads/saves checkpoints when ``--resume-from`` or
         ``--checkpoint-dir`` are provided.
+
+    Raises:
+        SystemExit: If no ``--data`` globs are supplied or none yield readable
+            shard files.
     """
-    data_files = _expand_data_patterns(args.data)
+    data_patterns = getattr(args, "data", None)
+    if not data_patterns:
+        raise SystemExit("train-bpe requires at least one --data glob pattern")
+    data_files = _expand_data_patterns(data_patterns)
     autoscaler = AutoScaler(
         target_util=args.target_util,
         min_bs=args.min_batch,
@@ -366,6 +381,13 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
     )
     resume_state: dict[str, object] | None = None
     resume_batches: Iterable[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None = None
+    # Checkpoint resume flow:
+    # 1. Optionally load serialized state, including packed batches, from the
+    #    requested ``--resume-from`` directory.
+    # 2. When batches are available in the checkpoint metadata we replay them
+    #    directly so the autoscaler restarts from the previous batch size.
+    # 3. Otherwise we fall back to building a fresh :class:`CorpusStreamer`
+    #    pipeline that will be recreated whenever the autoscaler resizes.
     if args.resume_from:
         resume_state = trainer.load_checkpoint(str(args.resume_from))
         metadata = dict(resume_state.get("metadata", {}))
@@ -453,8 +475,15 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
     Side Effects:
         Loads all packed batches into host memory and writes the trained model
         to ``args.out_dir`` when provided.
+
+    Raises:
+        SystemExit: If ``--data`` is omitted or the globs do not resolve to at
+            least one shard.
     """
-    data_files = _expand_data_patterns(args.data)
+    data_patterns = getattr(args, "data", None)
+    if not data_patterns:
+        raise SystemExit("train-unigram requires at least one --data glob pattern")
+    data_files = _expand_data_patterns(data_patterns)
     sequences = _load_sequences(data_files, bos=args.bos, eos=args.eos)
 
     batches = _build_unigram_batches(sequences, batch_size=args.batch_size, seed=args.seed)
@@ -469,6 +498,75 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
         print(f"epoch {epoch + 1}: {stats}")
     if args.out_dir:
         trainer.save(args.out_dir)
+
+
+def _cmd_stream_batches(args: argparse.Namespace) -> None:
+    """Stream packed batches and report their tensor dimensions.
+
+    Args:
+        args: Parsed CLI arguments providing data globs, optional BOS/EOS
+            tokens, seed, and the desired ``batch_size`` and ``max_batches``
+            attributes.
+
+    Returns:
+        ``None``. Batch metadata is emitted to stdout for inspection.
+
+    Side Effects:
+        Opens shard files, materializes packed tensors on the host, and prints
+        batch shapes until ``max_batches`` is reached (when provided).
+
+    Raises:
+        SystemExit: If no ``--data`` patterns are supplied or the globs resolve
+            to no shard files.
+    """
+
+    data_patterns = getattr(args, "data", None)
+    if not data_patterns:
+        raise SystemExit("stream-batches requires at least one --data glob pattern")
+    data_files = _expand_data_patterns(data_patterns)
+    sequences = _load_sequences(
+        data_files,
+        bos=getattr(args, "bos", None),
+        eos=getattr(args, "eos", None),
+    )
+    batch_size = getattr(args, "batch_size", 1024)
+    seed = getattr(args, "seed", 1337)
+    batches = _iter_packed_batches(sequences, batch_size=batch_size, seed=seed)
+    max_batches = getattr(args, "max_batches", None)
+    for idx, (tokens, mask, lengths) in enumerate(batches):
+        print(
+            f"batch {idx}: tokens={tuple(tokens.shape)} mask={tuple(mask.shape)} lengths={tuple(lengths.shape)}"
+        )
+        if max_batches is not None and max_batches > 0 and idx + 1 >= max_batches:
+            break
+
+
+def _cmd_resume_bpe(args: argparse.Namespace) -> None:
+    """Resume a BPE training run from an on-disk checkpoint.
+
+    Args:
+        args: Parsed CLI arguments expected to include ``--resume-from`` and all
+            parameters required by :func:`_cmd_train_bpe`.
+
+    Returns:
+        ``None``. All work is delegated to :func:`_cmd_train_bpe`.
+
+    Side Effects:
+        Loads checkpoint state via :class:`GPUBPETrainer`, potentially rebuilds
+        :class:`CorpusStreamer` instances, and produces the same outputs as a
+        standard ``train-bpe`` invocation.
+
+    Raises:
+        SystemExit: If ``--resume-from`` or ``--data`` are missing before
+            dispatching to :func:`_cmd_train_bpe`, or if the delegated training
+            invocation encounters its own fatal CLI condition.
+    """
+
+    if not getattr(args, "resume_from", None):
+        raise SystemExit("--resume-from is required when invoking resume-bpe")
+    if not getattr(args, "data", None):
+        raise SystemExit("resume-bpe requires --data globs to stream training shards")
+    _cmd_train_bpe(args)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -620,6 +718,22 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    """CLI entry point that dispatches to tokenizer subcommands.
+
+    Args:
+        argv: Optional argument vector override, mirroring ``sys.argv[1:]``
+            when ``None``.
+
+    Returns:
+        ``None``. The selected subcommand performs all work.
+
+    Side Effects:
+        Parses CLI arguments, writes help text and command output to stdout, and
+        may exit the interpreter via :func:`argparse.ArgumentParser.parse_args`.
+
+    Raises:
+        SystemExit: If argument parsing fails or no subcommand is provided.
+    """
     parser = _parser()
     args = parser.parse_args(argv)
     func = getattr(args, "func", None)
