@@ -54,6 +54,84 @@ class AutoScaler:
         self._step_times: Deque[float] = deque(maxlen=self._window_size)
         self._vram_fracs: Deque[float] = deque(maxlen=self._window_size)
 
+    # ------------------------------------------------------------------
+    # Serialization helpers
+    def state_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable snapshot of the autoscaler's state."""
+
+        payload: dict[str, object] = {
+            "target_util": float(self.tu),
+            "device": self.device,
+            "min_bs": int(self.min_bs),
+            "max_bs": int(self.max_bs),
+            "min_workers": int(self.min_workers),
+            "max_workers": int(self.max_workers),
+            "h2d_mb": int(self._h2d_mb),
+            "window_size": int(self._window_size),
+            "step_times": list(self._step_times),
+            "vram_fracs": list(self._vram_fracs),
+            "state": asdict(self.state) if self.state is not None else None,
+        }
+        payload["vram_utilization"] = list(self._vram_fracs)
+        return payload
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        """Restore autoscaler internals from :meth:`state_dict`."""
+
+        if not state:
+            return
+
+        tu = float(state.get("target_util", self.tu))
+        self.tu = max(0.1, min(0.95, tu))
+        self.device = str(state.get("device", self.device))
+        # Window size and historical samples
+        window_size = int(state.get("window_size", self._window_size))
+        self._window_size = max(3, window_size)
+
+        step_times = [
+            float(sample)
+            for sample in state.get("step_times", [])
+            if isinstance(sample, (int, float)) and math.isfinite(float(sample))
+        ]
+        self._step_times = deque(step_times, maxlen=self._window_size)
+
+        raw_vram = state.get("vram_fracs")
+        if raw_vram is None:
+            raw_vram = state.get("vram_utilization", [])
+        vram_samples = [
+            max(0.0, min(1.0, float(sample)))
+            for sample in raw_vram
+            if isinstance(sample, (int, float)) and math.isfinite(float(sample))
+        ]
+        self._vram_fracs = deque(vram_samples, maxlen=self._window_size)
+
+        h2d_mb = int(state.get("h2d_mb", self._h2d_mb))
+        self._h2d_mb = max(256, min(8192, h2d_mb))
+
+        state_payload = state.get("state")
+        if isinstance(state_payload, dict):
+            batch_size = int(state_payload.get("batch_size", self.min_bs))
+            batch_size = max(self.min_bs, min(self.max_bs, batch_size))
+
+            cpu_workers = int(state_payload.get("cpu_workers", self.min_workers))
+            cpu_workers = max(self.min_workers, min(self.max_workers, cpu_workers))
+
+            state_h2d = int(state_payload.get("h2d_mb", self._h2d_mb))
+            state_h2d = max(256, min(8192, state_h2d))
+
+            fallback = float(state_payload.get("cpu_fallback_rate", 0.0))
+            fallback = max(0.0, min(1.0, fallback))
+
+            self.state = ScaleState(
+                batch_size=batch_size,
+                cpu_workers=cpu_workers,
+                h2d_mb=state_h2d,
+                cpu_fallback_rate=fallback,
+            )
+            self._h2d_mb = self.state.h2d_mb
+        else:
+            self.state = None
+
     def _gpu_caps(self) -> tuple[int, int]:
         if self.device == "cpu" or not torch.cuda.is_available():
             return 0, 0

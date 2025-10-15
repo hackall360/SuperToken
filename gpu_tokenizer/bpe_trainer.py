@@ -1006,7 +1006,8 @@ class GPUBPETrainer:
                 if self._active_batch_size is not None
                 else None
             ),
-            "autoscaler": self.autoscaler.snapshot_metrics(),
+            "autoscaler": self.autoscaler.state_dict(),
+            "autoscaler_metrics": self.autoscaler.snapshot_metrics(),
         }
         if include_batches and current_batches is not None:
             serialized_batches = self._serialize_batches(current_batches)
@@ -1109,25 +1110,37 @@ class GPUBPETrainer:
         autoscaler_meta = metadata.get("autoscaler") or {}
         scale_state = self.autoscaler.state
         if autoscaler_meta:
-            self.autoscaler.device = autoscaler_meta.get("device", self.autoscaler.device)
-            self.autoscaler.tu = float(autoscaler_meta.get("target_util", self.autoscaler.tu))
-            window_size = int(autoscaler_meta.get("window_size", self.autoscaler._window_size))
-            self.autoscaler._window_size = window_size
-            step_times = autoscaler_meta.get("step_times", [])
-            vram_util = autoscaler_meta.get("vram_utilization", [])
-            self.autoscaler._step_times = deque(step_times, maxlen=window_size)
-            self.autoscaler._vram_fracs = deque(vram_util, maxlen=window_size)
-            state_payload = autoscaler_meta.get("state")
-            if state_payload is not None:
-                scale_state = ScaleState(
-                    batch_size=int(state_payload.get("batch_size", 0)),
-                    cpu_workers=int(state_payload.get("cpu_workers", 0)),
-                    h2d_mb=int(state_payload.get("h2d_mb", 0)),
-                    cpu_fallback_rate=float(state_payload.get("cpu_fallback_rate", 0.0)),
-                )
-                self.autoscaler.state = scale_state
+            if "state" in autoscaler_meta or "h2d_mb" in autoscaler_meta:
+                self.autoscaler.load_state_dict(autoscaler_meta)
+                scale_state = self.autoscaler.state
             else:
-                self.autoscaler.state = None
+                # Backwards compatibility for checkpoints created before autoscaler
+                # serialization helpers were introduced.
+                self.autoscaler.device = autoscaler_meta.get("device", self.autoscaler.device)
+                self.autoscaler.tu = float(
+                    autoscaler_meta.get("target_util", self.autoscaler.tu)
+                )
+                window_size = int(
+                    autoscaler_meta.get("window_size", self.autoscaler._window_size)
+                )
+                self.autoscaler._window_size = window_size
+                step_times = autoscaler_meta.get("step_times", [])
+                vram_util = autoscaler_meta.get("vram_utilization", [])
+                self.autoscaler._step_times = deque(step_times, maxlen=window_size)
+                self.autoscaler._vram_fracs = deque(vram_util, maxlen=window_size)
+                state_payload = autoscaler_meta.get("state")
+                if state_payload is not None:
+                    scale_state = ScaleState(
+                        batch_size=int(state_payload.get("batch_size", 0)),
+                        cpu_workers=int(state_payload.get("cpu_workers", 0)),
+                        h2d_mb=int(state_payload.get("h2d_mb", 0)),
+                        cpu_fallback_rate=float(
+                            state_payload.get("cpu_fallback_rate", 0.0)
+                        ),
+                    )
+                    self.autoscaler.state = scale_state
+                else:
+                    self.autoscaler.state = None
         batches_payload = metadata.get("batches")
         current_batches, gpu_batches = self._deserialize_batches(
             batches_payload,
