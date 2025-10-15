@@ -2,8 +2,14 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+import gpu_tokenizer.triton_kernels as triton_kernels
 import gpu_tokenizer.utils as utils
-from gpu_tokenizer.utils import aggregate_pair_keys, count_pairs, reduce_pair_histograms
+from gpu_tokenizer.utils import (
+    _count_pairs_pytorch,
+    aggregate_pair_keys,
+    count_pairs,
+    reduce_pair_histograms,
+)
 
 
 def _allocate_pair_buffers(seqs: torch.Tensor):
@@ -80,6 +86,62 @@ def test_count_pairs_device_matches_input():
         assert counts_cuda.device.type == "cuda"
         assert torch.equal(pairs, pairs_cuda.cpu())
         assert torch.equal(counts, counts_cuda.cpu())
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not triton_kernels.is_triton_available(),
+    reason="CUDA and Triton are required for GPU parity",
+)
+def test_count_pairs_triton_matches_cpu_reference():
+    torch.manual_seed(1)
+    seqs = torch.randint(0, 1024, (8, 257), dtype=torch.int32, device="cuda")
+    valid = torch.randint(0, 2, seqs.shape, dtype=torch.uint8, device="cuda")
+
+    pair_keys_buffer, pair_counts_buffer, pair_count_length = _allocate_pair_buffers(seqs)
+    count_pairs(seqs, valid, pair_keys_buffer, pair_counts_buffer, pair_count_length)
+
+    length = int(pair_count_length.item())
+    pairs = pair_keys_buffer[:length].cpu()
+    counts = pair_counts_buffer[:length].cpu()
+
+    ref_pairs, ref_counts = _cpu_reference_count_pairs(seqs.cpu(), valid.cpu())
+
+    assert torch.equal(pairs, ref_pairs)
+    assert torch.equal(counts, ref_counts)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not triton_kernels.is_triton_available(),
+    reason="CUDA and Triton are required for performance comparison",
+)
+def test_count_pairs_triton_outperforms_pytorch():
+    torch.manual_seed(123)
+    batch, length = 64, 513
+    seqs = torch.randint(0, 4096, (batch, length), dtype=torch.int32, device="cuda")
+    valid = torch.ones_like(seqs, dtype=torch.uint8)
+
+    buffers = _allocate_pair_buffers(seqs)
+
+    count_pairs(seqs, valid, *buffers)
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    def _time_call(fn):
+        durations = []
+        for _ in range(5):
+            start.record()
+            fn(seqs, valid, *buffers)
+            end.record()
+            torch.cuda.synchronize()
+            durations.append(start.elapsed_time(end))
+        return sum(durations) / len(durations)
+
+    triton_ms = _time_call(count_pairs)
+    pytorch_ms = _time_call(_count_pairs_pytorch)
+
+    assert triton_ms < pytorch_ms
 
 
 def test_count_pairs_saturates_and_logs(monkeypatch, caplog):

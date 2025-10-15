@@ -248,9 +248,220 @@ def apply_merge_and_compact(
     )
 
 
+if triton is not None:
+
+    @triton.jit
+    def _count_pairs_histogram_kernel(
+        tokens_ptr,
+        valid_ptr,
+        packed_keys_ptr,
+        packed_counts_ptr,
+        total_length_ptr,
+        error_flag_ptr,
+        stride_tokens: tl.constexpr,
+        stride_valid: tl.constexpr,
+        capacity,
+        width,
+        PAD_WIDTH: tl.constexpr,
+        TOKENS_IS_INT64: tl.constexpr,
+        VALID_IS_BOOL: tl.constexpr,
+    ):
+        row_idx = tl.program_id(0)
+        tokens_row = tokens_ptr + row_idx * stride_tokens
+        valid_row = valid_ptr + row_idx * stride_valid
+
+        cols = tl.arange(0, PAD_WIDTH)
+        active_cols = cols < width
+
+        lhs = tl.load(tokens_row + cols, mask=active_cols, other=0)
+        rhs = tl.load(tokens_row + cols + 1, mask=active_cols, other=0)
+
+        lhs_i64 = lhs.to(tl.int64) if TOKENS_IS_INT64 else lhs.to(tl.int32).to(tl.int64)
+        rhs_i64 = rhs.to(tl.int64) if TOKENS_IS_INT64 else rhs.to(tl.int32).to(tl.int64)
+
+        left_valid = tl.load(valid_row + cols, mask=active_cols, other=0)
+        right_valid = tl.load(valid_row + cols + 1, mask=active_cols, other=0)
+
+        if VALID_IS_BOOL:
+            left_valid_bool = left_valid != 0
+            right_valid_bool = right_valid != 0
+        else:
+            left_valid_bool = left_valid.to(tl.int32) != 0
+            right_valid_bool = right_valid.to(tl.int32) != 0
+
+        pair_active = active_cols & left_valid_bool & right_valid_bool
+
+        UINT32_MASK = 0xFFFFFFFF
+        lhs_u32 = lhs_i64 & UINT32_MASK
+        rhs_u32 = rhs_i64 & UINT32_MASK
+        packed_keys = (lhs_u32 << 32) | rhs_u32
+
+        sentinel = tl.full([PAD_WIDTH], -1, dtype=tl.int64)
+        key_bucket = tl.shared_memory((PAD_WIDTH,), dtype=tl.int64)
+        tl.store(key_bucket + cols, tl.where(pair_active, packed_keys, sentinel))
+
+        sorted_keys = tl.sort(tl.load(key_bucket + cols))
+        tl.store(key_bucket + cols, sorted_keys)
+
+        num_valid = tl.sum(pair_active.to(tl.int32), axis=0)
+        num_valid = tl.minimum(num_valid, width)
+        start_idx = PAD_WIDTH - num_valid
+
+        agg_keys = tl.shared_memory((PAD_WIDTH,), dtype=tl.int64)
+        agg_counts = tl.shared_memory((PAD_WIDTH,), dtype=tl.int32)
+
+        unique_count = tl.zeros((), dtype=tl.int32)
+        run_length = tl.zeros((), dtype=tl.int32)
+        prev_key = tl.zeros((), dtype=tl.int64)
+        have_prev = tl.zeros((), dtype=tl.int1)
+
+        for idx in range(PAD_WIDTH):
+            key = tl.load(key_bucket + idx)
+            idx_scalar = tl.full((), idx, dtype=tl.int32)
+            active = (idx_scalar >= start_idx) & (num_valid > 0)
+
+            same_key = have_prev & (key == prev_key)
+            run_length = tl.where(active & same_key, run_length + 1, run_length)
+
+            new_run = active & tl.logical_not(same_key)
+            finalize = new_run & have_prev
+
+            tl.store(agg_keys + unique_count, prev_key, mask=finalize)
+            tl.store(agg_counts + unique_count, run_length, mask=finalize)
+            unique_count = tl.where(finalize, unique_count + 1, unique_count)
+
+            prev_key = tl.where(new_run, key, prev_key)
+            run_length = tl.where(new_run, 1, run_length)
+            have_prev = tl.where(
+                active, tl.full((), 1, dtype=tl.int1), have_prev
+            )
+
+        tl.store(agg_keys + unique_count, prev_key, mask=have_prev)
+        tl.store(agg_counts + unique_count, run_length, mask=have_prev)
+        unique_count = tl.where(have_prev, unique_count + 1, unique_count)
+
+        base = tl.atomic_add(total_length_ptr, unique_count)
+        limit = capacity - base
+        overflow = limit < unique_count
+        tl.atomic_max(error_flag_ptr, overflow.to(tl.int32))
+
+        store_mask = tl.logical_not(overflow)
+        for idx in range(PAD_WIDTH):
+            write_mask = store_mask & (idx < unique_count)
+            key = tl.load(agg_keys + idx)
+            count = tl.load(agg_counts + idx)
+            tl.store(packed_keys_ptr + base + idx, key, mask=write_mask)
+            tl.store(packed_counts_ptr + base + idx, count, mask=write_mask)
+
+
+def can_use_triton_count_pairs(
+    seqs: torch.Tensor,
+    valid: torch.Tensor,
+    pair_keys_buffer: torch.Tensor,
+    pair_counts_buffer: torch.Tensor,
+    pair_count_length: torch.Tensor,
+) -> bool:
+    if triton is None:
+        return False
+    if seqs.dim() != 2 or valid.dim() != 2:
+        return False
+    if seqs.shape != valid.shape:
+        return False
+    if not (seqs.is_cuda and valid.is_cuda):
+        return False
+    if not pair_keys_buffer.is_cuda or not pair_counts_buffer.is_cuda:
+        return False
+    if not pair_count_length.is_cuda:
+        return False
+    if not seqs.is_contiguous() or not valid.is_contiguous():
+        return False
+    if not pair_keys_buffer.is_contiguous() or not pair_counts_buffer.is_contiguous():
+        return False
+    if pair_count_length.numel() != 1:
+        return False
+    if pair_keys_buffer.dim() != 2 or pair_keys_buffer.shape[1] != 2:
+        return False
+    if pair_counts_buffer.dim() != 1:
+        return False
+    if pair_keys_buffer.size(0) != pair_counts_buffer.size(0):
+        return False
+    if pair_keys_buffer.dtype not in (torch.int32, torch.int64):
+        return False
+    if pair_counts_buffer.dtype != torch.int32:
+        return False
+    if seqs.dtype not in (torch.int32, torch.int64):
+        return False
+    if valid.dtype not in (torch.uint8, torch.bool):
+        return False
+    B, L = seqs.shape
+    if B == 0 or L <= 1:
+        return True
+    width = L - 1
+    max_width = 2048
+    return width <= max_width
+
+
+def count_pairs_histogram(
+    seqs: torch.Tensor,
+    valid: torch.Tensor,
+    pair_keys_buffer: torch.Tensor,
+    pair_counts_buffer: torch.Tensor,
+    pair_count_length: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    if not can_use_triton_count_pairs(seqs, valid, pair_keys_buffer, pair_counts_buffer, pair_count_length):
+        raise RuntimeError("Triton count_pairs kernel cannot be used for the provided tensors")
+
+    B, L = seqs.shape
+    width = max(L - 1, 0)
+    capacity = pair_counts_buffer.numel()
+
+    if B == 0 or width == 0 or capacity == 0:
+        return (
+            torch.empty((0,), dtype=torch.int64, device=seqs.device),
+            torch.empty((0,), dtype=torch.int32, device=seqs.device),
+            0,
+        )
+
+    pad_width = 1 << (width - 1).bit_length()
+    pad_width = max(pad_width, 1)
+
+    packed_keys = torch.empty((capacity,), dtype=torch.int64, device=seqs.device)
+    packed_counts = torch.empty_like(pair_counts_buffer)
+    error_flag = torch.zeros((1,), dtype=torch.int32, device=seqs.device)
+
+    pair_count_length.zero_()
+
+    grid = (B,)
+    _count_pairs_histogram_kernel[grid](
+        seqs,
+        valid,
+        packed_keys,
+        packed_counts,
+        pair_count_length,
+        error_flag,
+        seqs.stride(0),
+        valid.stride(0),
+        capacity,
+        width,
+        pad_width,
+        seqs.dtype == torch.int64,
+        valid.dtype == torch.bool,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    if int(error_flag.item()) != 0:
+        raise RuntimeError("pair workspace capacity exceeded")
+
+    total = int(pair_count_length.item())
+    return packed_keys, packed_counts, total
+
+
 __all__ = [
     "is_triton_available",
     "can_use_triton_apply_merge",
     "apply_merge_and_compact",
+    "can_use_triton_count_pairs",
+    "count_pairs_histogram",
 ]
 
