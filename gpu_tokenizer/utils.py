@@ -10,6 +10,10 @@ import torch.distributed as dist
 
 from .cuda_kernels import apply_merge_and_compact as cuda_apply_merge_and_compact
 from .dtypes import clamp_lengths_to_dtype, promote_length_sum_dtype, INT32_MAX
+from .triton_kernels import (
+    can_use_triton_count_pairs,
+    count_pairs_histogram,
+)
 
 
 UINT32_MAX = (1 << 32) - 1
@@ -243,15 +247,14 @@ def apply_merge_once(
     return seqs, valid, lengths, spans
 
 
-@torch.jit.script
-def count_pairs(
+def _count_pairs_pytorch(
     seqs: torch.Tensor,
     valid: torch.Tensor,
     pair_keys_buffer: torch.Tensor,
     pair_counts_buffer: torch.Tensor,
     pair_count_length: torch.Tensor,
 ) -> None:
-    """Populate ``pair_*`` workspaces with unique adjacent token pairs."""
+    """Packed-key implementation executed with PyTorch ops."""
 
     B = seqs.size(0)
     L = seqs.size(1) if seqs.dim() > 1 else 0
@@ -322,6 +325,77 @@ def count_pairs(
         pair_counts_buffer[length:].zero_()
 
     pair_count_length[0] = length
+
+
+def _count_pairs_triton(
+    seqs: torch.Tensor,
+    valid: torch.Tensor,
+    pair_keys_buffer: torch.Tensor,
+    pair_counts_buffer: torch.Tensor,
+    pair_count_length: torch.Tensor,
+) -> bool:
+    if not can_use_triton_count_pairs(
+        seqs, valid, pair_keys_buffer, pair_counts_buffer, pair_count_length
+    ):
+        return False
+
+    try:
+        packed_keys, packed_counts, total = count_pairs_histogram(
+            seqs, valid, pair_keys_buffer, pair_counts_buffer, pair_count_length
+        )
+    except RuntimeError:
+        return False
+
+    capacity = pair_counts_buffer.numel()
+    pair_count_length.zero_()
+
+    if total == 0 or capacity == 0:
+        if pair_keys_buffer.numel() > 0:
+            pair_keys_buffer.fill_(-1)
+        if pair_counts_buffer.numel() > 0:
+            pair_counts_buffer.zero_()
+        return True
+
+    keys = packed_keys[:total]
+    counts = packed_counts[:total]
+
+    unique_keys, unique_counts = aggregate_pair_keys(keys, counts)
+    length = int(unique_keys.numel())
+    if length > capacity:
+        raise RuntimeError("pair workspace capacity exceeded")
+
+    lhs_vals = (unique_keys >> 32).to(seqs.dtype)
+    rhs_vals = (unique_keys & UINT32_MAX).to(seqs.dtype)
+
+    pair_keys_buffer[:length, 0].copy_(lhs_vals)
+    pair_keys_buffer[:length, 1].copy_(rhs_vals)
+    pair_counts_buffer[:length].copy_(unique_counts)
+
+    if length < pair_keys_buffer.size(0):
+        pair_keys_buffer[length:].fill_(-1)
+    if length < pair_counts_buffer.size(0):
+        pair_counts_buffer[length:].zero_()
+
+    pair_count_length[0] = length
+    return True
+
+
+def count_pairs(
+    seqs: torch.Tensor,
+    valid: torch.Tensor,
+    pair_keys_buffer: torch.Tensor,
+    pair_counts_buffer: torch.Tensor,
+    pair_count_length: torch.Tensor,
+) -> None:
+    """Populate ``pair_*`` workspaces with unique adjacent token pairs."""
+
+    used_triton = _count_pairs_triton(
+        seqs, valid, pair_keys_buffer, pair_counts_buffer, pair_count_length
+    )
+    if not used_triton:
+        _count_pairs_pytorch(
+            seqs, valid, pair_keys_buffer, pair_counts_buffer, pair_count_length
+        )
 
 
 def aggregate_pair_keys(
