@@ -1,44 +1,69 @@
 # Architecture Overview
 
-SuperToken is organized around a GPU-first tokenization toolkit with a command-line interface and supporting benchmarks. This guide sketches how the major components interact so you can extend them or slot in new modules.
+SuperToken couples GPU-centric tokenizer trainers with a streaming data engine and automation layers that keep accelerators saturated. This document drills into how the moving parts cooperate so you can extend or swap components confidently.
 
 ## Quick Navigation
-- [CLI entry points](#cli-entry-points)
-- [GPU tokenizer package](#gpu-tokenizer-package)
-- [Benchmark utilities](#benchmark-utilities)
+- [Trainer pipeline](#trainer-pipeline)
+- [Autoscaler lifecycle](#autoscaler-lifecycle)
+- [Dataset and streaming layers](#dataset-and-streaming-layers)
+- [CLI integration](#cli-integration)
+- [Benchmarking workflow](#benchmarking-workflow)
 - [Related guides](#related-guides)
 
-## CLI Entry Points
-The `main.py` script exposes the public CLI surface. It wires the subcommands (`train-bpe`, `train-unigram`, `benchmark`) to the concrete trainers and benchmarking helpers while handling shared arguments such as dataset globs, checkpoint configuration, and autoscaling targets. Each subcommand delegates to functions in `gpu_tokenizer.cli_train_bpe`, `gpu_tokenizer.unigram_trainer`, and the benchmarking helpers to keep the CLI thin and composable.
+## Trainer Pipeline
+The core training loop is shared between the [BPE](../gpu_tokenizer/bpe_trainer.py) and [unigram](../gpu_tokenizer/unigram_trainer.py) implementations. Each step is designed to maximize GPU residency:
 
-Key responsibilities:
-- Parse global and subcommand-specific options via `argparse`.
-- Instantiate the appropriate trainer (`GPUBPETrainer` or `GPUUnigramTrainer`).
-- Configure autoscaling, dataset ingestion, and checkpoint paths.
-- Dispatch benchmarking runs that emit telemetry tables and JSON artifacts.
+1. **Shard discovery** – Dataset providers enumerate files or glob patterns and create an iterator of logical shards.
+2. **Streaming ingestion** – Reader workers pull shards through the I/O adapters, decompress data when required, and feed bytes into the host staging buffers.
+3. **Packing** – The packing utilities collate sequences into contiguous device-ready tensors, applying special tokens or padding rules.
+4. **Autoscaled batching** – The [`AutoScaler`](../gpu_tokenizer/autoscaler.py) recommends the next batch size based on throughput telemetry captured in the previous iteration.
+5. **GPU kernels** – Trainer-specific CUDA/Triton kernels execute merge scoring or unigram probability updates.
+6. **Checkpointing and metrics** – Trainers optionally snapshot state (merge tables, unigram weights, autoscaler state) and surface progress to the CLI logger.
 
-## GPU Tokenizer Package
-The `gpu_tokenizer/` package houses the GPU kernels, trainers, and utilities that power the CLI. The modules are loosely grouped by concern:
+Because the trainers conform to a shared interface, you can prototype new algorithms by reusing the streaming and autoscaling layers while plugging in new kernel invocations. Refer to the [API reference](api.md) for class signatures and extensibility hooks.
 
-- **Training frontends**: `bpe_trainer.py` and `unigram_trainer.py` implement the high-level training loops for BPE and unigram vocabularies. They coordinate dataset streaming, invoke CUDA/Triton kernels, and persist vocab artifacts.
-- **Autoscaling**: `autoscaler.py` monitors throughput statistics and adjusts batch sizes to saturate the GPU within a target utilization band.
-- **Dataset ingestion**: `datasets.py` and `io.py` provide streaming readers with optional compression, memory mapping, and worker-based prefetch.
-- **Packing and fast paths**: `cpu_packer.py`, `cpu_fastpath.py`, and `utils.py` manage host-side preparation of byte sequences before they reach the GPU.
-- **Kernels and dtype helpers**: `cuda_kernels.py`, `triton_kernels.py`, and `dtypes.py` collect specialized kernels plus dtype utilities shared across trainers.
-- **Analytics and statistics**: `ngram_stats.py` gathers corpus statistics that feed into tokenizer initialization and evaluation.
+## Autoscaler Lifecycle
+Maintaining high device utilization is the autoscaler's primary objective:
 
-Each trainer composes these modules: data loaders stream shards into packed batches, autoscaling suggests the next batch size, and GPU kernels execute merge or unigram scoring steps. The package layout is intentionally modular so new trainers or kernels can be dropped into the same scaffolding.
+- **Initialization** – When a trainer starts, it seeds the autoscaler with a target utilization band and warm-up window.
+- **Measurement** – After each batch, trainers report throughput counters (tokens processed, kernel duration, host wait time).
+- **Decision** – The autoscaler smooths the metrics, compares them to targets, and proposes the next batch size within configured bounds.
+- **Persistence** – On checkpoint, autoscaler state is serialized so resumed runs maintain momentum.
 
-## Benchmark Utilities
-Benchmark entry points live alongside the CLI (`main.py benchmark`) and reuse the trainers with synthetic or sampled datasets. The helper functions in `benchmarks/` generate reproducible corpora, run both trainers under comparable settings, and emit:
+The autoscaler exposes hooks for alternative policies (e.g., PID-style controllers or reinforcement learners). Implementation details and configuration knobs are documented in the [API reference](api.md#autoscaler).
 
-- Tabular summaries printed to stdout.
-- JSON telemetry payloads under the requested output directory.
+## Dataset and Streaming Layers
+SuperToken treats data as an infinite stream:
 
-When adding new benchmarking scenarios, place reusable helpers in `benchmarks/` and expose them via the CLI subcommand. This keeps benchmarking logic isolated from the training loops while still sharing dataset and autoscaling utilities.
+- **Datasets module** – [`gpu_tokenizer/datasets`](../gpu_tokenizer/datasets/__init__.py) exports high-level abstractions such as `IterableCorpus`, synthetic generators, and shard samplers.
+- **I/O adapters** – [`gpu_tokenizer/io`](../gpu_tokenizer/io/__init__.py) centralizes compression handling, memory mapping, and threaded prefetch.
+- **Prefetch workers** – Configurable worker pools overlap disk reads with GPU execution, reducing idle windows.
+- **Backpressure** – Autoscaler suggestions feed back into the dataset layer to avoid queue overflows or starvation.
+
+For more operational details—including configuration flags and expected throughput—see the [CLI usage guide](cli.md#streaming-options) and [performance notes](performance.md).
+
+## CLI Integration
+`main.py` orchestrates the trainers through user-facing commands:
+
+- Each subcommand (e.g., `train-bpe`, `train-unigram`, `benchmark`) wires parser arguments to trainer factories.
+- Common flags configure dataset paths, compression, autoscaler targets, checkpoint cadence, and output directories.
+- Structured logging surfaces autoscaler decisions, throughput summaries, and checkpoint events for observability.
+
+The [CLI usage guide](cli.md) contains end-to-end examples and option tables, while the [API reference](api.md#cli-helpers) covers the helper functions exposed for reuse in other entry points.
+
+## Benchmarking Workflow
+Benchmarks share the training backbone but focus on repeatability:
+
+1. Configure synthetic and real corpus sources, output directories, and runtime limits.
+2. Instantiate trainer pairs with consistent autoscaler targets.
+3. Execute each trainer sequentially while recording telemetry snapshots.
+4. Emit tabular summaries and JSON artifacts that can be parsed by external dashboards.
+
+Custom benchmarks should live under the `benchmarks/` package, reusing the dataset and autoscaling primitives described above. Consult the [CLI usage guide](cli.md#benchmark-command) for invocation recipes and the [API reference](api.md#benchmarking-utilities) for programmatic entry points.
 
 ## Related Guides
-- [Performance notes and benchmarks](performance.md): Deep dive into throughput expectations, tuning knobs, and representative benchmark results.
-- [README](../README.md#quick-start): Quick-start examples and command invocations for common workflows.
-
-> Looking for something else? Future guides can extend this section with links to API references, kernel deep dives, or integration tutorials.
+- [CLI usage guide](cli.md)
+- [API reference](api.md)
+- [Module guide](modules.md)
+- [Performance notes and benchmarks](performance.md)
+- [Project README](../README.md)
