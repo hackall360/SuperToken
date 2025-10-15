@@ -20,6 +20,9 @@ SuperToken is a GPU-accelerated tokenizer toolkit that offers high-throughput by
 - [Architecture & API Overview](#architecture--api-overview)
 - [Project Layout](#project-layout)
 - [Documentation](#documentation)
+  - [Module Guide](docs/modules.md)
+  - [Architecture overview](docs/architecture.md)
+  - [Performance notes and benchmarks](docs/performance.md)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -157,6 +160,17 @@ Future deep dives will land in the `docs/` directory (see [`docs/architecture.md
 - [Architecture & API Overview](#architecture--api-overview): Start here for a quick summary of major modules, CLI extension points, and benchmarking utilities.
 - [Architecture overview](docs/architecture.md): High-level map of the CLI, core modules, and benchmarks so you can navigate the codebase quickly.
 - [Performance notes and benchmarks](docs/performance.md): Guidance on measuring throughput, interpreting telemetry, and tuning GPU utilization.
+- [Module guide](docs/modules.md): Deeper dives into the trainers, autoscaler, and streaming I/O stack with extension tips.
+
+### Module Primers
+- **Trainers** – `GPUBPETrainer` and `GPUUnigramTrainer` coordinate packing, kernel launches, and checkpointing. See the [Module guide → Trainers](docs/modules.md#trainers) section for configuration hints and extension hooks.
+- **Autoscaler** – The adaptive batching logic in `gpu_tokenizer.autoscaler` keeps GPU utilization in the target band. Refer to [Module guide → Autoscaler](docs/modules.md#autoscaler) for heuristics and subclassing advice.
+- **Streaming I/O** – Dataset loaders and IO helpers manage compressed shards, worker pools, and synthetic corpora. Explore [Module guide → Streaming I/O](docs/modules.md#streaming-io) to customize ingestion paths.
+
+### CLI & Benchmark Navigation
+- **Discover commands** – `main.py` is the CLI entry point; run `python main.py --help` to enumerate subcommands. Each `train-*` action is registered inside the `build_parser` helper alongside shared arguments.
+- **Command implementations** – The BPE flow lives in [`gpu_tokenizer/cli_train_bpe.py`](gpu_tokenizer/cli_train_bpe.py), which binds argument parsing to the `GPUBPETrainer`. Mirror its structure when adding new CLI frontends so trainers remain reusable.
+- **Benchmark utilities** – Reusable harnesses, corpus generators, and reporting helpers reside under [`benchmarks/`](benchmarks/). Pair them with `python main.py benchmark` for quick comparisons, or import them directly in notebooks to script bespoke experiments.
 
 Additional guides and API notes can be added under the `docs/` directory as the project grows.
 
