@@ -22,25 +22,25 @@ from gpu_tokenizer.utils import apply_merge_once, count_pairs
 
 def test_aggregate_pair_keys_repeated_counts():
     keys = torch.tensor([1, 1, 1, 2, 2, 3], dtype=torch.long)
-    counts = torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.int32)
+    counts = torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.int64)
 
     aggregated_keys, aggregated_counts = _aggregate_pair_keys(keys, counts)
 
     assert torch.equal(aggregated_keys, torch.tensor([1, 2, 3], dtype=torch.long))
     assert torch.equal(
-        aggregated_counts, torch.tensor([1 + 2 + 3, 4 + 5, 6], dtype=torch.int32)
+        aggregated_counts, torch.tensor([1 + 2 + 3, 4 + 5, 6], dtype=torch.int64)
     )
 
 
 def test_aggregate_pair_keys_unsorted_input():
     keys = torch.tensor([2, 1, 3, 1, 2], dtype=torch.long)
-    counts = torch.tensor([5, 1, 2, 3, 4], dtype=torch.int32)
+    counts = torch.tensor([5, 1, 2, 3, 4], dtype=torch.int64)
 
     aggregated_keys, aggregated_counts = _aggregate_pair_keys(keys, counts)
 
     assert torch.equal(aggregated_keys, torch.tensor([1, 2, 3], dtype=torch.long))
     assert torch.equal(
-        aggregated_counts, torch.tensor([1 + 3, 5 + 4, 2], dtype=torch.int32)
+        aggregated_counts, torch.tensor([1 + 3, 5 + 4, 2], dtype=torch.int64)
     )
 
 
@@ -85,7 +85,7 @@ def test_cpu_fastpath_pair_count_matches_baseline():
     width = max(L - 1, 0)
     capacity = max(B * width, 1)
     pair_workspace = torch.empty((capacity, 2), dtype=tokens.dtype)
-    count_workspace = torch.empty((capacity,), dtype=torch.int32)
+    count_workspace = torch.empty((capacity,), dtype=torch.int64)
     pair_length = torch.zeros((1,), dtype=torch.long)
     count_pairs(tokens, valid, pair_workspace, count_workspace, pair_length)
     length = int(pair_length.item())
@@ -99,8 +99,8 @@ def test_cpu_fastpath_pair_count_matches_baseline():
     fast_keys, fast_counts = count_pairs_fastpath(tokens, valid)
     assert torch.equal(torch.sort(baseline_keys)[0], torch.sort(fast_keys)[0])
     assert torch.equal(
-        torch.sort(baseline_counts.to(torch.int32))[0],
-        torch.sort(fast_counts.to(torch.int32))[0],
+        torch.sort(baseline_counts)[0],
+        torch.sort(fast_counts)[0],
     )
 
 

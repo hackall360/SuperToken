@@ -75,7 +75,7 @@ def test_compute_ngram_histograms_matches_cpu(device: torch.device) -> None:
     for order in (2, 3, 4):
         keys, counts = histograms[order]
         assert keys.dtype == torch.long
-        assert counts.dtype == torch.int32
+        assert counts.dtype == torch.int64
         assert keys.device == device
         assert counts.device == device
 
@@ -94,7 +94,7 @@ def test_compute_ngram_histograms_respects_padding() -> None:
     # Only the first bigram is valid; no trigrams or 4-grams should be emitted.
     bigram_keys, bigram_counts = histograms[2]
     assert bigram_keys.numel() == 1
-    assert torch.equal(bigram_counts.cpu(), torch.tensor([1], dtype=torch.int32))
+    assert torch.equal(bigram_counts.cpu(), torch.tensor([1], dtype=torch.int64))
 
     trigram_keys, trigram_counts = histograms[3]
     assert trigram_keys.numel() == 0

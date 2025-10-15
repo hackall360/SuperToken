@@ -308,7 +308,7 @@ if triton is not None:
         start_idx = PAD_WIDTH - num_valid
 
         agg_keys = tl.shared_memory((PAD_WIDTH,), dtype=tl.int64)
-        agg_counts = tl.shared_memory((PAD_WIDTH,), dtype=tl.int32)
+        agg_counts = tl.shared_memory((PAD_WIDTH,), dtype=tl.int64)
 
         unique_count = tl.zeros((), dtype=tl.int32)
         run_length = tl.zeros((), dtype=tl.int32)
@@ -327,7 +327,7 @@ if triton is not None:
             finalize = new_run & have_prev
 
             tl.store(agg_keys + unique_count, prev_key, mask=finalize)
-            tl.store(agg_counts + unique_count, run_length, mask=finalize)
+            tl.store(agg_counts + unique_count, run_length.to(tl.int64), mask=finalize)
             unique_count = tl.where(finalize, unique_count + 1, unique_count)
 
             prev_key = tl.where(new_run, key, prev_key)
@@ -337,7 +337,7 @@ if triton is not None:
             )
 
         tl.store(agg_keys + unique_count, prev_key, mask=have_prev)
-        tl.store(agg_counts + unique_count, run_length, mask=have_prev)
+        tl.store(agg_counts + unique_count, run_length.to(tl.int64), mask=have_prev)
         unique_count = tl.where(have_prev, unique_count + 1, unique_count)
 
         base = tl.atomic_add(total_length_ptr, unique_count)
@@ -387,7 +387,7 @@ def can_use_triton_count_pairs(
         return False
     if pair_keys_buffer.dtype not in (torch.int32, torch.int64):
         return False
-    if pair_counts_buffer.dtype != torch.int32:
+    if pair_counts_buffer.dtype != torch.int64:
         return False
     if seqs.dtype not in (torch.int32, torch.int64):
         return False
@@ -418,7 +418,7 @@ def count_pairs_histogram(
     if B == 0 or width == 0 or capacity == 0:
         return (
             torch.empty((0,), dtype=torch.int64, device=seqs.device),
-            torch.empty((0,), dtype=torch.int32, device=seqs.device),
+            torch.empty((0,), dtype=torch.int64, device=seqs.device),
             0,
         )
 

@@ -156,7 +156,7 @@ class GPUBatchRecord:
                 self.pair_keys_buffer = torch.empty((0, 2), dtype=self.tokens.dtype, device=device)
             if self.pair_counts_buffer is None or self.pair_counts_buffer.shape != (0,):
                 self.pair_counts_buffer = torch.empty(
-                    (0,), dtype=torch.int32, device=device
+                    (0,), dtype=torch.int64, device=device
                 )
         else:
             if (
@@ -170,10 +170,10 @@ class GPUBatchRecord:
             if (
                 self.pair_counts_buffer is None
                 or self.pair_counts_buffer.shape[0] != capacity
-                or self.pair_counts_buffer.dtype != torch.int32
+                or self.pair_counts_buffer.dtype != torch.int64
             ):
                 self.pair_counts_buffer = torch.empty(
-                    (capacity,), dtype=torch.int32, device=device
+                    (capacity,), dtype=torch.int64, device=device
                 )
         if self.pair_count_length is None or self.pair_count_length.shape != (1,):
             self.pair_count_length = torch.zeros((1,), dtype=torch.long, device=device)
@@ -481,7 +481,7 @@ class GPUBPETrainer:
         self._transfer_stage_totals: dict[str, dict[str, int]] = {}
         self._enable_histogram_cache: bool = True
         self._cached_pair_keys: torch.Tensor = torch.empty((0,), dtype=torch.long)
-        self._cached_pair_counts: torch.Tensor = torch.empty((0,), dtype=torch.int32)
+        self._cached_pair_counts: torch.Tensor = torch.empty((0,), dtype=torch.int64)
         self._hist_cache_valid: bool = False
         self._force_recount: bool = True
         self._top_pairs_limit: int = 512
@@ -1079,10 +1079,10 @@ class GPUBPETrainer:
         cached_counts = tensors.get("cached_pair_counts")
         if cached_keys is not None and cached_counts is not None:
             self._cached_pair_keys = cached_keys.detach().clone().to(torch.long)
-            self._cached_pair_counts = cached_counts.detach().clone().to(torch.int32)
+            self._cached_pair_counts = cached_counts.detach().clone().to(torch.int64)
         else:
             self._cached_pair_keys = torch.empty((0,), dtype=torch.long)
-            self._cached_pair_counts = torch.empty((0,), dtype=torch.int32)
+            self._cached_pair_counts = torch.empty((0,), dtype=torch.int64)
             self._hist_cache_valid = False
         if self._hist_cache_valid:
             self._refresh_top_pairs_from_cache()
@@ -1245,7 +1245,7 @@ class GPUBPETrainer:
 
     def _reset_histogram_cache(self) -> None:
         self._cached_pair_keys = torch.empty((0,), dtype=torch.long)
-        self._cached_pair_counts = torch.empty((0,), dtype=torch.int32)
+        self._cached_pair_counts = torch.empty((0,), dtype=torch.int64)
         self._hist_cache_valid = False
         self._force_recount = True
         self._reset_top_pairs()
@@ -1275,7 +1275,7 @@ class GPUBPETrainer:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if span_mask.numel() == 0:
             empty_keys = torch.empty((0,), dtype=torch.long)
-            empty_counts = torch.empty((0,), dtype=torch.int32)
+            empty_counts = torch.empty((0,), dtype=torch.int64)
             return (
                 empty_keys,
                 empty_counts,
@@ -1296,21 +1296,21 @@ class GPUBPETrainer:
             remove_keys = (pre_lhs[remove_mask].to(torch.long) << 32) | pre_rhs[remove_mask].to(torch.long)
             remove_keys = remove_keys.to(device=device)
             remove_counts = torch.ones(
-                (remove_keys.numel(),), dtype=torch.int32, device=device
+                (remove_keys.numel(),), dtype=torch.int64, device=device
             )
             remove_keys, remove_counts = aggregate_pair_keys(remove_keys, remove_counts)
         else:
             remove_keys = torch.empty((0,), dtype=torch.long, device=device)
-            remove_counts = torch.empty((0,), dtype=torch.int32, device=device)
+            remove_counts = torch.empty((0,), dtype=torch.int64, device=device)
 
         if add_mask.any():
             add_keys = (post_lhs[add_mask].to(torch.long) << 32) | post_rhs[add_mask].to(torch.long)
             add_keys = add_keys.to(device=device)
-            add_counts = torch.ones((add_keys.numel(),), dtype=torch.int32, device=device)
+            add_counts = torch.ones((add_keys.numel(),), dtype=torch.int64, device=device)
             add_keys, add_counts = aggregate_pair_keys(add_keys, add_counts)
         else:
             add_keys = torch.empty((0,), dtype=torch.long, device=device)
-            add_counts = torch.empty((0,), dtype=torch.int32, device=device)
+            add_counts = torch.empty((0,), dtype=torch.int64, device=device)
 
         return remove_keys, remove_counts, add_keys, add_counts
 
@@ -2003,7 +2003,7 @@ class GPUBPETrainer:
                         (0, 2), dtype=x_snapshot.dtype, device=cpu_device
                     )
                     pair_counts_workspace = torch.empty(
-                        (0,), dtype=torch.int32, device=cpu_device
+                        (0,), dtype=torch.int64, device=cpu_device
                     )
                 else:
                     if (
@@ -2017,10 +2017,10 @@ class GPUBPETrainer:
                     if (
                         pair_counts_workspace is None
                         or pair_counts_workspace.shape[0] != capacity
-                        or pair_counts_workspace.dtype != torch.int32
+                        or pair_counts_workspace.dtype != torch.int64
                     ):
                         pair_counts_workspace = torch.empty(
-                            (capacity,), dtype=torch.int32, device=cpu_device
+                            (capacity,), dtype=torch.int64, device=cpu_device
                         )
                 if (
                     pair_count_length_workspace is None
@@ -2043,10 +2043,10 @@ class GPUBPETrainer:
                     a_ids = pairs_view[:, 0].to(torch.long)
                     b_ids = pairs_view[:, 1].to(torch.long)
                     keys = ((a_ids << 32) | b_ids).to(torch.long)
-                    counts_cpu = counts_view.to(torch.int32)
+                    counts_cpu = counts_view.to(torch.int64)
                 else:
                     keys = torch.empty((0,), dtype=torch.long, device=cpu_device)
-                    counts_cpu = torch.empty((0,), dtype=torch.int32, device=cpu_device)
+                    counts_cpu = torch.empty((0,), dtype=torch.int64, device=cpu_device)
                 keys_cpu = keys.clone().to("cpu")
                 counts_cpu = counts_cpu.clone().to("cpu")
                 consumed.append(
@@ -2073,7 +2073,7 @@ class GPUBPETrainer:
                 )
             else:
                 reduced_keys = torch.empty((0,), dtype=torch.long)
-                reduced_counts = torch.empty((0,), dtype=torch.int32)
+                reduced_counts = torch.empty((0,), dtype=torch.int64)
 
             self._cached_pair_keys = reduced_keys.clone()
             self._cached_pair_counts = reduced_counts.clone()
@@ -2183,7 +2183,7 @@ class GPUBPETrainer:
                         )
                         if pair_keys is None or pair_counts is None:
                             pair_keys = torch.empty((0,), dtype=torch.long)
-                            pair_counts = torch.empty((0,), dtype=torch.int32)
+                            pair_counts = torch.empty((0,), dtype=torch.int64)
                         pair_keys, pair_counts = self._apply_histogram_delta(
                             pair_keys,
                             pair_counts,
@@ -2204,7 +2204,7 @@ class GPUBPETrainer:
                         pair_counts = (
                             pair_counts
                             if pair_counts is not None
-                            else torch.empty((0,), dtype=torch.int32)
+                            else torch.empty((0,), dtype=torch.int64)
                         )
                     new_batches.append(
                         _pack_cpu_batch(
@@ -2329,7 +2329,7 @@ class GPUBPETrainer:
                                 keys_cpu, counts_cpu = count_pairs_fastpath(tokens_cpu, valid_cpu)
                                 if keys_cpu.numel() > 0:
                                     local_keys.append(keys_cpu.to(torch.long))
-                                    local_counts.append(counts_cpu.to(torch.int32))
+                                    local_counts.append(counts_cpu.to(torch.int64))
                                 if self._enable_histogram_cache:
                                     batch.pair_keys = keys_cpu.clone()
                                     batch.pair_counts = counts_cpu.clone()
@@ -2435,7 +2435,7 @@ class GPUBPETrainer:
                             if length <= 0:
                                 if self._enable_histogram_cache:
                                     shard.pair_keys = torch.empty((0,), dtype=torch.long)
-                                    shard.pair_counts = torch.empty((0,), dtype=torch.int32)
+                                    shard.pair_counts = torch.empty((0,), dtype=torch.int64)
                                 continue
                             assert shard.pair_keys_buffer is not None
                             assert shard.pair_counts_buffer is not None
@@ -2445,10 +2445,10 @@ class GPUBPETrainer:
                             b_ids = pairs_view[:, 1].to(torch.long)
                             keys = (a_ids << 32) | b_ids
                             local_keys.append(keys)
-                            local_counts.append(counts_view.to(torch.int32))
+                            local_counts.append(counts_view.to(torch.int64))
                             if self._enable_histogram_cache:
                                 shard.pair_keys = keys.to(torch.long).to("cpu")
-                                shard.pair_counts = counts_view.to(torch.int32).to("cpu")
+                                shard.pair_counts = counts_view.to(torch.int64).to("cpu")
                     if local_keys and local_counts:
                         combined_keys = torch.cat(local_keys, dim=0)
                         combined_counts = torch.cat(local_counts, dim=0)
@@ -2463,10 +2463,10 @@ class GPUBPETrainer:
                     ]
                     if reduced_keys is None or reduced_counts is None:
                         cached_keys = torch.empty((0,), dtype=torch.long)
-                        cached_counts = torch.empty((0,), dtype=torch.int32)
+                        cached_counts = torch.empty((0,), dtype=torch.int64)
                     else:
                         cached_keys = reduced_keys.to(torch.long).to("cpu")
-                        cached_counts = reduced_counts.to(torch.int32).to("cpu")
+                        cached_counts = reduced_counts.to(torch.int64).to("cpu")
                     self._cached_pair_keys = cached_keys.clone()
                     self._cached_pair_counts = cached_counts.clone()
                     self._hist_cache_valid = True
@@ -2597,7 +2597,7 @@ class GPUBPETrainer:
                                         )
                                         if shard.pair_keys is None or shard.pair_counts is None:
                                             shard.pair_keys = torch.empty((0,), dtype=torch.long)
-                                            shard.pair_counts = torch.empty((0,), dtype=torch.int32)
+                                            shard.pair_counts = torch.empty((0,), dtype=torch.int64)
                                         shard.pair_keys, shard.pair_counts = self._apply_histogram_delta(
                                             shard.pair_keys,
                                             shard.pair_counts,
@@ -2614,7 +2614,7 @@ class GPUBPETrainer:
                                         if shard.pair_keys is None:
                                             shard.pair_keys = torch.empty((0,), dtype=torch.long)
                                         if shard.pair_counts is None:
-                                            shard.pair_counts = torch.empty((0,), dtype=torch.int32)
+                                            shard.pair_counts = torch.empty((0,), dtype=torch.int64)
                                     compute_event = torch.cuda.Event(blocking=False)
                                     compute_event.record(ctx.compute_stream)
                                 shard.mark_device_event(compute_event)
