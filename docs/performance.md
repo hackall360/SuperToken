@@ -49,6 +49,12 @@ WORLD_SIZE=4 torchrun --nproc_per_node=4 \
     python -m gpu_tokenizer.cli_train_bpe --merges 10000 --devices cuda
 ```
 
+The CLI automatically shards the expanded ``--data`` glob list by rank. When
+launched with ``torchrun`` or any other launcher that initializes
+``torch.distributed`` (or sets ``RANK``/``WORLD_SIZE``), each process only reads
+its assigned subset of shards, eliminating redundant disk I/O during
+multi-worker training.
+
 Each rank must contribute identically shaped tensors to the reduction; the
 trainer handles padding internally, so no additional user code is required
 beyond the distributed initialization.
