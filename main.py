@@ -39,6 +39,22 @@ __all__ = [
 def _load_sequences(
     paths: Iterable[Path], bos: int | None, eos: int | None
 ) -> Iterator[Iterator[int]]:
+    """Stream token sequences from ``paths`` using a :class:`BytePacker`.
+
+    Args:
+        paths: Iterable of shard file paths to open and encode.
+        bos: Optional beginning-of-sequence token id to prefix onto each document.
+        eos: Optional end-of-sequence token id to suffix onto each document.
+
+    Returns:
+        Iterator that yields iterators over integer token ids for each encoded
+        document in the provided shards.
+
+    Side Effects:
+        Opens :class:`MemoryMappedShard` instances for the lifetime of the
+        returned iterator so that shard data remains memory-mapped while being
+        consumed.
+    """
     packer = BytePacker(bos=bos, eos=eos)
 
     def _generator() -> Iterator[Iterator[int]]:
@@ -51,6 +67,19 @@ def _load_sequences(
 
 
 def _expand_data_patterns(patterns: Sequence[str]) -> list[Path]:
+    """Resolve glob ``patterns`` into a concrete list of readable files.
+
+    Args:
+        patterns: Glob expressions pointing at data shards.
+
+    Returns:
+        List of unique file paths that matched at least one pattern in the
+        order they were discovered.
+
+    Side Effects:
+        Raises :class:`SystemExit` when no files are found so the caller can
+        surface a user-facing error immediately.
+    """
     files: list[Path] = []
     for pattern in patterns:
         for path in glob.glob(pattern, recursive=True):
@@ -67,6 +96,17 @@ def _iter_packed_batches(
     batch_size: int,
     seed: int,
 ) -> Iterable[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Construct a streaming batch iterator backed by :class:`PackedBatcher`.
+
+    Args:
+        sequences: Tokenized documents to be batched.
+        batch_size: Maximum number of documents per batch.
+        seed: Shuffle seed forwarded to :class:`PackedBatcher` for determinism.
+
+    Returns:
+        Iterable that yields ``(tokens, mask, lengths)`` tensors suitable for
+        GPU consumption.
+    """
     return PackedBatcher(sequences, batch_size=batch_size, seed=seed)
 
 
@@ -75,11 +115,40 @@ def _build_unigram_batches(
     batch_size: int,
     seed: int,
 ) -> list[torch.Tensor]:
+    """Materialize packed token batches for the unigram trainer.
+
+    Args:
+        sequences: Tokenized documents to feed into the unigram objective.
+        batch_size: Number of documents per packed batch.
+        seed: Shuffle seed used to stabilize batch ordering.
+
+    Returns:
+        List of ``torch.Tensor`` batches representing the token payload for
+        each packed batch.
+
+    Side Effects:
+        Loads the entire packed representation into memory so batches can be
+        replayed across epochs without rebuilding.
+    """
     packed = PackedBatcher(sequences, batch_size=batch_size, seed=seed)
     return [x for (x, _mask, _lengths) in packed]
 
 
 def _cmd_benchmark(args: argparse.Namespace) -> None:
+    """Run synthetic and real-corpus benchmarks and emit a serialized report.
+
+    Args:
+        args: Parsed CLI arguments configuring synthetic data, datasets, and
+            trainer hyper-parameters.
+
+    Returns:
+        ``None``. Results are printed and written to disk.
+
+    Side Effects:
+        Generates synthetic corpora when requested, reads optional datasets,
+        writes benchmark summaries under ``args.output_dir``, and prints a
+        human-readable summary to stdout.
+    """
     sequences: list[list[int]] = []
     sources: list[dict[str, object]] = []
 
@@ -173,6 +242,22 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
 
 
 def _cmd_train_bpe(args: argparse.Namespace) -> None:
+    """Train a GPU-accelerated BPE model with autoscaling batch management.
+
+    Args:
+        args: Parsed CLI arguments describing data sources, autoscaler targets,
+            checkpointing configuration, and trainer hyper-parameters.
+
+    Returns:
+        ``None``. Progress and metadata are surfaced via stdout and optional
+        checkpoint directories.
+
+    Side Effects:
+        Uses :class:`AutoScaler` suggestions to resize the active batch size,
+        starts a :class:`CorpusStreamer` that must be closed when training
+        completes, and loads/saves checkpoints when ``--resume-from`` or
+        ``--checkpoint-dir`` are provided.
+    """
     data_files = _expand_data_patterns(args.data)
     autoscaler = AutoScaler(
         target_util=args.target_util,
@@ -355,6 +440,20 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
 
 
 def _cmd_train_unigram(args: argparse.Namespace) -> None:
+    """Train a unigram tokenizer model over prepacked batches.
+
+    Args:
+        args: Parsed CLI arguments providing data patterns, batching options,
+            and model hyper-parameters.
+
+    Returns:
+        ``None``. Training progress is printed for each epoch and the trained
+        state is optionally saved to disk.
+
+    Side Effects:
+        Loads all packed batches into host memory and writes the trained model
+        to ``args.out_dir`` when provided.
+    """
     data_files = _expand_data_patterns(args.data)
     sequences = _load_sequences(data_files, bos=args.bos, eos=args.eos)
 
@@ -373,6 +472,15 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
 
 
 def _parser() -> argparse.ArgumentParser:
+    """Build the CLI parser that exposes training and benchmarking commands.
+
+    Returns:
+        Configured :class:`argparse.ArgumentParser` with subcommands registered
+        for ``train-bpe``, ``train-unigram``, and ``benchmark``.
+
+    Side Effects:
+        None.
+    """
     parser = argparse.ArgumentParser(description="GPU tokenizer toolkit")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
