@@ -52,6 +52,26 @@ python main.py train-bpe \
   --out-dir ./artifacts/bpe
 ```
 
+Need resilience against interruptions? The BPE trainer now supports periodic checkpointing and seamless resume:
+
+```bash
+python main.py train-bpe \
+  --data "data/**/*.txt" \
+  --merges 50000 \
+  --checkpoint-dir ./artifacts/bpe-checkpoints \
+  --checkpoint-every 2000
+
+# Later, continue from the most recent checkpoint:
+python main.py train-bpe \
+  --data "data/**/*.txt" \
+  --merges 50000 \
+  --resume-from ./artifacts/bpe-checkpoints \
+  --checkpoint-dir ./artifacts/bpe-checkpoints \
+  --checkpoint-every 2000
+```
+
+The CLI will restore the autoscaler state, on-device batches, and resume streaming where it left off while logging each checkpoint save/restore event.
+
 Train a unigram model with a fixed vocabulary size:
 
 ```bash
