@@ -27,6 +27,11 @@ from .dtypes import (
 )
 from .utils import aggregate_pair_keys, apply_merge_once, count_pairs, reduce_pair_histograms
 
+try:  # pragma: no cover - optional dependency
+    from tokenizers import Tokenizer as _HFTokenizer
+except Exception:  # pragma: no cover - optional dependency in CI
+    _HFTokenizer = None
+
 
 UINT32_MAX = (1 << 32) - 1
 
@@ -416,6 +421,93 @@ class CPUFallbackBatch:
             shards[device] = record
             start = end
         return cls(shards)
+
+class GPUBPETokenizer:
+    """Runtime tokenizer compatible with Hugging Face `tokenizers.Tokenizer`."""
+
+    def __init__(
+        self,
+        tokenizer: "_HFTokenizer",
+        *,
+        config: dict[str, object],
+        vocab: dict[str, int],
+        merges: list[str],
+        artifact_path: str | None = None,
+    ) -> None:
+        if tokenizer is None:
+            raise RuntimeError(
+                "The `tokenizers` library is required to construct GPUBPETokenizer"
+            )
+        self._tokenizer = tokenizer
+        # Store deep copies to avoid accidental mutation from callers.
+        self.config = json.loads(json.dumps(config))
+        self.vocab = dict(vocab)
+        self.merges = list(merges)
+        self.artifact_path = artifact_path
+
+    @staticmethod
+    def _require_tokenizers() -> None:
+        if _HFTokenizer is None:
+            raise RuntimeError(
+                "The `tokenizers` library is required to use GPUBPETokenizer"
+            )
+
+    @classmethod
+    def from_config(cls, config: dict[str, object]) -> "GPUBPETokenizer":
+        """Instantiate a tokenizer directly from an in-memory config."""
+
+        cls._require_tokenizers()
+        tokenizer = _HFTokenizer.from_str(json.dumps(config))  # type: ignore[union-attr]
+        model_cfg = dict(config.get("model", {}))
+        vocab = dict(model_cfg.get("vocab", {}))
+        merges = list(model_cfg.get("merges", []))
+        return cls(
+            tokenizer,
+            config=config,
+            vocab=vocab,
+            merges=merges,
+        )
+
+    @classmethod
+    def from_file(cls, path: str) -> "GPUBPETokenizer":
+        """Load tokenizer artifacts saved via :class:`GPUBPETrainer`."""
+
+        cls._require_tokenizers()
+        tokenizer = _HFTokenizer.from_file(path)  # type: ignore[union-attr]
+        with open(path, "r", encoding="utf-8") as handle:
+            config = json.load(handle)
+        model_cfg = dict(config.get("model", {}))
+        vocab = dict(model_cfg.get("vocab", {}))
+        merges = list(model_cfg.get("merges", []))
+        return cls(
+            tokenizer,
+            config=config,
+            vocab=vocab,
+            merges=merges,
+            artifact_path=os.fspath(path),
+        )
+
+    def encode(self, *args, **kwargs):
+        """Encode text using the wrapped Hugging Face tokenizer."""
+
+        self._require_tokenizers()
+        return self._tokenizer.encode(*args, **kwargs)
+
+    def decode(self, *args, **kwargs):
+        """Decode token ids back into text."""
+
+        self._require_tokenizers()
+        return self._tokenizer.decode(*args, **kwargs)
+
+    @property
+    def tokenizer(self) -> "_HFTokenizer":
+        """Expose the underlying Hugging Face tokenizer instance."""
+
+        return self._tokenizer
+
+    def __getattr__(self, name: str):  # pragma: no cover - passthrough to HF tokenizer
+        return getattr(self._tokenizer, name)
+
 
 class GPUBPETrainer:
     """Train byte-pair encodings on the GPU."""
@@ -3125,23 +3217,24 @@ class GPUBPETrainer:
             "telemetry": telemetry_summary,
         }
 
-    def save(self, out_dir: str) -> None:
-        os.makedirs(out_dir, exist_ok=True)
+    @staticmethod
+    def _bytes_to_unicode() -> dict[int, str]:
+        """Mirror the mapping used by Hugging Face's ByteLevel BPE."""
 
-        def _bytes_to_unicode() -> dict[int, str]:
-            """Mirror the mapping used by Hugging Face's ByteLevel BPE."""
+        bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+        cs = bs[:]
+        n = 0
+        for b in range(256):
+            if b not in bs:
+                bs.append(b)
+                cs.append(256 + n)
+                n += 1
+        return {b: chr(c) for b, c in zip(bs, cs)}
 
-            bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
-            cs = bs[:]
-            n = 0
-            for b in range(256):
-                if b not in bs:
-                    bs.append(b)
-                    cs.append(256 + n)
-                    n += 1
-            return {b: chr(c) for b, c in zip(bs, cs)}
-
-        byte_encoder = _bytes_to_unicode()
+    def _build_tokenizer_artifacts(
+        self,
+    ) -> tuple[dict[str, int], list[str], dict[str, object]]:
+        byte_encoder = self._bytes_to_unicode()
         token_strings: list[str] = []
         added_tokens: list[dict[str, object]] = []
         for token_id in range(self.base_vocab):
@@ -3174,7 +3267,6 @@ class GPUBPETrainer:
 
         expected_vocab = self.base_vocab + len(self.merges)
         if self.vocab_size != expected_vocab:
-            # The tokenizer export expects an exact vocab → id mapping
             raise ValueError(
                 "Mismatch between vocab_size and merges: "
                 f"expected {expected_vocab}, found {self.vocab_size}"
@@ -3185,18 +3277,6 @@ class GPUBPETrainer:
             f"{token_strings[left]} {token_strings[right]}"
             for left, right in self.merges
         ]
-
-        vocab_path = os.path.join(out_dir, "vocab.json")
-        merges_path = os.path.join(out_dir, "merges.txt")
-        tokenizer_path = os.path.join(out_dir, "tokenizer.json")
-
-        with open(vocab_path, "w", encoding="utf-8") as f:
-            json.dump(vocab, f, ensure_ascii=False)
-
-        with open(merges_path, "w", encoding="utf-8") as f:
-            f.write("#version: 0.2\n")
-            for merge in merges:
-                f.write(f"{merge}\n")
 
         tokenizer_config = {
             "version": "1.0",
@@ -3225,21 +3305,69 @@ class GPUBPETrainer:
             },
         }
 
-        with open(tokenizer_path, "w", encoding="utf-8") as f:
-            json.dump(tokenizer_config, f, ensure_ascii=False)
+        return vocab, merges, tokenizer_config
+
+    def _write_tokenizer_artifacts(
+        self,
+        out_dir: str,
+        vocab: dict[str, int],
+        merges: list[str],
+        tokenizer_config: dict[str, object],
+    ) -> dict[str, str]:
+        os.makedirs(out_dir, exist_ok=True)
+
+        vocab_path = os.path.join(out_dir, "vocab.json")
+        merges_path = os.path.join(out_dir, "merges.txt")
+        tokenizer_path = os.path.join(out_dir, "tokenizer.json")
+        meta_path = os.path.join(out_dir, "bpe_merges.json")
+
+        with open(vocab_path, "w", encoding="utf-8") as handle:
+            json.dump(vocab, handle, ensure_ascii=False)
+
+        with open(merges_path, "w", encoding="utf-8") as handle:
+            handle.write("#version: 0.2\n")
+            for merge in merges:
+                handle.write(f"{merge}\n")
+
+        with open(tokenizer_path, "w", encoding="utf-8") as handle:
+            json.dump(tokenizer_config, handle, ensure_ascii=False)
 
         meta = {
             "base_vocab": self.base_vocab,
             "vocab_size": self.vocab_size,
             "merges": self.merges,
         }
-        with open(os.path.join(out_dir, "bpe_merges.json"), "w", encoding="utf-8") as f:
-            json.dump(meta, f)
+        with open(meta_path, "w", encoding="utf-8") as handle:
+            json.dump(meta, handle)
 
+        return {
+            "vocab": vocab_path,
+            "merges": merges_path,
+            "tokenizer": tokenizer_path,
+            "metadata": meta_path,
+        }
+
+    def export_tokenizer(self, out_dir: str | None = None) -> GPUBPETokenizer:
+        """Create a :class:`GPUBPETokenizer` from the current trainer state."""
+
+        vocab, merges, tokenizer_config = self._build_tokenizer_artifacts()
+        if out_dir is not None:
+            paths = self._write_tokenizer_artifacts(out_dir, vocab, merges, tokenizer_config)
+            return GPUBPETokenizer.from_file(paths["tokenizer"])
+        if _HFTokenizer is None:
+            raise RuntimeError(
+                "The `tokenizers` library is required for in-memory export; "
+                "provide `out_dir` to persist artifacts instead."
+            )
+        return GPUBPETokenizer.from_config(tokenizer_config)
+
+    def save(self, out_dir: str) -> None:
+        vocab, merges, tokenizer_config = self._build_tokenizer_artifacts()
+        paths = self._write_tokenizer_artifacts(out_dir, vocab, merges, tokenizer_config)
         print(
             "Saved tokenizer artifacts → "
-            f"{vocab_path}, {merges_path}, {tokenizer_path}"
+            f"{paths['vocab']}, {paths['merges']}, {paths['tokenizer']}"
         )
 
 
-__all__ = ["GPUBPETrainer"]
+__all__ = ["GPUBPETokenizer", "GPUBPETrainer"]
