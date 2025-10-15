@@ -17,6 +17,7 @@ SuperToken is a GPU-accelerated tokenizer toolkit that offers high-throughput by
 - [Quick Start](#quick-start)
 - [Command Reference](#command-reference)
 - [Benchmarking](#benchmarking)
+- [Architecture & API Overview](#architecture--api-overview)
 - [Project Layout](#project-layout)
 - [Documentation](#documentation)
 - [Contributing](#contributing)
@@ -129,6 +130,20 @@ Common flags include:
 
 Run `python main.py --help` for a full list of options.
 
+## Architecture & API Overview
+
+SuperToken is organized into modular layers that can be reused independently or combined through the CLI:
+
+- **Autoscaling (`gpu_tokenizer.autoscaler`)** – Provides the `AutoScaler` class that tracks throughput telemetry and surfaces `suggest_batch_size` helpers for trainers. See the inline docstrings in [`gpu_tokenizer/autoscaler.py`](gpu_tokenizer/autoscaler.py) for configuration knobs and extension hooks around utilization targets.
+- **BPE training (`gpu_tokenizer.bpe_trainer`)** – Implements `GPUBPETrainer`, merging heuristics, and checkpoint serialization. This module integrates directly with the autoscaler and exposes hooks for custom merge filters; refer to [`gpu_tokenizer/bpe_trainer.py`](gpu_tokenizer/bpe_trainer.py).
+- **Unigram training (`gpu_tokenizer.unigram_trainer`)** – Offers `GPUUnigramTrainer` plus scoring utilities for probabilistic vocabularies. Docstrings in [`gpu_tokenizer/unigram_trainer.py`](gpu_tokenizer/unigram_trainer.py) describe how to plug in custom smoothing or constraint logic.
+- **Datasets & packing (`gpu_tokenizer.datasets`)** – Houses streaming dataset abstractions, packing helpers, and synthetic corpus generators used by both trainers. See [`gpu_tokenizer/datasets/__init__.py`](gpu_tokenizer/datasets/__init__.py) and the submodules it re-exports.
+- **I/O pipeline (`gpu_tokenizer.io`)** – Encapsulates shard decoding, compression handling, and background workers. Start with [`gpu_tokenizer/io/__init__.py`](gpu_tokenizer/io/__init__.py) and follow the module-level docs for extension points.
+- **CLI composition (`main.py`)** – Declares the `train-bpe`, `train-unigram`, and `benchmark` subcommands. You can register new commands by extending the `build_parser` function and wiring your trainers to the shared autoscaler utilities.
+- **Benchmark utilities (`benchmarks/`)** – Contains reusable benchmarking harnesses and report formatters. Module docstrings point to upcoming narrative guides under `docs/benchmarks/` for more complex scenarios.
+
+Future deep dives will land in the `docs/` directory (see [`docs/architecture.md`](docs/architecture.md)) and will mirror the high-level flow described here.
+
 ## Project Layout
 ```
 .
@@ -139,10 +154,9 @@ Run `python main.py --help` for a full list of options.
 ```
 
 ## Documentation
-- [Architecture overview](docs/architecture.md): High-level map of the CLI, core modules, and benchmarks so you can navigate th
-e codebase quickly.
-- [Performance notes and benchmarks](docs/performance.md): Guidance on measuring throughput, interpreting telemetry, and tuning
- GPU utilization.
+- [Architecture & API Overview](#architecture--api-overview): Start here for a quick summary of major modules, CLI extension points, and benchmarking utilities.
+- [Architecture overview](docs/architecture.md): High-level map of the CLI, core modules, and benchmarks so you can navigate the codebase quickly.
+- [Performance notes and benchmarks](docs/performance.md): Guidance on measuring throughput, interpreting telemetry, and tuning GPU utilization.
 
 Additional guides and API notes can be added under the `docs/` directory as the project grows.
 
