@@ -32,6 +32,21 @@ class CorpusSummary:
 
 
 def _ensure_trainers_available() -> None:
+    """Validate that GPU-backed trainer classes were successfully imported.
+
+    Returns
+    -------
+    None
+        The function exists purely for its side effect of raising when the
+        trainers cannot be used.
+
+    Raises
+    ------
+    RuntimeError
+        Raised when either :class:`GPUBPETrainer` or :class:`GPUUnigramTrainer`
+        resolved to ``None`` because PyTorch lacks CUDA support.
+    """
+
     if GPUBPETrainer is None or GPUUnigramTrainer is None:  # type: ignore[truthy-function]
         raise RuntimeError(
             "Both GPUBPETrainer and GPUUnigramTrainer require torch with GPU support."
@@ -76,8 +91,9 @@ def synthesize_corpus(
     Returns
     -------
     list[list[int]]
-        A list containing one integer sequence per generated document. The list
-        is empty if ``documents`` is ``0`` or negative.
+        A list containing one integer sequence per generated document. Each
+        inner list represents a 1D token vector whose length matches the sampled
+        document length. The list is empty if ``documents`` is ``0`` or negative.
 
     Side Effects
     ------------
@@ -124,6 +140,8 @@ def _iter_shard_sequences(
     -------
     Iterator[list[int]]
         Iterator producing one list of integer token IDs per stored sequence.
+        Each yielded list corresponds to a packed shard record decoded into a
+        1D CPU tensor before conversion to Python integers.
 
     Notes
     -----
@@ -167,8 +185,9 @@ def load_real_corpus(
     Returns
     -------
     list[list[int]]
-        Token sequences decoded from the provided shards. The order matches the
-        order of ``paths``.
+        Token sequences decoded from the provided shards. Each sequence is a 1D
+        list of integer token IDs, and the outer list preserves the order of
+        ``paths``.
 
     Side Effects
     ------------
@@ -192,6 +211,8 @@ def load_real_corpus(
         return []
     packer = BytePacker(bos=bos, eos=eos)
     sequences: list[list[int]] = []
+    # ExitStack ensures shards are closed in LIFO order even if iteration
+    # exits early, so we acquire it before touching any filesystem resources.
     with ExitStack() as stack:
         for path in paths:
             shard = stack.enter_context(MemoryMappedShard(path))
@@ -222,7 +243,8 @@ def summarize_corpus(
     -------
     CorpusSummary
         Dataclass containing the number of sequences, total token count, the
-        maximum sequence length, and the preserved ``sources`` metadata.
+        maximum sequence length, and the preserved ``sources`` metadata. The
+        ``max_length`` field reflects the maximum 1D sequence length in tokens.
 
     Side Effects
     ------------
@@ -270,7 +292,10 @@ def _build_bpe_batches(
     Returns
     -------
     PackedBatcher
-        The ready-to-iterate batcher.
+        The ready-to-iterate batcher. Iterating yields ``(tokens, valid,
+        lengths)`` tuples where ``tokens`` is a 2D tensor shaped ``[batch,
+        max_tokens]`` representing packed sequences on the CPU, ``valid`` masks
+        padding positions, and ``lengths`` contains per-sequence lengths.
 
     Side Effects
     ------------
@@ -308,9 +333,10 @@ def _build_unigram_batches(
     Returns
     -------
     list[torch.Tensor]
-        List of cloned token tensors, one per packed batch. Cloning detaches the
-        tensors from the underlying memory map so that the unigram trainer can
-        freely modify them.
+        List of cloned 2D token tensors shaped ``[batch, max_tokens]`` with
+        sequences laid out row-wise. Cloning detaches the tensors from the
+        underlying memory map so that the unigram trainer can freely modify
+        their contents in-place.
 
     Side Effects
     ------------
@@ -369,7 +395,9 @@ def run_bpe_benchmark(
     -------
     dict[str, object]
         Dictionary capturing the configuration, wall-clock time in seconds, and
-        the metadata returned by :meth:`GPUBPETrainer.fit`.
+        the metadata returned by :meth:`GPUBPETrainer.fit`. The batches are
+        produced deterministically given ``seed`` to keep benchmark runs
+        reproducible.
 
     Side Effects
     ------------
@@ -413,6 +441,8 @@ def run_bpe_benchmark(
         device=device,
         autoscaler=autoscaler,
     )
+    # Capture the high-resolution wall-clock before invoking GPU work so the
+    # elapsed timing includes the entire training call.
     wall_start = time.perf_counter()
     meta = trainer.fit(batches, log_every=log_every)
     wall_time = time.perf_counter() - wall_start
@@ -465,7 +495,9 @@ def run_unigram_benchmark(
     -------
     dict[str, object]
         Dictionary containing the configuration, wall-clock time in seconds, and
-        per-epoch metrics returned from :meth:`GPUUnigramTrainer.fit_epoch`.
+        per-epoch metrics returned from :meth:`GPUUnigramTrainer.fit_epoch`. The
+        deterministic batching seeded by ``seed`` ensures consistent epoch
+        ordering across runs.
 
     Side Effects
     ------------
@@ -506,6 +538,8 @@ def run_unigram_benchmark(
         seed=seed,
     )
     batches = _build_unigram_batches(sequences, batch_size=batch_size, seed=seed)
+    # Start measuring wall-clock time immediately before the epoch loop so the
+    # reported duration covers every iteration and synchronization point.
     wall_start = time.perf_counter()
     epoch_metrics: list[dict[str, object]] = []
     for epoch in range(epochs):
