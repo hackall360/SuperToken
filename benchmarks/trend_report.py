@@ -41,6 +41,25 @@ class TrendPoint:
 
 
 def _load_point(path: Path) -> TrendPoint:
+    """Parse a benchmark JSON snapshot into a :class:`TrendPoint`.
+
+    Parameters
+    ----------
+    path:
+        Path to a ``benchmark_*.json`` file produced by the benchmarking
+        harness.
+
+    Returns
+    -------
+    TrendPoint
+        Structured representation of the raw metrics contained in ``path``.
+
+    Notes
+    -----
+    The payload is expected to contain ``timestamp``, ``corpus.tokens``,
+    ``bpe.wall_time_s``, and ``unigram.wall_time_s`` fields. When the timestamp
+    is missing or uses an unknown format we fall back to the file's mtime.
+    """
     payload = json.loads(path.read_text(encoding="utf-8"))
     timestamp_raw = payload.get("timestamp")
     try:
@@ -60,18 +79,67 @@ def _load_point(path: Path) -> TrendPoint:
 
 
 def load_history(inputs: Iterable[Path]) -> list[TrendPoint]:
+    """Load and sort a collection of benchmark points.
+
+    Parameters
+    ----------
+    inputs:
+        Iterable of :class:`pathlib.Path` objects pointing at benchmark JSON
+        snapshots.
+
+    Returns
+    -------
+    list[TrendPoint]
+        Benchmark points sorted chronologically and secondarily by filename to
+        provide a stable ordering.
+    """
     points = [_load_point(path) for path in inputs]
     points.sort(key=lambda p: (p.timestamp, p.source.name))
     return points
 
 
 def _format_value(value: float | None) -> str:
+    """Render floating point metrics for inclusion in Markdown tables.
+
+    Parameters
+    ----------
+    value:
+        Numeric value to render. ``None`` is treated as unavailable data.
+
+    Returns
+    -------
+    str
+        Human-friendly string, formatted to two decimal places or ``"n/a"``
+        when ``value`` is ``None``.
+    """
     if value is None:
         return "n/a"
     return f"{value:,.2f}"
 
 
 def render_table(points: Sequence[TrendPoint], output: Path) -> Path:
+    """Write a Markdown table summarising benchmark runs.
+
+    Parameters
+    ----------
+    points:
+        Ordered sequence of :class:`TrendPoint` items to tabulate.
+    output:
+        Destination :class:`pathlib.Path` whose contents will be replaced with
+        a Markdown ``.md`` document.
+
+    Returns
+    -------
+    Path
+        The ``output`` path, allowing for method chaining in calling code.
+
+    Notes
+    -----
+    The table contains token counts, wall-clock durations, and derived tokens
+    per second metrics for both the BPE and unigram trainers. When ``points``
+    is empty the file contains the sentence ``_No benchmarks found._`` for
+    easier downstream rendering.
+    """
     headers = [
         "Timestamp",
         "Tokens",
@@ -100,6 +168,27 @@ def render_table(points: Sequence[TrendPoint], output: Path) -> Path:
 
 
 def render_plot(points: Sequence[TrendPoint], output: Path) -> Path:
+    """Create a PNG line chart visualising throughput over time.
+
+    Parameters
+    ----------
+    points:
+        Ordered sequence of benchmark points that provide tokens-per-second
+        values for the BPE and unigram trainers.
+    output:
+        Destination :class:`pathlib.Path` where a PNG image will be written.
+
+    Returns
+    -------
+    Path
+        The ``output`` path, allowing callers to reference the saved image.
+
+    Notes
+    -----
+    The module configures matplotlib to use the ``Agg`` backend so the plot can
+    be rendered in headless environments. When ``points`` is empty an empty
+    file is produced so downstream automation can detect the absence of data.
+    """
     if not points:
         output.write_bytes(b"")
         return output
@@ -124,6 +213,16 @@ def render_plot(points: Sequence[TrendPoint], output: Path) -> Path:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Construct the CLI argument parser for the trend reporting utility.
+
+    Returns
+    -------
+    argparse.ArgumentParser
+        Parser defining ``--input`` (directory of ``benchmark_*.json`` files),
+        ``--output-dir`` (destination directory), ``--table-name``, and
+        ``--plot-name`` options. All paths are interpreted relative to the
+        current working directory when invoked from the shell.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--input",
@@ -149,6 +248,27 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    """Entry point for generating Markdown and PNG trend reports.
+
+    Parameters
+    ----------
+    argv:
+        Optional sequence of command-line arguments. When ``None`` (the
+        default) ``argparse`` reads arguments from :data:`sys.argv`.
+
+    Notes
+    -----
+    The CLI can be invoked directly, for example::
+
+        python -m benchmarks.trend_report \
+            --input artifacts/benchmarks \
+            --output-dir artifacts/benchmarks/trends
+
+    The command expects ``benchmark_*.json`` files in ``--input`` and writes a
+    Markdown table, a PNG chart, and a ``trend_manifest.json`` manifest into
+    ``--output-dir``. The manifest records resolved input paths and the derived
+    metrics, which makes integration with automation pipelines easier.
+    """
     parser = build_parser()
     args = parser.parse_args(argv)
     input_dir = Path(args.input)
