@@ -24,7 +24,7 @@ def _allocate_pair_buffers(seqs: torch.Tensor):
     device = seqs.device
     dtype = seqs.dtype
     pair_keys_buffer = torch.empty((capacity, 2), dtype=dtype, device=device)
-    pair_counts_buffer = torch.empty((capacity,), dtype=torch.int32, device=device)
+    pair_counts_buffer = torch.empty((capacity,), dtype=torch.int64, device=device)
     pair_count_length = torch.zeros((1,), dtype=torch.long, device=device)
     return pair_keys_buffer, pair_counts_buffer, pair_count_length
 
@@ -50,12 +50,12 @@ def _cpu_reference_count_pairs(seqs: torch.Tensor, valid: torch.Tensor):
     if not counts:
         return (
             torch.empty((0, 2), dtype=seqs.dtype),
-            torch.empty((0,), dtype=torch.int32),
+            torch.empty((0,), dtype=torch.int64),
         )
 
     ordered_items = sorted(counts.items())
     pairs = torch.tensor([p for p, _ in ordered_items], dtype=seqs.dtype)
-    freq = torch.tensor([c for _, c in ordered_items], dtype=torch.int32)
+    freq = torch.tensor([c for _, c in ordered_items], dtype=torch.int64)
     return pairs, freq
 
 
@@ -83,6 +83,7 @@ def test_count_pairs_device_matches_input():
     assert length_buffer.device == seqs.device
     assert pairs.device == seqs.device
     assert counts.device == seqs.device
+    assert counts.dtype == torch.int64
 
     if torch.cuda.is_available():
         seqs_cuda = seqs.cuda()
@@ -150,48 +151,38 @@ def test_count_pairs_triton_outperforms_pytorch():
     assert triton_ms < pytorch_ms
 
 
-def test_count_pairs_saturates_and_logs(monkeypatch, caplog):
-    monkeypatch.setattr(utils, "INT32_MAX", 5)
-    caplog.set_level("WARNING", logger="gpu_tokenizer.utils")
-
+def test_count_pairs_emits_int64_counts():
     seqs = torch.ones((1, 12), dtype=torch.int32)
     valid = torch.ones_like(seqs, dtype=torch.uint8)
 
-    pairs, counts, _, _, _ = _run_count_pairs(seqs, valid)
+    _pairs, counts, _keys_buf, _counts_buf, _length_buf = _run_count_pairs(seqs, valid)
 
-    assert counts.dtype == torch.int32
-    assert counts.tolist() == [5]
-    assert any("count_pairs" in record.message for record in caplog.records)
+    assert counts.dtype == torch.int64
+    assert counts.tolist() == [11]
 
 
-def test_aggregate_pair_keys_saturates(monkeypatch, caplog):
-    monkeypatch.setattr(utils, "INT32_MAX", 5)
-    caplog.set_level("WARNING", logger="gpu_tokenizer.utils")
-
-    keys = torch.tensor([1, 1, 1], dtype=torch.long)
-    counts = torch.tensor([4, 4, 4], dtype=torch.int64)
+def test_aggregate_pair_keys_preserves_large_counts():
+    base = 1 << 31
+    keys = torch.tensor([1, 1, 1, 2], dtype=torch.long)
+    counts = torch.tensor([base - 21, 10, 11, 5], dtype=torch.int64)
 
     aggregated_keys, aggregated_counts = aggregate_pair_keys(keys, counts)
 
-    assert aggregated_keys.tolist() == [1]
-    assert aggregated_counts.dtype == torch.int32
-    assert aggregated_counts.tolist() == [5]
-    assert any("aggregate_pair_keys" in record.message for record in caplog.records)
+    assert aggregated_keys.tolist() == [1, 2]
+    assert aggregated_counts.dtype == torch.int64
+    assert aggregated_counts.tolist() == [base, 5]
 
 
-def test_reduce_pair_histograms_matches_clipped_reference(monkeypatch, caplog):
-    monkeypatch.setattr(utils, "INT32_MAX", 5)
-    caplog.set_level("WARNING", logger="gpu_tokenizer.utils")
-
-    keys = torch.tensor([1, 2, 2, 3], dtype=torch.long)
-    counts = torch.tensor([3, 4, 4, 7], dtype=torch.int64)
+def test_reduce_pair_histograms_preserves_large_counts():
+    base = (1 << 31) + 7
+    keys = torch.tensor([1, 1, 1, 2], dtype=torch.long)
+    counts = torch.tensor([base - 5, 3, 2, base], dtype=torch.int64)
 
     reduced_keys, reduced_counts = reduce_pair_histograms(keys, counts)
 
-    assert reduced_keys.tolist() == [1, 2, 3]
-    assert reduced_counts.dtype == torch.int32
-    assert reduced_counts.tolist() == [3, 5, 5]
-    assert any("aggregate_pair_keys" in record.message for record in caplog.records)
+    assert reduced_keys.tolist() == [1, 2]
+    assert reduced_counts.dtype == torch.int64
+    assert reduced_counts.tolist() == [base, base]
 
 
 def _find_free_port() -> int:
@@ -262,8 +253,8 @@ def test_reduce_pair_histograms_single_node_world():
         torch.tensor([2, 4], dtype=torch.long),
     ]
     counts_payload = [
-        torch.tensor([3, 1, 2], dtype=torch.int32),
-        torch.tensor([2, 7], dtype=torch.int32),
+        torch.tensor([3, 1, 2], dtype=torch.int64),
+        torch.tensor([2, 7], dtype=torch.int64),
     ]
 
     world_size = len(keys_payload)
@@ -276,7 +267,7 @@ def test_reduce_pair_histograms_single_node_world():
     for payload in results.values():
         assert payload["keys"] == expected_keys
         assert payload["counts"] == expected_counts
-        assert payload["dtype"] == "torch.int32"
+        assert payload["dtype"] == "torch.int64"
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
@@ -288,10 +279,10 @@ def test_reduce_pair_histograms_multinode_hierarchy():
         torch.tensor([3, 4], dtype=torch.long),
     ]
     counts_payload = [
-        torch.tensor([2, 1, 5], dtype=torch.int32),
-        torch.tensor([1, 2], dtype=torch.int32),
-        torch.tensor([3, 1], dtype=torch.int32),
-        torch.tensor([4, 2], dtype=torch.int32),
+        torch.tensor([2, 1, 5], dtype=torch.int64),
+        torch.tensor([1, 2], dtype=torch.int64),
+        torch.tensor([3, 1], dtype=torch.int64),
+        torch.tensor([4, 2], dtype=torch.int64),
     ]
 
     def _env(rank: int):
@@ -313,7 +304,7 @@ def test_reduce_pair_histograms_multinode_hierarchy():
     for payload in results.values():
         assert payload["keys"] == expected_keys
         assert payload["counts"] == expected_counts
-        assert payload["dtype"] == "torch.int32"
+        assert payload["dtype"] == "torch.int64"
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
@@ -324,9 +315,9 @@ def test_reduce_pair_histograms_mixed_backend_topology():
         torch.tensor([7, 9, 9], dtype=torch.long),
     ]
     counts_payload = [
-        torch.tensor([1, 4], dtype=torch.int32),
-        torch.tensor([2, 3], dtype=torch.int32),
-        torch.tensor([5, 1, 2], dtype=torch.int32),
+        torch.tensor([1, 4], dtype=torch.int64),
+        torch.tensor([2, 3], dtype=torch.int64),
+        torch.tensor([5, 1, 2], dtype=torch.int64),
     ]
 
     def _env(rank: int):
@@ -347,4 +338,4 @@ def test_reduce_pair_histograms_mixed_backend_topology():
     for payload in results.values():
         assert payload["keys"] == expected_keys
         assert payload["counts"] == expected_counts
-        assert payload["dtype"] == "torch.int32"
+        assert payload["dtype"] == "torch.int64"

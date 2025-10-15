@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 
 from .cuda_kernels import apply_merge_and_compact as cuda_apply_merge_and_compact
-from .dtypes import clamp_lengths_to_dtype, promote_length_sum_dtype, INT32_MAX
+from .dtypes import clamp_lengths_to_dtype, promote_length_sum_dtype
 from .triton_kernels import (
     can_use_triton_count_pairs,
     count_pairs_histogram,
@@ -162,16 +162,16 @@ def _broadcast_histogram_to_local_ranks(
     if local_world_size == 1:
         return (
             keys_cpu.to(device=device, dtype=torch.long),
-            counts_cpu.to(device=device, dtype=torch.int32),
+            counts_cpu.to(device=device, dtype=torch.int64),
         )
 
     if local_rank == 0:
         keys_device = keys_cpu.to(device=device, dtype=torch.long)
-        counts_device = counts_cpu.to(device=device, dtype=torch.int32)
+        counts_device = counts_cpu.to(device=device, dtype=torch.int64)
         length_tensor = torch.tensor([keys_device.numel()], dtype=torch.long, device=device)
     else:
         keys_device = torch.empty((0,), dtype=torch.long, device=device)
-        counts_device = torch.empty((0,), dtype=torch.int32, device=device)
+        counts_device = torch.empty((0,), dtype=torch.int64, device=device)
         length_tensor = torch.zeros((1,), dtype=torch.long, device=device)
 
     dist.broadcast(length_tensor, src=node_leader, group=local_group)
@@ -179,7 +179,7 @@ def _broadcast_histogram_to_local_ranks(
 
     if local_rank != 0:
         keys_device = torch.empty((total_len,), dtype=torch.long, device=device)
-        counts_device = torch.empty((total_len,), dtype=torch.int32, device=device)
+        counts_device = torch.empty((total_len,), dtype=torch.int64, device=device)
     elif keys_device.numel() != total_len:
         keys_device = keys_device[:total_len]
         counts_device = counts_device[:total_len]
@@ -189,24 +189,21 @@ def _broadcast_histogram_to_local_ranks(
         dist.broadcast(counts_device, src=node_leader, group=local_group)
     else:
         keys_device = keys_device.new_empty((0,), dtype=torch.long)
-        counts_device = counts_device.new_empty((0,), dtype=torch.int32)
+        counts_device = counts_device.new_empty((0,), dtype=torch.int64)
 
     return keys_device, counts_device
 
 
-def _clamp_counts_to_int32(counts: torch.Tensor, context: str) -> torch.Tensor:
-    """Clamp ``counts`` to ``torch.int32`` while logging saturation."""
+def _ensure_counts_int64(counts: torch.Tensor, context: str) -> torch.Tensor:
+    """Promote ``counts`` to ``torch.int64`` while logging dtype changes."""
 
-    if counts.numel() == 0:
-        return counts.to(torch.int32)
+    if counts.dtype == torch.int64:
+        return counts
 
-    working = counts.to(torch.int64)
-    overflow = working > INT32_MAX
-    if overflow.any():
-        saturated = int(overflow.sum().item())
-        logger.warning("%s saturated %d entries at INT32_MAX", context, saturated)
-        working = torch.clamp(working, max=INT32_MAX)
-    return working.to(torch.int32)
+    promoted = counts.to(torch.int64)
+    if counts.numel() > 0 and counts.dtype != torch.int64:
+        logger.debug("%s promoted %d counts to int64", context, counts.numel())
+    return promoted
 
 
 def device_of(x: torch.Tensor) -> torch.device:
@@ -478,7 +475,7 @@ def _count_pairs_pytorch(
     next_indices[:-1] = run_indices[1:]
     next_indices[-1] = num_keys
     counts = next_indices - run_indices
-    counts = _clamp_counts_to_int32(counts, "count_pairs")
+    counts = _ensure_counts_int64(counts, "count_pairs")
 
     unique_keys = sorted_keys[run_indices]
     length = int(unique_keys.numel())
@@ -585,17 +582,16 @@ def aggregate_pair_keys(
     if keys.numel() == 0:
         if keys.dtype != torch.long:
             keys = keys.to(torch.long)
-        counts = _clamp_counts_to_int32(counts, "aggregate_pair_keys input")
+        counts = _ensure_counts_int64(counts, "aggregate_pair_keys input")
         return keys, counts
 
     device = keys.device
     keys = keys.to(torch.long)
-    counts = _clamp_counts_to_int32(counts, "aggregate_pair_keys input")
+    counts = _ensure_counts_int64(counts, "aggregate_pair_keys input")
 
     order = torch.argsort(keys)
     sorted_keys = keys[order]
-    sorted_counts32 = counts[order]
-    sorted_counts = sorted_counts32.to(torch.int64)
+    sorted_counts = counts[order]
 
     diff = torch.ones_like(sorted_keys, dtype=torch.bool)
     diff[1:] = sorted_keys[1:] != sorted_keys[:-1]
@@ -613,8 +609,7 @@ def aggregate_pair_keys(
         ]
     )
 
-    aggregated_counts64 = prefix[next_indices] - prefix[run_starts]
-    aggregated_counts = _clamp_counts_to_int32(aggregated_counts64, "aggregate_pair_keys")
+    aggregated_counts = prefix[next_indices] - prefix[run_starts]
     aggregated_keys = sorted_keys[run_starts]
     return aggregated_keys, aggregated_counts
 
@@ -662,7 +657,7 @@ def reduce_pair_histograms(
         max_len = max(lengths, default=0)
         if max_len == 0:
             node_keys = keys.new_empty((0,), dtype=torch.long)
-            node_counts = counts.new_empty((0,), dtype=torch.int32)
+            node_counts = counts.new_empty((0,), dtype=counts.dtype)
         else:
             pad_value = torch.iinfo(torch.long).max
             padded_keys = torch.full((max_len,), pad_value, dtype=torch.long, device=device)
@@ -679,7 +674,7 @@ def reduce_pair_histograms(
 
             if union_keys.numel() == 0:
                 node_keys = keys.new_empty((0,), dtype=torch.long)
-                node_counts = counts.new_empty((0,), dtype=torch.int32)
+                node_counts = counts.new_empty((0,), dtype=counts.dtype)
             else:
                 local_counts64 = torch.zeros((union_keys.numel(),), dtype=torch.int64, device=device)
                 if keys.numel() > 0:
@@ -696,7 +691,7 @@ def reduce_pair_histograms(
 
     if local_rank == 0:
         node_keys_cpu = node_keys.to(dtype=torch.long, device="cpu")
-        node_counts_cpu = node_counts.to(dtype=torch.int32, device="cpu")
+        node_counts_cpu = node_counts.to(dtype=torch.int64, device="cpu")
         payload = (node_keys_cpu.tolist(), node_counts_cpu.tolist())
         gathered: List[Tuple[List[int], List[int]]] = [([], []) for _ in leader_ranks]
         assert leader_group is not None
@@ -711,15 +706,13 @@ def reduce_pair_histograms(
                 reduced_counts64.index_add_(0, indices, node_counts_cpu.to(torch.int64))
             dist.all_reduce(reduced_counts64, op=dist.ReduceOp.SUM, group=leader_group)
             final_keys_cpu = sorted_keys
-            final_counts_cpu = _clamp_counts_to_int32(
-                reduced_counts64, "reduce_pair_histograms inter-node"
-            )
+            final_counts_cpu = reduced_counts64
         else:
             final_keys_cpu = torch.empty((0,), dtype=torch.long)
-            final_counts_cpu = torch.empty((0,), dtype=torch.int32)
+            final_counts_cpu = torch.empty((0,), dtype=torch.int64)
     else:
         final_keys_cpu = torch.empty((0,), dtype=torch.long)
-        final_counts_cpu = torch.empty((0,), dtype=torch.int32)
+        final_counts_cpu = torch.empty((0,), dtype=torch.int64)
 
     final_keys, final_counts = _broadcast_histogram_to_local_ranks(
         final_keys_cpu,

@@ -68,22 +68,22 @@ def count_pairs_fastpath(
     if rows == 0 or width <= 0:
         return (
             torch.empty((0,), dtype=torch.long, device=tokens.device),
-            torch.empty((0,), dtype=torch.int32, device=tokens.device),
+            torch.empty((0,), dtype=torch.int64, device=tokens.device),
         )
 
     capacity = max(rows * width, 1)
     pair_workspace = torch.empty((capacity, 2), dtype=tokens.dtype, device=tokens.device)
-    count_workspace = torch.empty((capacity,), dtype=torch.int32, device=tokens.device)
+    count_workspace = torch.empty((capacity,), dtype=torch.int64, device=tokens.device)
     length_tensor = torch.zeros((1,), dtype=torch.long, device=tokens.device)
     count_pairs(tokens, valid, pair_workspace, count_workspace, length_tensor)
     length = int(length_tensor.item())
     if length <= 0:
         return (
             torch.empty((0,), dtype=torch.long, device=tokens.device),
-            torch.empty((0,), dtype=torch.int32, device=tokens.device),
+            torch.empty((0,), dtype=torch.int64, device=tokens.device),
         )
     pairs = pair_workspace[:length]
-    counts = count_workspace[:length].to(torch.int32)
+    counts = count_workspace[:length]
     a_ids = pairs[:, 0].to(torch.long)
     b_ids = pairs[:, 1].to(torch.long)
     keys = (a_ids << 32) | b_ids

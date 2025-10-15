@@ -70,7 +70,7 @@ def compute_ngram_histograms(
     Returns:
         Dictionary mapping each order ``n`` to a tuple ``(keys, counts)`` where
         ``keys`` is a one-dimensional ``torch.int64`` tensor of packed n-gram
-        identifiers and ``counts`` is a ``torch.int32`` tensor containing the
+        identifiers and ``counts`` is a ``torch.int64`` tensor containing the
         corresponding frequencies.
     """
 
@@ -113,11 +113,11 @@ def compute_ngram_histograms(
     for order in range(1, max_order + 1):
         if collected_keys[order]:
             keys = torch.cat(collected_keys[order])
-            counts = torch.ones((keys.numel(),), dtype=torch.int32, device=device)
+            counts = torch.ones((keys.numel(),), dtype=torch.int64, device=device)
             aggregated_keys, aggregated_counts = aggregate_pair_keys(keys, counts)
         else:
             aggregated_keys = torch.empty((0,), dtype=torch.long, device=device)
-            aggregated_counts = torch.empty((0,), dtype=torch.int32, device=device)
+            aggregated_counts = torch.empty((0,), dtype=torch.int64, device=device)
         histograms[order] = (aggregated_keys, aggregated_counts)
 
     return histograms
