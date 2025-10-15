@@ -1,6 +1,12 @@
+import os
+import socket
+
 import pytest
 
 torch = pytest.importorskip("torch")
+
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 import gpu_tokenizer.triton_kernels as triton_kernels
 import gpu_tokenizer.utils as utils
@@ -186,3 +192,159 @@ def test_reduce_pair_histograms_matches_clipped_reference(monkeypatch, caplog):
     assert reduced_counts.dtype == torch.int32
     assert reduced_counts.tolist() == [3, 5, 5]
     assert any("aggregate_pair_keys" in record.message for record in caplog.records)
+
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _reference_histogram(keys_list, counts_list):
+    all_keys = torch.cat([tensor.to(dtype=torch.long) for tensor in keys_list], dim=0)
+    all_counts = torch.cat([tensor.to(dtype=torch.int64) for tensor in counts_list], dim=0)
+    return aggregate_pair_keys(all_keys, all_counts)
+
+
+def _distributed_reduce_worker(
+    rank,
+    world_size,
+    port,
+    keys_payload,
+    counts_payload,
+    results,
+    env_factory,
+):
+    os.environ.update(
+        {
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": str(port),
+            "WORLD_SIZE": str(world_size),
+            "RANK": str(rank),
+        }
+    )
+    if env_factory is not None:
+        os.environ.update(env_factory(rank))
+
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    utils._clear_cached_process_groups()
+
+    keys = keys_payload[rank].clone()
+    counts = counts_payload[rank].clone()
+    reduced_keys, reduced_counts = reduce_pair_histograms(keys, counts)
+
+    results[rank] = {
+        "keys": reduced_keys.cpu().tolist(),
+        "counts": reduced_counts.cpu().tolist(),
+        "dtype": str(reduced_counts.dtype),
+    }
+
+    dist.destroy_process_group()
+
+
+def _run_reduce_pair_histograms(world_size, keys_payload, counts_payload, env_factory=None):
+    port = _find_free_port()
+    with mp.Manager() as manager:
+        results = manager.dict()
+        mp.spawn(
+            _distributed_reduce_worker,
+            args=(world_size, port, keys_payload, counts_payload, results, env_factory),
+            nprocs=world_size,
+            join=True,
+        )
+        return dict(results)
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
+def test_reduce_pair_histograms_single_node_world():
+    keys_payload = [
+        torch.tensor([1, 2, 5], dtype=torch.long),
+        torch.tensor([2, 4], dtype=torch.long),
+    ]
+    counts_payload = [
+        torch.tensor([3, 1, 2], dtype=torch.int32),
+        torch.tensor([2, 7], dtype=torch.int32),
+    ]
+
+    world_size = len(keys_payload)
+    reference_keys, reference_counts = _reference_histogram(keys_payload, counts_payload)
+    results = _run_reduce_pair_histograms(world_size, keys_payload, counts_payload)
+
+    expected_keys = reference_keys.tolist()
+    expected_counts = reference_counts.tolist()
+
+    for payload in results.values():
+        assert payload["keys"] == expected_keys
+        assert payload["counts"] == expected_counts
+        assert payload["dtype"] == "torch.int32"
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
+def test_reduce_pair_histograms_multinode_hierarchy():
+    keys_payload = [
+        torch.tensor([1, 1, 2], dtype=torch.long),
+        torch.tensor([2, 3], dtype=torch.long),
+        torch.tensor([1, 4], dtype=torch.long),
+        torch.tensor([3, 4], dtype=torch.long),
+    ]
+    counts_payload = [
+        torch.tensor([2, 1, 5], dtype=torch.int32),
+        torch.tensor([1, 2], dtype=torch.int32),
+        torch.tensor([3, 1], dtype=torch.int32),
+        torch.tensor([4, 2], dtype=torch.int32),
+    ]
+
+    def _env(rank: int):
+        local_world = 2
+        return {
+            "LOCAL_WORLD_SIZE": str(local_world),
+            "LOCAL_RANK": str(rank % local_world),
+        }
+
+    world_size = len(keys_payload)
+    reference_keys, reference_counts = _reference_histogram(keys_payload, counts_payload)
+    results = _run_reduce_pair_histograms(
+        world_size, keys_payload, counts_payload, env_factory=_env
+    )
+
+    expected_keys = reference_keys.tolist()
+    expected_counts = reference_counts.tolist()
+
+    for payload in results.values():
+        assert payload["keys"] == expected_keys
+        assert payload["counts"] == expected_counts
+        assert payload["dtype"] == "torch.int32"
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
+def test_reduce_pair_histograms_mixed_backend_topology():
+    keys_payload = [
+        torch.tensor([7, 8], dtype=torch.long),
+        torch.tensor([8, 9], dtype=torch.long),
+        torch.tensor([7, 9, 9], dtype=torch.long),
+    ]
+    counts_payload = [
+        torch.tensor([1, 4], dtype=torch.int32),
+        torch.tensor([2, 3], dtype=torch.int32),
+        torch.tensor([5, 1, 2], dtype=torch.int32),
+    ]
+
+    def _env(rank: int):
+        return {
+            "LOCAL_WORLD_SIZE": "1",
+            "LOCAL_RANK": "0",
+        }
+
+    world_size = len(keys_payload)
+    reference_keys, reference_counts = _reference_histogram(keys_payload, counts_payload)
+    results = _run_reduce_pair_histograms(
+        world_size, keys_payload, counts_payload, env_factory=_env
+    )
+
+    expected_keys = reference_keys.tolist()
+    expected_counts = reference_counts.tolist()
+
+    for payload in results.values():
+        assert payload["keys"] == expected_keys
+        assert payload["counts"] == expected_counts
+        assert payload["dtype"] == "torch.int32"
