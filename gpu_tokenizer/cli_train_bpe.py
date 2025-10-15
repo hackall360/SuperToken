@@ -90,6 +90,12 @@ def main() -> None:
         action="store_true",
         help="Prevent seeded merges from being reconsidered during training",
     )
+    parser.add_argument(
+        "--out-dir",
+        type=str,
+        default="./bpe_out",
+        help="Directory where the trained tokenizer artifacts will be stored",
+    )
     args = parser.parse_args()
 
     from .autoscaler import AutoScaler
@@ -155,7 +161,7 @@ def main() -> None:
         warm_start_plan=warm_plan,
         freeze_warm_start=args.freeze_warm_start if warm_plan else None,
     )
-    trainer.save("./bpe_out")
+    trainer.save(args.out_dir)
     print(meta)
 
 

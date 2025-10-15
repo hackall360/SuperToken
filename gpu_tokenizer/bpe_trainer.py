@@ -3127,14 +3127,119 @@ class GPUBPETrainer:
 
     def save(self, out_dir: str) -> None:
         os.makedirs(out_dir, exist_ok=True)
+
+        def _bytes_to_unicode() -> dict[int, str]:
+            """Mirror the mapping used by Hugging Face's ByteLevel BPE."""
+
+            bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+            cs = bs[:]
+            n = 0
+            for b in range(256):
+                if b not in bs:
+                    bs.append(b)
+                    cs.append(256 + n)
+                    n += 1
+            return {b: chr(c) for b, c in zip(bs, cs)}
+
+        byte_encoder = _bytes_to_unicode()
+        token_strings: list[str] = []
+        added_tokens: list[dict[str, object]] = []
+        for token_id in range(self.base_vocab):
+            if 0 <= token_id < 256:
+                token_strings.append(byte_encoder[token_id])
+            else:
+                content = f"<|{token_id}|>"
+                token_strings.append(content)
+                added_tokens.append(
+                    {
+                        "id": token_id,
+                        "content": content,
+                        "single_word": False,
+                        "lstrip": False,
+                        "rstrip": False,
+                        "normalized": False,
+                        "special": True,
+                    }
+                )
+
+        for idx, (left_id, right_id) in enumerate(self.merges):
+            try:
+                left = token_strings[left_id]
+                right = token_strings[right_id]
+            except IndexError as exc:
+                raise ValueError(
+                    f"Invalid merge pair {(left_id, right_id)} at position {idx}"
+                ) from exc
+            token_strings.append(left + right)
+
+        expected_vocab = self.base_vocab + len(self.merges)
+        if self.vocab_size != expected_vocab:
+            # The tokenizer export expects an exact vocab → id mapping
+            raise ValueError(
+                "Mismatch between vocab_size and merges: "
+                f"expected {expected_vocab}, found {self.vocab_size}"
+            )
+
+        vocab = {token: idx for idx, token in enumerate(token_strings)}
+        merges = [
+            f"{token_strings[left]} {token_strings[right]}"
+            for left, right in self.merges
+        ]
+
+        vocab_path = os.path.join(out_dir, "vocab.json")
+        merges_path = os.path.join(out_dir, "merges.txt")
+        tokenizer_path = os.path.join(out_dir, "tokenizer.json")
+
+        with open(vocab_path, "w", encoding="utf-8") as f:
+            json.dump(vocab, f, ensure_ascii=False)
+
+        with open(merges_path, "w", encoding="utf-8") as f:
+            f.write("#version: 0.2\n")
+            for merge in merges:
+                f.write(f"{merge}\n")
+
+        tokenizer_config = {
+            "version": "1.0",
+            "truncation": None,
+            "padding": None,
+            "added_tokens": added_tokens,
+            "normalizer": None,
+            "pre_tokenizer": {
+                "type": "ByteLevel",
+                "add_prefix_space": False,
+                "trim_offsets": True,
+                "use_regex": True,
+            },
+            "post_processor": None,
+            "decoder": {"type": "ByteLevel"},
+            "model": {
+                "type": "BPE",
+                "dropout": None,
+                "unk_token": None,
+                "continuing_subword_prefix": "",
+                "end_of_word_suffix": "",
+                "fuse_unk": False,
+                "byte_fallback": False,
+                "vocab": vocab,
+                "merges": merges,
+            },
+        }
+
+        with open(tokenizer_path, "w", encoding="utf-8") as f:
+            json.dump(tokenizer_config, f, ensure_ascii=False)
+
         meta = {
             "base_vocab": self.base_vocab,
             "vocab_size": self.vocab_size,
             "merges": self.merges,
         }
-        with open(os.path.join(out_dir, "bpe_merges.json"), "w") as f:
+        with open(os.path.join(out_dir, "bpe_merges.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f)
-        print(f"Saved merges → {out_dir}/bpe_merges.json")
+
+        print(
+            "Saved tokenizer artifacts → "
+            f"{vocab_path}, {merges_path}, {tokenizer_path}"
+        )
 
 
 __all__ = ["GPUBPETrainer"]
