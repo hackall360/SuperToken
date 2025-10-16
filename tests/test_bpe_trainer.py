@@ -7,10 +7,14 @@ pytest.importorskip("torch.utils")
 
 from gpu_tokenizer import bpe_trainer as bt
 from gpu_tokenizer.autoscaler import AutoScaler, ScaleState
-from gpu_tokenizer.bpe_trainer import GPUBPETrainer, _aggregate_pair_keys
+from gpu_tokenizer.bpe_trainer import (
+    DeviceContext,
+    GPUBPETrainer,
+    GPUBatchRecord,
+    _aggregate_pair_keys,
+)
 from gpu_tokenizer.dtypes import length_storage_dtype
 from gpu_tokenizer.datasets import PackedBatcher
-from gpu_tokenizer.bpe_trainer import GPUBatchRecord
 from gpu_tokenizer.cpu_fastpath import (
     FastPathWorkspaces,
     apply_merge_fastpath,
@@ -168,6 +172,71 @@ def test_gpu_batch_record_flags_overflow_for_uint16_lengths():
     assert host_tokens.data_ptr() == record.host_tokens.data_ptr()
     assert host_valid.data_ptr() == record.host_valid.data_ptr()
     assert bool(record.host_length_overflow is not None and record.host_length_overflow.item())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for stream overlap test")
+def test_gpu_copy_and_compute_overlap_across_streams():
+    device = torch.device("cuda")
+    ctx = DeviceContext(
+        device=device,
+        compute_stream=torch.cuda.Stream(device=device),
+        h2d_stream=torch.cuda.Stream(device=device),
+        d2h_stream=torch.cuda.Stream(device=device),
+    )
+
+    torch.cuda.synchronize(device)
+
+    rows_copy, width_copy = 256, 8192
+    tokens_copy = torch.arange(rows_copy * width_copy, dtype=torch.int32).view(rows_copy, width_copy)
+    valid_copy = torch.ones((rows_copy, width_copy), dtype=torch.uint8)
+    lengths_copy = torch.full((rows_copy,), width_copy, dtype=torch.int64)
+    record_copy = GPUBatchRecord.from_cpu(tokens_copy, valid_copy, lengths_copy, device, ctx=ctx)
+
+    compute1_start = torch.cuda.Event(enable_timing=True)
+    compute1_end = torch.cuda.Event(enable_timing=True)
+    with torch.cuda.device(device), torch.cuda.stream(ctx.compute_stream):
+        record_copy.wait_for_device(ctx.compute_stream)
+        compute1_start.record()
+        torch.cuda._sleep(int(5e6))
+        compute1_end.record()
+    record_copy.mark_device_event(compute1_end)
+
+    copy_start = torch.cuda.Event(enable_timing=True)
+    with torch.cuda.device(device), torch.cuda.stream(ctx.d2h_stream):
+        copy_start.record()
+    with torch.cuda.device(device):
+        record_copy.schedule_host_sync(ctx.d2h_stream)
+    copy_end = record_copy.host_event
+    assert copy_end is not None
+
+    rows_compute, width_compute = 16, 256
+    tokens_compute = torch.arange(rows_compute * width_compute, dtype=torch.int32).view(
+        rows_compute, width_compute
+    )
+    valid_compute = torch.ones((rows_compute, width_compute), dtype=torch.uint8)
+    lengths_compute = torch.full((rows_compute,), width_compute, dtype=torch.int64)
+    record_compute = GPUBatchRecord.from_cpu(
+        tokens_compute, valid_compute, lengths_compute, device, ctx=ctx
+    )
+
+    compute2_start = torch.cuda.Event(enable_timing=True)
+    compute2_end = torch.cuda.Event(enable_timing=True)
+    with torch.cuda.device(device), torch.cuda.stream(ctx.compute_stream):
+        record_compute.wait_for_device(ctx.compute_stream)
+        compute2_start.record()
+        torch.cuda._sleep(int(5e6))
+        compute2_end.record()
+    record_compute.mark_device_event(compute2_end)
+
+    torch.cuda.synchronize(device)
+
+    copy_duration = copy_start.elapsed_time(copy_end)
+    start_offset = copy_start.elapsed_time(compute2_start)
+    end_offset = copy_start.elapsed_time(compute2_end)
+
+    assert copy_duration > 0.0
+    assert 0.0 <= start_offset < copy_duration
+    assert end_offset > 0.0
 
 
 def test_fit_supports_streaming_iterator():
