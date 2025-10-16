@@ -43,6 +43,11 @@ class TrendPoint:
 def _load_point(path: Path) -> TrendPoint:
     """Parse a benchmark JSON snapshot into a :class:`TrendPoint`.
 
+    In the overall reporting pipeline this helper is responsible for taking the
+    raw JSON emitted by the benchmark harness and converting it into the richer
+    :class:`TrendPoint` representation used downstream by
+    :func:`load_history`, :func:`render_table`, and :func:`render_plot`.
+
     Parameters
     ----------
     path:
@@ -66,8 +71,12 @@ def _load_point(path: Path) -> TrendPoint:
     payload = json.loads(path.read_text(encoding="utf-8"))
     timestamp_raw = payload.get("timestamp")
     try:
+        # Benchmarks serialize timestamps as ``YYYYMMDDTHHMMSSZ`` strings; parse
+        # eagerly so plots/tables can show chronological order from JSON alone.
         timestamp = datetime.strptime(timestamp_raw, "%Y%m%dT%H%M%SZ")
     except Exception:  # pragma: no cover - defensive fallback for unexpected formats
+        # If parsing fails (older schema or missing field) fall back to the file
+        # modification time so the run still appears in the trend output.
         timestamp = datetime.utcfromtimestamp(path.stat().st_mtime)
     tokens = int(payload["corpus"]["tokens"])
     bpe_wall = float(payload["bpe"].get("wall_time_s", 0.0))
@@ -83,6 +92,11 @@ def _load_point(path: Path) -> TrendPoint:
 
 def load_history(inputs: Iterable[Path]) -> list[TrendPoint]:
     """Load and sort a collection of benchmark points.
+
+    This step aggregates the per-run data produced by :func:`_load_point` into
+    a chronological series ready for report generation. The returned list feeds
+    both :func:`render_table` and :func:`render_plot`, ensuring they operate on
+    a consistent snapshot of the benchmark history.
 
     Parameters
     ----------
@@ -109,6 +123,10 @@ def load_history(inputs: Iterable[Path]) -> list[TrendPoint]:
 def _format_value(value: float | None) -> str:
     """Render floating point metrics for inclusion in Markdown tables.
 
+    The Markdown export performed by :func:`render_table` relies on this helper
+    to keep numeric throughput values consistent and easy to scan across rows in
+    the trend report.
+
     Parameters
     ----------
     value:
@@ -127,6 +145,11 @@ def _format_value(value: float | None) -> str:
 
 def render_table(points: Sequence[TrendPoint], output: Path) -> Path:
     """Write a Markdown table summarising benchmark runs.
+
+    The Markdown output acts as the textual half of the trend report generated
+    by :func:`main`. It complements the graphical overview created by
+    :func:`render_plot` and is included in the manifest so automated tooling can
+    publish or archive it alongside the raw benchmark data.
 
     Parameters
     ----------
@@ -179,6 +202,10 @@ def render_table(points: Sequence[TrendPoint], output: Path) -> Path:
 def render_plot(points: Sequence[TrendPoint], output: Path) -> Path:
     """Create a PNG line chart visualising throughput over time.
 
+    This visual output forms the graphical counterpart to the Markdown table.
+    Together they give operators a quick sense of throughput trends when
+    :func:`main` assembles the final report bundle.
+
     Parameters
     ----------
     points:
@@ -204,12 +231,18 @@ def render_plot(points: Sequence[TrendPoint], output: Path) -> Path:
         return output
     labels = [point.label for point in points]
     indices = range(len(points))
+    # Tokens-per-second metrics may be ``None`` for failed runs; coerce to zero
+    # so matplotlib can render a continuous line while preserving chronology.
     bpe = [point.bpe_tokens_per_second or 0.0 for point in points]
     unigram = [point.unigram_tokens_per_second or 0.0 for point in points]
 
     fig, ax = plt.subplots(figsize=(9, 4))
+    # Explicit marker+line configuration mirrors the table ordering to keep the
+    # two report artefacts aligned for human readers.
     ax.plot(indices, bpe, marker="o", label="GPUBPETrainer tokens/s")
     ax.plot(indices, unigram, marker="o", label="GPUUnigramTrainer tokens/s")
+    # Use integer indices for x-ticks so uneven timestamp spacing still renders
+    # in chronological order while labels show the parsed timestamps.
     ax.set_xticks(list(indices))
     ax.set_xticklabels(labels, rotation=45, ha="right")
     ax.set_ylabel("Tokens per second")
@@ -224,6 +257,10 @@ def render_plot(points: Sequence[TrendPoint], output: Path) -> Path:
 
 def build_parser() -> argparse.ArgumentParser:
     """Construct the CLI argument parser for the trend reporting utility.
+
+    The parser wires together all user-configurable pieces needed by
+    :func:`main` so the CLI can discover benchmark inputs and decide where to
+    write the generated report artefacts.
 
     Returns
     -------
@@ -260,6 +297,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     """Entry point for generating Markdown and PNG trend reports.
+
+    The CLI orchestrates the full report pipeline: it locates benchmark JSON
+    snapshots, materialises them into :class:`TrendPoint` instances, and then
+    delegates to :func:`render_table` and :func:`render_plot` to produce the
+    human-readable artefacts recorded in the final manifest.
 
     Parameters
     ----------
