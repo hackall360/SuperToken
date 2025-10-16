@@ -6,7 +6,7 @@ from .autoscaler import AutoScaler
 from .cpu_packer import BytePacker
 from .datasets import PackedBatcher, StreamingPackedBatcher
 from .io import CorpusStreamer, MemoryMappedShard
-from . import ngram_stats, utils
+from . import dist_runtime, lease_queue, ngram_stats, utils
 
 try:  # pragma: no cover - optional torch dependency
     from .bpe_trainer import GPUBPETrainer  # type: ignore
@@ -29,6 +29,8 @@ __all__ = [
         "MemoryMappedShard",
         "CorpusStreamer",
         "AutoScaler",
+        "dist_runtime",
+        "lease_queue",
         "ngram_stats",
         "utils",
     ]
