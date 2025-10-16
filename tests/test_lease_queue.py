@@ -80,6 +80,8 @@ def test_state_dict_roundtrip() -> None:
     notary.requeue_lease(rank=0, start=0, end=5)
 
     snap = notary.state_dict()
+    assert "rank_weights" in snap
+    assert snap["rank_weights"] == {}
 
     restored = LeaseNotary(total_chunks=0, lease_ttl=3.0)
     restored.load_state_dict(snap)
@@ -203,4 +205,20 @@ def test_timed_out_leases_requeue_and_are_reattributed() -> None:
 
     # Ensure no extra work becomes available.
     assert notary.grant_lease(rank=3, preferred_size=1) is None
+
+
+def test_rank_weights_roundtrip() -> None:
+    notary = LeaseNotary(total_chunks=4, lease_ttl=5.0)
+    notary.update_rank_weights({0: 0.7, 1: 0.3})
+
+    weights = notary.rank_weights()
+    assert weights == {0: 0.7, 1: 0.3}
+
+    snap = notary.state_dict()
+    assert snap["rank_weights"] == {0: 0.7, 1: 0.3}
+
+    restored = LeaseNotary(total_chunks=0, lease_ttl=1.0)
+    restored.load_state_dict(snap)
+
+    assert restored.rank_weights() == {0: 0.7, 1: 0.3}
 
