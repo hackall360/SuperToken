@@ -11,7 +11,7 @@ import time
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, Callable, Iterable, Iterator, Optional
+from typing import TYPE_CHECKING, AsyncIterator, Callable, Iterable, Iterator, Optional
 
 try:  # pragma: no cover - optional dependency
     import zstandard as _zstd  # type: ignore
@@ -27,6 +27,10 @@ try:  # pragma: no cover - optional torch dependency
     import torch
 except Exception:  # pragma: no cover - torch optional at runtime
     torch = None
+
+
+if TYPE_CHECKING:  # pragma: no cover - typing helper
+    from .bpe_trainer import TrainerMetricsEWMA
 
 
 CompressionType = str
@@ -196,6 +200,84 @@ class _ReusableBufferPool:
             self._buffers.put_nowait(buf)
         except queue.Full:  # pragma: no cover - defensive fallback
             pass
+
+
+@dataclass
+class ChunkSpec:
+    """Describe a workload chunk fed into the trainer pipeline."""
+
+    batches: int
+    tokens: int
+    target_ms: float
+    expected_ms: Optional[float]
+    tokens_per_s_hint: Optional[float]
+    leases_per_s_hint: Optional[float]
+
+
+def make_chunker(
+    target_ms: float,
+    batch_tokens: int,
+    ewma: "TrainerMetricsEWMA | None",
+) -> Iterator[ChunkSpec]:
+    """Return a generator producing chunk specifications near ``target_ms``.
+
+    ``batch_tokens`` represents the token count processed per trainer batch.  The
+    generator consults the optional :class:`TrainerMetricsEWMA` to adapt the chunk
+    size based on recent throughput measurements.  When EWMA metrics are
+    unavailable the chunker yields fixed-size chunks containing exactly one
+    batch.
+    """
+
+    try:
+        target_ms_value = float(target_ms)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("target_ms must be convertible to float") from exc
+    if not (target_ms_value > 0.0):
+        raise ValueError("target_ms must be positive")
+
+    try:
+        batch_tokens_value = int(batch_tokens)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("batch_tokens must be an integer") from exc
+    if batch_tokens_value <= 0:
+        raise ValueError("batch_tokens must be positive")
+
+    def _iter_chunks() -> Iterator[ChunkSpec]:
+        while True:
+            tokens_per_s = None
+            leases_per_s = None
+            if ewma is not None and getattr(ewma, "enabled", True):
+                tokens_per_s = ewma.tokens_per_s
+                leases_per_s = ewma.lease_per_s
+
+            if tokens_per_s is not None and tokens_per_s > 0:
+                tokens_per_ms = tokens_per_s / 1000.0
+                estimated_tokens = max(
+                    batch_tokens_value,
+                    int(round(tokens_per_ms * target_ms_value)),
+                )
+            else:
+                estimated_tokens = batch_tokens_value
+
+            batches = max(1, int(round(estimated_tokens / batch_tokens_value)))
+            tokens = batches * batch_tokens_value
+
+            expected_ms: Optional[float]
+            if tokens_per_s is not None and tokens_per_s > 0:
+                expected_ms = (tokens / tokens_per_s) * 1000.0
+            else:
+                expected_ms = None
+
+            yield ChunkSpec(
+                batches=batches,
+                tokens=tokens,
+                target_ms=target_ms_value,
+                expected_ms=expected_ms,
+                tokens_per_s_hint=tokens_per_s,
+                leases_per_s_hint=leases_per_s,
+            )
+
+    return _iter_chunks()
 
 
 @dataclass
