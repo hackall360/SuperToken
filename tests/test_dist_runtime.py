@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import os
 import pathlib
@@ -415,3 +416,56 @@ def test_startup_throughput_weights_normalised(monkeypatch: pytest.MonkeyPatch) 
         assert pytest.approx(weights[idx], rel=1e-9, abs=1e-9) == expected
 
     assert artifacts["gather_log"]
+
+
+def test_iterate_leased_shards_prefetches_additional_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dist_runtime, _ = _patch_common_runtime(monkeypatch)
+
+    notary = dist_runtime.LeaseNotary(
+        total_chunks=6,
+        lease_ttl=5.0,
+        max_active_leases=2,
+    )
+    host_state = dist_runtime._LeaseHostState(notary=notary, lock=threading.Lock())
+    client = dist_runtime.DistributedLeaseClient(
+        job_id="prefetch",
+        rank=0,
+        world_size=1,
+        host_state=host_state,
+    )
+
+    shard_paths = list(range(6))
+    chunk_slices = [(idx, idx + 1) for idx in range(6)]
+    observed_lengths: list[int] = []
+
+    @contextlib.contextmanager
+    def _open(path: int):
+        yield path
+
+    def _encode(shard: int):
+        state = notary.state_dict()
+        entry = state["inflight"].get(0)
+        records = []
+        if isinstance(entry, dict):
+            records = entry.get("records", [])
+        observed_lengths.append(len(records))
+        yield shard
+
+    iterator = dist_runtime.iterate_leased_shards(
+        shard_paths,
+        chunk_slices,
+        lease_client=client,
+        encode_shard=_encode,
+        shard_opener=_open,
+        preferred_lease_size=2,
+        prefetch_threshold=1,
+    )
+
+    for shard_iter in iterator:
+        list(shard_iter)
+
+    assert observed_lengths
+    assert max(observed_lengths) >= 2
+    assert notary.state_dict()["inflight"] == {}

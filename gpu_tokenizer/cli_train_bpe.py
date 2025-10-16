@@ -317,6 +317,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     lease_client = None
     chunk_slices: List[Tuple[int, int]] | None = None
     preferred_lease_size = max(1, int(os.environ.get("SUPERTOKEN_LEASE_SIZE", "1")))
+    lease_prefetch_threshold = max(
+        0, int(os.environ.get("SUPERTOKEN_LEASE_PREFETCH_THRESHOLD", "0"))
+    )
     if world_size > 1:
         chunk_target_ms = float(
             os.environ.get("SUPERTOKEN_CHUNK_TARGET_MS", DEFAULT_CHUNK_TARGET_MS)
@@ -354,6 +357,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             encode_shard=packer.encode_shard,
             shard_opener=MemoryMappedShardType,
             preferred_lease_size=preferred_lease_size,
+            prefetch_threshold=lease_prefetch_threshold,
         )
 
     seqs: Iterable[Iterable[int]] = _iter_sequences()
