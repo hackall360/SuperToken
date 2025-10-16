@@ -25,7 +25,13 @@ from .dtypes import (
     length_storage_dtype,
     promote_length_sum_dtype,
 )
-from .utils import aggregate_pair_keys, apply_merge_once, count_pairs, reduce_pair_histograms
+from .utils import (
+    aggregate_pair_keys,
+    apply_merge_once,
+    count_pairs,
+    peer_copy_tensor,
+    reduce_pair_histograms,
+)
 
 
 def _aggregate_pair_keys(
@@ -811,6 +817,8 @@ class GPUBPETrainer:
         self._top_pairs_heap: list[tuple[int, int]] = []
         self._top_pairs_index: dict[int, int] = {}
         self._pair_count_lookup: dict[int, int] = {}
+        self._cached_pair_keys_per_device: dict[torch.device, torch.Tensor] = {}
+        self._cached_pair_counts_per_device: dict[torch.device, torch.Tensor] = {}
         self._cpu_fallback_batches: int = 0
         self._last_cpu_fallback_ratio: float = 0.0
         self._merge_step: int = 0
@@ -1435,6 +1443,8 @@ class GPUBPETrainer:
             self._refresh_top_pairs_from_cache()
         else:
             self._reset_top_pairs()
+        if use_cuda:
+            self._materialize_histogram_cache_on_devices(device_contexts)
         self.bytes_h2d = int(metadata.get("bytes_h2d", self.bytes_h2d))
         self.bytes_d2h = int(metadata.get("bytes_d2h", self.bytes_d2h))
         self.h2d_events = int(metadata.get("h2d_events", self.h2d_events))
@@ -1596,11 +1606,89 @@ class GPUBPETrainer:
         self._hist_cache_valid = False
         self._force_recount = True
         self._reset_top_pairs()
+        self._cached_pair_keys_per_device.clear()
+        self._cached_pair_counts_per_device.clear()
 
     def _invalidate_hist_cache(self) -> None:
         self._hist_cache_valid = False
         self._force_recount = True
         self._reset_top_pairs()
+        self._cached_pair_keys_per_device.clear()
+        self._cached_pair_counts_per_device.clear()
+
+    def _materialize_histogram_cache_on_devices(
+        self,
+        device_contexts: Optional[Dict[torch.device, "DeviceContext"]],
+        *,
+        source: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> None:
+        if (
+            device_contexts is None
+            or not device_contexts
+            or not self._enable_histogram_cache
+            or not self._hist_cache_valid
+        ):
+            self._cached_pair_keys_per_device.clear()
+            self._cached_pair_counts_per_device.clear()
+            return
+
+        if self._cached_pair_keys.numel() == 0:
+            self._cached_pair_keys_per_device.clear()
+            self._cached_pair_counts_per_device.clear()
+            return
+
+        if not torch.cuda.is_available():
+            return
+
+        primary: Optional[torch.device] = None
+        for dev in device_contexts:
+            if dev.type == "cuda":
+                primary = dev
+                break
+
+        if primary is None:
+            return
+
+        cached_keys = self._cached_pair_keys_per_device.get(primary)
+        cached_counts = self._cached_pair_counts_per_device.get(primary)
+        if cached_keys is None or cached_counts is None or cached_keys.device != primary:
+            if source is not None:
+                cached_keys = source[0].to(device=primary, dtype=torch.long, non_blocking=True)
+                cached_counts = source[1].to(
+                    device=primary, dtype=torch.int64, non_blocking=True
+                )
+            else:
+                cached_keys = self._cached_pair_keys.to(
+                    device=primary, dtype=torch.long, non_blocking=True
+                )
+                cached_counts = self._cached_pair_counts.to(
+                    device=primary, dtype=torch.int64, non_blocking=True
+                )
+            self._cached_pair_keys_per_device[primary] = cached_keys
+            self._cached_pair_counts_per_device[primary] = cached_counts
+
+        for dev, ctx in device_contexts.items():
+            if dev == primary or dev.type != "cuda":
+                continue
+
+            dst_keys = torch.empty_like(cached_keys, device=dev)
+            dst_counts = torch.empty_like(cached_counts, device=dev)
+            stream = getattr(ctx, "h2d_stream", None)
+
+            peer_keys = peer_copy_tensor(dst_keys, cached_keys, stream=stream)
+            peer_counts = peer_copy_tensor(dst_counts, cached_counts, stream=stream)
+
+            if not (peer_keys and peer_counts):
+                if stream is not None:
+                    with torch.cuda.stream(stream):
+                        dst_keys.copy_(cached_keys)
+                        dst_counts.copy_(cached_counts)
+                else:
+                    dst_keys.copy_(cached_keys)
+                    dst_counts.copy_(cached_counts)
+
+            self._cached_pair_keys_per_device[dev] = dst_keys
+            self._cached_pair_counts_per_device[dev] = dst_counts
 
     def _expand_recount_spans(self, span_mask: torch.Tensor) -> torch.Tensor:
         if span_mask.numel() == 0:
@@ -2730,6 +2818,7 @@ class GPUBPETrainer:
                 ):
                     realized = list(batch_iter)
                     _mark_active_batches(realized)
+                    self._materialize_histogram_cache_on_devices(device_contexts)
                     return (
                         self._cached_pair_keys.clone(),
                         self._cached_pair_counts.clone(),
@@ -2907,9 +2996,13 @@ class GPUBPETrainer:
                     if reduced_keys is None or reduced_counts is None:
                         cached_keys = torch.empty((0,), dtype=torch.long)
                         cached_counts = torch.empty((0,), dtype=torch.int64)
+                        gpu_source: Optional[tuple[torch.Tensor, torch.Tensor]] = None
                     else:
-                        cached_keys = reduced_keys.to(torch.long).to("cpu")
-                        cached_counts = reduced_counts.to(torch.int64).to("cpu")
+                        gpu_keys = reduced_keys.to(torch.long)
+                        gpu_counts = reduced_counts.to(torch.int64)
+                        gpu_source = (gpu_keys, gpu_counts)
+                        cached_keys = gpu_keys.to("cpu")
+                        cached_counts = gpu_counts.to("cpu")
                     self._cached_pair_keys = cached_keys.clone()
                     self._cached_pair_counts = cached_counts.clone()
                     self._hist_cache_valid = True
@@ -2917,6 +3010,10 @@ class GPUBPETrainer:
                     self._refresh_top_pairs_from_cache()
                     if not self._enable_histogram_cache:
                         self._invalidate_hist_cache()
+                    else:
+                        self._materialize_histogram_cache_on_devices(
+                            device_contexts, source=gpu_source
+                        )
                     total_batches = max(1, len(consumed))
                     self._cpu_fallback_batches += len(cpu_consumed)
                     self._last_cpu_fallback_ratio = len(cpu_consumed) / float(total_batches)

@@ -85,10 +85,39 @@ def _install_torch_stub() -> None:
 
     torch_stub = types.ModuleType("torch")
 
+    class _DeviceContext:
+        def __init__(self, cuda_mod: "_CudaStub", index: int) -> None:
+            self._cuda = cuda_mod
+            self._index = index
+
+        def __enter__(self) -> "_DeviceContext":
+            self._cuda.set_device(self._index)
+            return self
+
+        def __exit__(self, *_: object) -> bool:
+            return False
+
+    class _StreamStub:
+        def __init__(self) -> None:
+            self.contexts: int = 0
+
+    class _StreamContext:
+        def __init__(self, stream: _StreamStub) -> None:
+            self._stream = stream
+
+        def __enter__(self) -> _StreamStub:
+            self._stream.contexts += 1
+            return self._stream
+
+        def __exit__(self, *_: object) -> bool:
+            return False
+
     class _CudaStub:
         def __init__(self) -> None:
             self._available = False
             self._count = 0
+            self._current = 0
+            self.peer_calls: list[tuple[object, int, object, int]] = []
 
         def is_available(self) -> bool:
             return self._available
@@ -97,13 +126,37 @@ def _install_torch_stub() -> None:
             return self._count
 
         def current_device(self) -> int:
-            return 0
+            return self._current
+
+        def set_device(self, index: int) -> None:
+            self._current = int(index)
+
+        def device(self, identifier: int) -> _DeviceContext:
+            return _DeviceContext(self, int(identifier))
 
         def mem_get_info(self, *_, **__) -> tuple[int, int]:
             return (0, 1)
 
         def device_can_access_peer(self, *_: int) -> bool:
             return False
+
+        def device_enable_peer_access(self, *_: int) -> None:
+            return None
+
+        def Stream(self, *_: object, **__: object) -> _StreamStub:  # pragma: no cover - simple stub
+            return _StreamStub()
+
+        def stream(self, stream_obj: _StreamStub) -> _StreamContext:
+            return _StreamContext(stream_obj)
+
+        def memcpy_peer_async(
+            self,
+            dst: object,
+            dst_device: int,
+            src: object,
+            src_device: int,
+        ) -> None:
+            self.peer_calls.append((dst, int(dst_device), src, int(src_device)))
 
     torch_stub.cuda = _CudaStub()
 
@@ -202,3 +255,34 @@ def test_can_peer_same_device_short_circuit(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert utils.can_peer(1, 1) is True
     assert sentinel.called is False
+
+
+def test_peer_copy_tensor_prefers_peer_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    cuda_stub = utils.torch.cuda
+    cuda_stub._available = True
+    cuda_stub._count = 2
+
+    src_tensor = types.SimpleNamespace(device=types.SimpleNamespace(type="cuda", index=0))
+    dst_tensor = types.SimpleNamespace(device=types.SimpleNamespace(type="cuda", index=1))
+
+    monkeypatch.setattr(utils, "can_peer", lambda src, dst: True)
+
+    stream = cuda_stub.Stream()
+    assert utils.peer_copy_tensor(dst_tensor, src_tensor, stream=stream) is True
+    assert cuda_stub.peer_calls == [(dst_tensor, 1, src_tensor, 0)]
+
+
+def test_peer_copy_tensor_falls_back_without_peer(monkeypatch: pytest.MonkeyPatch) -> None:
+    cuda_stub = utils.torch.cuda
+    cuda_stub.peer_calls.clear()
+    cuda_stub._available = True
+    cuda_stub._count = 2
+
+    src_tensor = types.SimpleNamespace(device=types.SimpleNamespace(type="cuda", index=0))
+    dst_tensor = types.SimpleNamespace(device=types.SimpleNamespace(type="cuda", index=1))
+
+    monkeypatch.setattr(utils, "can_peer", lambda *_: False)
+
+    stream = cuda_stub.Stream()
+    assert utils.peer_copy_tensor(dst_tensor, src_tensor, stream=stream) is False
+    assert cuda_stub.peer_calls == []
