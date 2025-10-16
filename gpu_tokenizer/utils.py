@@ -23,6 +23,63 @@ logger = logging.getLogger(__name__)
 
 
 _NODE_GROUP_CACHE: Dict[str, object] = {}
+_PEER_ACCESS_CACHE: Dict[Tuple[int, int], bool] = {}
+
+
+def _clear_cached_peer_access() -> None:
+    """Reset cached peer access metadata (primarily for tests)."""
+
+    _PEER_ACCESS_CACHE.clear()
+
+
+def can_peer(src: int, dst: int) -> bool:
+    """Return ``True`` if ``src`` can access ``dst`` via CUDA peer-to-peer links.
+
+    The helper validates CUDA availability, guards against invalid device indices,
+    and memoizes the underlying ``torch.cuda.device_can_access_peer`` probe so
+    repeated checks are inexpensive.  Callers can rely on the function raising a
+    descriptive :class:`RuntimeError` when CUDA support is missing or the device
+    topology cannot be queried.
+    """
+
+    if not torch.cuda.is_available():  # pragma: no cover - depends on environment
+        raise RuntimeError("CUDA is not available; cannot query peer access")
+
+    try:
+        src_idx = int(src)
+        dst_idx = int(dst)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Device indices must be integers") from exc
+
+    device_count = torch.cuda.device_count()
+    if device_count <= 0:
+        raise RuntimeError("No CUDA devices detected; cannot query peer access")
+
+    for idx_name, idx in (("src", src_idx), ("dst", dst_idx)):
+        if idx < 0 or idx >= device_count:
+            raise ValueError(
+                f"CUDA device index for {idx_name} ({idx}) is out of range (0-{device_count - 1})"
+            )
+
+    if src_idx == dst_idx:
+        return True
+
+    key = (src_idx, dst_idx)
+    cached = _PEER_ACCESS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    try:
+        result = bool(torch.cuda.device_can_access_peer(src_idx, dst_idx))
+    except AttributeError as exc:  # pragma: no cover - depends on PyTorch build
+        raise RuntimeError(
+            "torch.cuda.device_can_access_peer is unavailable in this PyTorch build"
+        ) from exc
+    except RuntimeError as exc:  # pragma: no cover - defensive error surface
+        raise RuntimeError(f"Unable to query CUDA peer access: {exc}") from exc
+
+    _PEER_ACCESS_CACHE[key] = result
+    return result
 
 
 def _clear_cached_process_groups() -> None:
