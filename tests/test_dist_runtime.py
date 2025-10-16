@@ -80,11 +80,20 @@ def _patch_common_runtime(monkeypatch: pytest.MonkeyPatch):
     def _destroy() -> None:
         destroy_calls.append(1)
 
+    broadcast_payload: list[object] = []
+
+    def _broadcast(obj_list, *, src=0, group=None):
+        if src == 0 and obj_list:
+            broadcast_payload[:] = [obj_list[0]]
+        elif obj_list and broadcast_payload:
+            obj_list[0] = broadcast_payload[0]
+
     fake_dist = types.SimpleNamespace(
         is_available=lambda: True,
         is_initialized=lambda: True,
         init_process_group=lambda **_kwargs: None,
         destroy_process_group=_destroy,
+        broadcast_object_list=_broadcast,
     )
     monkeypatch.setattr(dist_runtime, "dist", fake_dist, raising=False)
 
@@ -194,3 +203,93 @@ def test_worker_entry_signal_triggers_process_group_teardown(monkeypatch: pytest
 
     assert artifacts["destroy_calls"]
     assert artifacts["registered_cleanup"], "cleanup should be registered"
+
+
+def test_distributed_lease_client_assigns_disjoint_ranges(monkeypatch: pytest.MonkeyPatch) -> None:
+    dist_runtime, _ = _patch_common_runtime(monkeypatch)
+    dist_runtime._reset_lease_registry()
+
+    chunk_slices = dist_runtime.plan_chunk_slices(
+        6, target_ms=50.0, batch_tokens=1, ewma=None
+    )
+    assert chunk_slices, "chunk planning should produce slices"
+
+    client0 = dist_runtime.register_lease_client(
+        job_id="test-job", total_chunks=len(chunk_slices), rank=0, world_size=2
+    )
+    client1 = dist_runtime.register_lease_client(
+        job_id="test-job", total_chunks=len(chunk_slices), rank=1, world_size=2
+    )
+
+    assigned: dict[int, list[tuple[int, int]]] = {0: [], 1: []}
+    while True:
+        lease0 = client0.request_lease(1)
+        lease1 = client1.request_lease(1)
+        if lease0 is None and lease1 is None:
+            break
+        if lease0 is not None:
+            assigned[0].append(lease0)
+            client0.complete_lease(*lease0)
+        if lease1 is not None:
+            assigned[1].append(lease1)
+            client1.complete_lease(*lease1)
+
+    all_leases = assigned[0] + assigned[1]
+    assert all_leases, "at least one lease should be granted"
+    seen: set[int] = set()
+    for start, end in all_leases:
+        for idx in range(start, end):
+            assert idx not in seen, "leases must be disjoint across ranks"
+            seen.add(idx)
+
+    assert seen == set(range(len(chunk_slices)))
+
+
+def test_requeued_leases_are_reassigned(monkeypatch: pytest.MonkeyPatch) -> None:
+    dist_runtime, _ = _patch_common_runtime(monkeypatch)
+    dist_runtime._reset_lease_registry()
+
+    chunk_slices = dist_runtime.plan_chunk_slices(
+        4, target_ms=50.0, batch_tokens=1, ewma=None
+    )
+    client0 = dist_runtime.register_lease_client(
+        job_id="requeue-job", total_chunks=len(chunk_slices), rank=0, world_size=2
+    )
+    client1 = dist_runtime.register_lease_client(
+        job_id="requeue-job", total_chunks=len(chunk_slices), rank=1, world_size=2
+    )
+
+    first = client0.request_lease(2)
+    assert first is not None
+    client0.requeue_lease(*first)
+
+    reassigned = client1.request_lease(1)
+    assert reassigned is not None
+    assert reassigned[0] == first[0], "requeue should return the same starting chunk"
+    client1.complete_lease(*reassigned)
+
+    next_lease = client0.request_lease(1)
+    assert next_lease is not None
+    assert next_lease[0] >= reassigned[1]
+    client0.complete_lease(*next_lease)
+
+    remaining: list[tuple[int, int]] = []
+    while True:
+        l0 = client0.request_lease(1)
+        l1 = client1.request_lease(1)
+        if l0 is None and l1 is None:
+            break
+        if l0 is not None:
+            remaining.append(l0)
+            client0.complete_lease(*l0)
+        if l1 is not None:
+            remaining.append(l1)
+            client1.complete_lease(*l1)
+
+    covered = set()
+    for start, end in remaining:
+        covered.update(range(start, end))
+
+    assert set(range(len(chunk_slices))).issubset(
+        covered | set(range(reassigned[0], reassigned[1])) | set(range(next_lease[0], next_lease[1]))
+    ), "all chunk indices should eventually be processed"
