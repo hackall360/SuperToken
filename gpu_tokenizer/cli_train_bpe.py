@@ -14,6 +14,9 @@ except Exception:  # pragma: no cover - torch may be unavailable in CI
     dist = None
 
 
+DEFAULT_LOG_EVERY = 100
+
+
 def resolve_distributed_rank() -> Tuple[int, int]:
     """Return the (rank, world_size) tuple for the current process.
 
@@ -62,7 +65,44 @@ def partition_paths_for_rank(
     return [unique_sorted[i] for i in range(rank, len(unique_sorted), world_size)]
 
 
-def main() -> None:
+def _parse_gpu_list(raw: str) -> List[int]:
+    values = []
+    for item in raw.split(","):
+        piece = item.strip()
+        if not piece:
+            continue
+        try:
+            index = int(piece)
+        except ValueError as exc:  # pragma: no cover - argparse surfaces message
+            raise argparse.ArgumentTypeError("GPU indices must be integers") from exc
+        if index < 0:
+            raise argparse.ArgumentTypeError("GPU indices must be non-negative")
+        values.append(index)
+    if not values:
+        raise argparse.ArgumentTypeError("At least one GPU index must be provided")
+    # Deduplicate while preserving order to avoid redundant launches.
+    return list(dict.fromkeys(values))
+
+
+def _format_iteration_summary(summary: dict[str, object]) -> str:
+    merge_idx = int(summary.get("merge", 0) or 0)
+    tokens = int(summary.get("tokens", 0) or 0)
+    leases = int(summary.get("leases", 0) or 0)
+    tokens_per_s = float(summary.get("tokens_per_s", 0.0) or 0.0)
+    leases_per_s = float(summary.get("lease_per_s", 0.0) or 0.0)
+    h2d = float(summary.get("h2d_s", 0.0) or 0.0)
+    kernel = float(summary.get("kernel_s", 0.0) or 0.0)
+    d2h = float(summary.get("d2h_s", 0.0) or 0.0)
+    reduction = float(summary.get("reduction_s", 0.0) or 0.0)
+    return (
+        f"[timings] merge {merge_idx:6d} | "
+        f"tokens={tokens:,} ({tokens_per_s:,.0f}/s) | "
+        f"leases={leases:,} ({leases_per_s:,.0f}/s) | "
+        f"h2d={h2d:.3f}s kernel={kernel:.3f}s d2h={d2h:.3f}s reduce={reduction:.3f}s"
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--data",
@@ -96,7 +136,45 @@ def main() -> None:
         default="./bpe_out",
         help="Directory where the trained tokenizer artifacts will be stored",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--dist",
+        action="store_true",
+        help="Enable distributed launcher (experimental, not yet implemented)",
+    )
+    parser.add_argument(
+        "--gpus",
+        type=_parse_gpu_list,
+        default=None,
+        help="Comma-separated list of GPU indices to use for distributed runs",
+    )
+    parser.add_argument(
+        "--target-chunk-ms",
+        type=float,
+        default=None,
+        help="Preferred processing time per chunk in milliseconds",
+    )
+    parser.add_argument(
+        "--log-stage-timings",
+        action="store_true",
+        help="Print EWMA timing summaries alongside merge progress logs",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.target_chunk_ms is not None and args.target_chunk_ms <= 0:
+        parser.error("--target-chunk-ms must be positive when provided")
+
+    if args.gpus is not None and not args.dist:
+        parser.error("--gpus may only be specified together with --dist")
+
+    if args.dist:
+        raise SystemExit("Distributed execution is not implemented yet; omit --dist")
+
+    log_every = DEFAULT_LOG_EVERY
 
     from .autoscaler import AutoScaler
     from .bpe_trainer import GPUBPETrainer
@@ -155,11 +233,27 @@ def main() -> None:
         warm_start_merges=(warm_plan["merges"] if warm_plan else None),
         freeze_warm_start=args.freeze_warm_start,
     )
+    iteration_callback = None
+    if args.log_stage_timings:
+        trainer.metrics.enabled = True
+
+        def _log_iteration(summary: dict[str, object]) -> None:
+            if summary.get("kind") != "merge":
+                return
+            merge_idx = int(summary.get("merge", 0) or 0)
+            if merge_idx <= 0:
+                return
+            if (merge_idx - 1) % max(1, log_every) != 0:
+                return
+            print(_format_iteration_summary(summary), flush=True)
+
+        iteration_callback = _log_iteration
     meta = trainer.fit(
         batcher,
-        log_every=100,
+        log_every=log_every,
         warm_start_plan=warm_plan,
         freeze_warm_start=args.freeze_warm_start if warm_plan else None,
+        on_iteration_summary=iteration_callback,
     )
     trainer.save(args.out_dir)
     print(meta)

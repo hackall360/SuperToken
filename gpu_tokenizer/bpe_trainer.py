@@ -1896,6 +1896,7 @@ class GPUBPETrainer:
         checkpoint_interval: Optional[int] = None,
         checkpoint_dir: Optional[str] = None,
         resume_state: Optional[dict[str, object]] = None,
+        on_iteration_summary: Optional[Callable[[dict[str, object]], None]] = None,
     ) -> dict[str, object]:
         """Train merges using a pipelined GPU workflow when possible."""
 
@@ -1949,6 +1950,12 @@ class GPUBPETrainer:
         iteration_summary: dict[str, object] | None = None
         iteration_summaries: list[dict[str, object]] = []
         self._metrics_iteration_summary = None
+
+        def _record_iteration_summary(summary: dict[str, object]) -> None:
+            snapshot = dict(summary)
+            iteration_summaries.append(snapshot)
+            if on_iteration_summary is not None:
+                on_iteration_summary(snapshot)
 
         def _new_iteration_summary(merge_idx: int, kind: str) -> dict[str, object]:
             return {
@@ -3232,7 +3239,7 @@ class GPUBPETrainer:
                 if metrics_enabled and iteration_summary is not None:
                     iteration_summary["tokens_per_s"] = 0.0
                     iteration_summary["lease_per_s"] = 0.0
-                    iteration_summaries.append(dict(iteration_summary))
+                    _record_iteration_summary(iteration_summary)
                     self._metrics_iteration_summary = None
             warm_meta["applied"] = applied_merges
             self._warm_start_applied = True
@@ -3502,7 +3509,7 @@ class GPUBPETrainer:
                     iteration_summary["lease_per_s"] = (
                         leases_val / token_time if token_time > 0 else 0.0
                     )
-                    iteration_summaries.append(dict(iteration_summary))
+                    _record_iteration_summary(iteration_summary)
                 self._metrics_iteration_summary = None
             if (
                 checkpoint_interval is not None
