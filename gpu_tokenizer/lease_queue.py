@@ -1,58 +1,193 @@
-"""Lease management primitives for coordinating distributed workers.
-
-This module defines the public surface area for managing work leases. Later
-phases will provide concrete implementations; for now we document the expected
-behaviour and raise ``NotImplementedError`` from the stub methods so callers
-understand that the functionality is pending.
-"""
+"""Lease management primitives for coordinating distributed workers."""
 
 from __future__ import annotations
 
+import threading
+import time
+from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Deque, Dict, Iterable, MutableMapping, Optional, Tuple
+
+
+@dataclass(frozen=True)
+class Lease:
+    """Represents a half-open interval ``[start, end)`` of work."""
+
+    start: int
+    end: int
+
+    def as_tuple(self) -> Tuple[int, int]:
+        return (self.start, self.end)
+
+    def __post_init__(self) -> None:  # pragma: no cover - dataclass hook
+        if self.start < 0:
+            raise ValueError("Lease start must be non-negative")
+        if self.end < self.start:
+            raise ValueError("Lease end must be greater or equal to start")
 
 
 @dataclass
-class LeaseState:
-    """Placeholder structure describing the state associated with a lease."""
-
-    lease_id: str
-    payload: Dict[str, Any]
-    owner: Optional[str] = None
+class _LeaseRecord:
+    lease: Lease
+    last_heartbeat: float
 
 
 class LeaseNotary:
-    """Coordinate the lifecycle of work leases across distributed workers.
+    """Thread-safe coordinator that hands out contiguous work intervals.
 
-    Invariants (to be upheld by the future implementation):
-
-    * At most one active lease is granted for a given ``lease_id`` at a time.
-    * ``heartbeat`` calls extend the validity of the most recently granted lease
-      for a worker; missing heartbeats results in the lease being eligible for
-      ``requeue``.
-    * ``serialize_state`` produces a deterministic snapshot of all outstanding
-      leases suitable for persisting and later restoration.
+    ``LeaseNotary`` dispenses leases covering ``total_chunks`` units of work.
+    Each rank may hold at most one inflight lease at a time. Ranks can complete
+    leases, requeue them for reassignment, and periodically record heartbeats
+    to indicate they are still making progress.
     """
 
-    def __init__(self) -> None:
-        raise NotImplementedError
+    def __init__(self, total_chunks: int) -> None:
+        if total_chunks < 0:
+            raise ValueError("total_chunks must be non-negative")
 
-    def grant_lease(self, *, worker_id: str) -> LeaseState:
-        """Return the next available lease for ``worker_id``."""
+        self._lock = threading.Lock()
+        self._total_chunks = total_chunks
+        self._next_idx = 0
+        self._inflight: Dict[int, _LeaseRecord] = {}
+        self._pending_requeue: Deque[Lease] = deque()
 
-        raise NotImplementedError
+    @staticmethod
+    def _now() -> float:
+        return time.monotonic()
 
-    def requeue(self, lease: LeaseState) -> None:
-        """Make ``lease`` available for future ``grant_lease`` calls."""
+    @property
+    def total_chunks(self) -> int:
+        return self._total_chunks
 
-        raise NotImplementedError
+    def grant_lease(self, rank: int, preferred_size: int) -> Optional[Tuple[int, int]]:
+        """Return the next available lease for ``rank``.
 
-    def heartbeat(self, *, lease: LeaseState, worker_id: str) -> None:
-        """Refresh the lease owned by ``worker_id`` to avoid reassignment."""
+        Leases are granted from the ``pending_requeue`` queue first and then
+        from the monotonic ``next_idx`` counter. Returns ``None`` when no more
+        work remains.
+        """
 
-        raise NotImplementedError
+        if preferred_size <= 0:
+            raise ValueError("preferred_size must be positive")
 
-    def serialize_state(self) -> Dict[str, Any]:
-        """Capture the durable state necessary to restore the queue."""
+        with self._lock:
+            if rank in self._inflight:
+                raise RuntimeError("rank already holds an active lease")
 
-        raise NotImplementedError
+            if self._pending_requeue:
+                lease = self._pending_requeue.popleft()
+            else:
+                if self._next_idx >= self._total_chunks:
+                    return None
+                start = self._next_idx
+                end = min(self._total_chunks, start + preferred_size)
+                lease = Lease(start, end)
+                self._next_idx = end
+
+            record = _LeaseRecord(lease=lease, last_heartbeat=self._now())
+            self._inflight[rank] = record
+            return lease.as_tuple()
+
+    def complete_lease(self, rank: int, start: int, end: int) -> None:
+        """Mark the specified lease as completed by ``rank``."""
+
+        lease = Lease(start, end)
+        with self._lock:
+            record = self._inflight.pop(rank, None)
+            if record is None:
+                raise KeyError(f"rank {rank} does not hold a lease")
+            if record.lease != lease:
+                self._inflight[rank] = record  # restore for debuggability
+                raise ValueError("completed lease does not match inflight record")
+
+    def requeue_lease(self, rank: int, start: int, end: int) -> None:
+        """Return an inflight lease to the queue for reassignment."""
+
+        lease = Lease(start, end)
+        with self._lock:
+            record = self._inflight.pop(rank, None)
+            if record is None:
+                raise KeyError(f"rank {rank} does not hold a lease")
+            if record.lease != lease:
+                self._inflight[rank] = record
+                raise ValueError("requeued lease does not match inflight record")
+            self._pending_requeue.appendleft(lease)
+
+    def heartbeat(self, rank: int) -> float:
+        """Record a progress heartbeat for ``rank`` and return the timestamp."""
+
+        with self._lock:
+            record = self._inflight.get(rank)
+            if record is None:
+                raise KeyError(f"rank {rank} does not hold a lease")
+            new_ts = self._now()
+            record.last_heartbeat = new_ts
+            return new_ts
+
+    def state_dict(self) -> Dict[str, object]:
+        """Return a serialisable snapshot of the notary state."""
+
+        with self._lock:
+            inflight: MutableMapping[int, Dict[str, float | Tuple[int, int]]] = {}
+            for rank, record in self._inflight.items():
+                inflight[rank] = {
+                    "lease": record.lease.as_tuple(),
+                    "last_heartbeat": record.last_heartbeat,
+                }
+
+            pending: Iterable[Tuple[int, int]] = (
+                lease.as_tuple() for lease in self._pending_requeue
+            )
+
+            return {
+                "total_chunks": self._total_chunks,
+                "next_idx": self._next_idx,
+                "inflight": dict(inflight),
+                "pending_requeue": list(pending),
+            }
+
+    def load_state_dict(self, state: Dict[str, object]) -> None:
+        """Restore state produced by :meth:`state_dict`."""
+
+        required_keys = {"total_chunks", "next_idx", "inflight", "pending_requeue"}
+        if not required_keys.issubset(state):
+            missing = required_keys - set(state)
+            raise KeyError(f"state missing keys: {sorted(missing)}")
+
+        total_chunks = int(state["total_chunks"])
+        next_idx = int(state["next_idx"])
+        inflight_raw = state["inflight"]
+        pending_raw = state["pending_requeue"]
+
+        if total_chunks < 0:
+            raise ValueError("total_chunks must be non-negative")
+        if not 0 <= next_idx <= total_chunks:
+            raise ValueError("next_idx must be between 0 and total_chunks")
+        if not isinstance(inflight_raw, dict):
+            raise TypeError("inflight must be a mapping")
+        if not isinstance(pending_raw, list):
+            raise TypeError("pending_requeue must be a list")
+
+        inflight: Dict[int, _LeaseRecord] = {}
+        for raw_rank, raw_entry in inflight_raw.items():
+            rank = int(raw_rank)
+            if not isinstance(raw_entry, dict):
+                raise TypeError("inflight entries must be mappings")
+            if "lease" not in raw_entry or "last_heartbeat" not in raw_entry:
+                raise KeyError("inflight entry missing required fields")
+            start, end = raw_entry["lease"]
+            lease = Lease(int(start), int(end))
+            last_hb = float(raw_entry["last_heartbeat"])
+            inflight[rank] = _LeaseRecord(lease=lease, last_heartbeat=last_hb)
+
+        pending_queue: Deque[Lease] = deque()
+        for entry in pending_raw:
+            start, end = entry
+            pending_queue.append(Lease(int(start), int(end)))
+
+        with self._lock:
+            self._total_chunks = total_chunks
+            self._next_idx = next_idx
+            self._inflight = inflight
+            self._pending_requeue = pending_queue
+
