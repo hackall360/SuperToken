@@ -39,7 +39,7 @@ __all__ = [
 def _load_sequences(
     paths: Iterable[Path], bos: int | None, eos: int | None
 ) -> Iterator[Iterator[int]]:
-    """Stream token sequences from ``paths`` using a :class:`BytePacker`.
+    """Yield tokenized documents drawn from memory-mapped shard files.
 
     Args:
         paths: Iterable of shard file paths to open and encode.
@@ -47,13 +47,14 @@ def _load_sequences(
         eos: Optional end-of-sequence token id to suffix onto each document.
 
     Returns:
-        Iterator that yields iterators over integer token ids for each encoded
-        document in the provided shards.
+        Iterator that lazily yields iterables of integer token ids for each
+        document contained in the supplied shards. The outer iterator streams
+        shards while the inner iterator walks the token sequence of each
+        document.
 
     Side Effects:
         Opens :class:`MemoryMappedShard` handles via an :class:`ExitStack` so
-        shard files stay memory-mapped for the duration of the returned
-        generator.
+        shard files stay memory-mapped for the lifetime of the generator.
     """
     packer = BytePacker(bos=bos, eos=eos)
 
@@ -67,14 +68,14 @@ def _load_sequences(
 
 
 def _expand_data_patterns(patterns: Sequence[str]) -> list[Path]:
-    """Resolve glob ``patterns`` into a concrete list of readable files.
+    """Resolve input glob patterns into a deterministic list of shard paths.
 
     Args:
         patterns: Glob expressions pointing at data shards.
 
     Returns:
-        List of unique file paths that matched at least one pattern in the
-        order they were discovered.
+        List of concrete file paths that matched at least one pattern. The
+        results are ordered by discovery so subsequent iteration is stable.
 
     Side Effects:
         Touches the filesystem to discover matching shard files.
@@ -107,7 +108,8 @@ def _iter_packed_batches(
 
     Returns:
         Iterable that yields ``(tokens, mask, lengths)`` tensors suitable for
-        GPU consumption.
+        GPU consumption. Each iteration produces a packed token matrix, a mask
+        indicating valid positions, and per-document lengths.
 
     Side Effects:
         None.
@@ -128,8 +130,9 @@ def _build_unigram_batches(
         seed: Shuffle seed used to stabilize batch ordering.
 
     Returns:
-        List of ``torch.Tensor`` batches representing the token payload for
-        each packed batch.
+        List containing the token payload tensor for every packed batch. Masks
+        and length tensors are intentionally dropped because the unigram
+        objective only consumes token ids.
 
     Side Effects:
         Loads the entire packed representation into host memory so batches can
@@ -147,7 +150,8 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
             trainer hyper-parameters.
 
     Returns:
-        ``None``. Results are printed and written to disk.
+        ``None``. The function prints progress summaries and writes a structured
+        report for downstream inspection.
 
     Side Effects:
         Generates synthetic corpora when requested, reads optional datasets,
@@ -204,6 +208,9 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
         )
 
     corpus = benchmark_runner.summarize_corpus(sequences, sources=sources)
+    # The synthetic/real corpus mixtures above feed both trainers, allowing
+    # benchmarking code to compare how each algorithm responds to identical
+    # token streams.
     bpe = benchmark_runner.run_bpe_benchmark(
         sequences,
         base_vocab=args.bpe_base_vocab,
@@ -224,6 +231,9 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
         seed=args.seed,
     )
     print(benchmark_runner.emit_benchmark_summary(corpus, bpe, unigram))
+    # Persist full benchmark metadata so checkpointing infrastructure can re-use
+    # the exact same corpora, hyper-parameters, and timing metrics in later
+    # automation runs.
     output_path = benchmark_runner.serialize_run(
         Path(args.output_dir),
         corpus=corpus,
@@ -258,7 +268,7 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
 
     Returns:
         ``None``. Progress and metadata are surfaced via stdout and optional
-        checkpoint directories.
+        checkpoint directories while the trained model may be exported.
 
     Side Effects:
         Uses :class:`AutoScaler` suggestions to resize the active batch size,
@@ -279,6 +289,8 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
         min_bs=args.min_batch,
         max_bs=args.max_batch,
     )
+    # Seed the autoscaler with an initial utilization target; the suggested
+    # batch size is later adjusted to respect CLI bounds.
     suggestion = autoscaler.suggest(token_bytes_per_example=args.token_bytes)
     batch_size = min(args.max_batch, max(args.min_batch, suggestion.batch_size))
     packer = BytePacker(bos=args.bos, eos=args.eos)
@@ -425,6 +437,8 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
         current_batch_size = new_bs
         if streamer is None:
             return
+        # Autoscaler triggered a resize: tear down the current streamer so it
+        # restarts with the new batch size and refreshed packing layout.
         streamer.close()
         streamer = _build_streamer()
         batches = StreamingPackedBatcher(
@@ -474,7 +488,8 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
 
     Side Effects:
         Loads all packed batches into host memory and writes the trained model
-        to ``args.out_dir`` when provided.
+        to ``args.out_dir`` when provided. The trainer's internal state is
+        mutated across epochs.
 
     Raises:
         SystemExit: If ``--data`` is omitted or the globs do not resolve to at
