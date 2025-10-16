@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import pathlib
 import queue
 import sys
@@ -83,6 +84,8 @@ def _patch_common_runtime(monkeypatch: pytest.MonkeyPatch):
 
     broadcast_payload: list[object] = []
     broadcast_log: list[tuple[int, object]] = []
+    gather_log: list[tuple[int, object]] = []
+    gather_buffer: list[object] = []
 
     def _broadcast(obj_list, *, src=0, group=None):
         if obj_list:
@@ -92,12 +95,23 @@ def _patch_common_runtime(monkeypatch: pytest.MonkeyPatch):
         elif obj_list and broadcast_payload:
             obj_list[0] = broadcast_payload[0]
 
+    def _gather_object(obj: object, gather_list=None, *, dst=0, group=None):
+        rank = int(os.environ.get("RANK", "0"))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if len(gather_buffer) != world_size:
+            gather_buffer[:] = [None] * world_size
+        gather_buffer[rank] = obj
+        gather_log.append((rank, obj))
+        if gather_list is not None:
+            gather_list[:] = list(gather_buffer)
+
     fake_dist = types.SimpleNamespace(
         is_available=lambda: True,
         is_initialized=lambda: True,
         init_process_group=lambda **_kwargs: None,
         destroy_process_group=_destroy,
         broadcast_object_list=_broadcast,
+        gather_object=_gather_object,
     )
     monkeypatch.setattr(dist_runtime, "dist", fake_dist, raising=False)
 
@@ -123,6 +137,7 @@ def _patch_common_runtime(monkeypatch: pytest.MonkeyPatch):
         "installed_handlers": installed_handlers,
         "registered_cleanup": registered_cleanup,
         "broadcast_log": broadcast_log,
+        "gather_log": gather_log,
     }
 
 
@@ -331,3 +346,72 @@ def test_requeued_leases_are_reassigned(monkeypatch: pytest.MonkeyPatch) -> None
     assert set(range(len(chunk_slices))).issubset(
         covered | set(range(reassigned[0], reassigned[1])) | set(range(next_lease[0], next_lease[1]))
     ), "all chunk indices should eventually be processed"
+
+
+def test_startup_throughput_weights_normalised(monkeypatch: pytest.MonkeyPatch) -> None:
+    dist_runtime, artifacts = _patch_common_runtime(monkeypatch)
+    dist_runtime._reset_lease_registry()
+
+    host_state = dist_runtime._LeaseHostState(
+        notary=dist_runtime.LeaseNotary(total_chunks=4, lease_ttl=1.0),
+        lock=threading.Lock(),
+    )
+
+    world_size = 3
+    clients = [
+        dist_runtime.DistributedLeaseClient(
+            job_id="calibration",
+            rank=rank,
+            world_size=world_size,
+            host_state=host_state,
+        )
+        for rank in range(world_size)
+    ]
+
+    total = 0.0
+    throughputs = []
+
+    class DummyMetrics:
+        def __init__(self, value: float) -> None:
+            self.enabled = True
+            self._value = float(value)
+
+        def record_tokens(self, tokens: int, duration_s: float, *, leases: int | None = None) -> None:
+            pass
+
+        @property
+        def tokens_per_s(self) -> float:
+            return self._value
+
+    os.environ["WORLD_SIZE"] = str(world_size)
+    for rank in range(1, world_size):
+        value = 200.0 / (2 ** rank)
+        throughputs.append(value)
+        total += value
+        os.environ["RANK"] = str(rank)
+        metrics = DummyMetrics(value)
+        dist_runtime._collect_startup_throughput_samples(
+            rank=rank,
+            world_size=world_size,
+            lease_client=clients[rank],
+            metrics=metrics,
+        )
+
+    root_value = 200.0
+    throughputs.insert(0, root_value)
+    total += root_value
+    os.environ["RANK"] = "0"
+    dist_runtime._collect_startup_throughput_samples(
+        rank=0,
+        world_size=world_size,
+        lease_client=clients[0],
+        metrics=DummyMetrics(root_value),
+    )
+
+    weights = host_state.notary.rank_weights()
+    assert pytest.approx(sum(weights.values()), rel=1e-9, abs=1e-9) == 1.0
+    for idx, value in enumerate(throughputs):
+        expected = value / total
+        assert pytest.approx(weights[idx], rel=1e-9, abs=1e-9) == expected
+
+    assert artifacts["gather_log"]

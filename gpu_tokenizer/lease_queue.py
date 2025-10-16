@@ -53,6 +53,7 @@ class LeaseNotary:
         self._inflight: Dict[int, _LeaseRecord] = {}
         self._pending_requeue: Deque[Lease] = deque()
         self._lease_ttl = float(lease_ttl)
+        self._rank_weights: Dict[int, float] = {}
 
     @staticmethod
     def _now() -> float:
@@ -187,6 +188,7 @@ class LeaseNotary:
                 "inflight": dict(inflight),
                 "pending_requeue": list(pending),
                 "lease_ttl": self._lease_ttl,
+                "rank_weights": dict(self._rank_weights),
             }
 
     def load_state_dict(self, state: Dict[str, object]) -> None:
@@ -207,6 +209,7 @@ class LeaseNotary:
         inflight_raw = state["inflight"]
         pending_raw = state["pending_requeue"]
         lease_ttl = float(state.get("lease_ttl", self._lease_ttl))
+        rank_weights_raw = state.get("rank_weights", {})
 
         if total_chunks < 0:
             raise ValueError("total_chunks must be non-negative")
@@ -218,6 +221,10 @@ class LeaseNotary:
             raise TypeError("pending_requeue must be a list")
         if lease_ttl <= 0:
             raise ValueError("lease_ttl must be positive")
+        if rank_weights_raw is None:
+            rank_weights_raw = {}
+        if not isinstance(rank_weights_raw, dict):
+            raise TypeError("rank_weights must be a mapping")
 
         inflight: Dict[int, _LeaseRecord] = {}
         for raw_rank, raw_entry in inflight_raw.items():
@@ -236,10 +243,38 @@ class LeaseNotary:
             start, end = entry
             pending_queue.append(Lease(int(start), int(end)))
 
+        rank_weights: Dict[int, float] = {}
+        for raw_rank, raw_weight in rank_weights_raw.items():
+            rank = int(raw_rank)
+            weight = float(raw_weight)
+            if weight < 0:
+                raise ValueError("rank weight must be non-negative")
+            rank_weights[rank] = weight
+
         with self._lock:
             self._total_chunks = total_chunks
             self._next_idx = next_idx
             self._inflight = inflight
             self._pending_requeue = pending_queue
             self._lease_ttl = lease_ttl
+            self._rank_weights = rank_weights
+
+    def update_rank_weights(self, weights: Dict[int, float]) -> None:
+        """Persist normalised per-rank weights for adaptive lease sizing."""
+
+        with self._lock:
+            cleaned: Dict[int, float] = {}
+            for raw_rank, raw_weight in weights.items():
+                rank = int(raw_rank)
+                weight = float(raw_weight)
+                if weight < 0:
+                    raise ValueError("rank weight must be non-negative")
+                cleaned[rank] = weight
+            self._rank_weights = cleaned
+
+    def rank_weights(self) -> Dict[int, float]:
+        """Return a copy of the stored per-rank weights."""
+
+        with self._lock:
+            return dict(self._rank_weights)
 

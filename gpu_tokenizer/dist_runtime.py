@@ -15,6 +15,8 @@ from datetime import timedelta
 from types import FrameType
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
+import time
+
 try:  # pragma: no cover - torch is optional in some environments
     import torch
     import torch.distributed as dist
@@ -60,6 +62,8 @@ class _LeaseHostState:
 
 _LEASE_REGISTRY_LOCK = threading.Lock()
 _LEASE_REGISTRY: Dict[str, _LeaseHostState] = {}
+
+_STARTUP_SAMPLE_LEASES = 2
 
 
 def _normalize_job_id(job_id: str | None) -> str:
@@ -171,6 +175,18 @@ class DistributedLeaseClient:
         self._broadcast_event("requeue", lease=(int(start), int(end)))
         return (int(start), int(end))
 
+    def update_rank_weights(self, weights: Dict[int, float]) -> None:
+        """Persist *weights* into the shared :class:`LeaseNotary`."""
+
+        with self._host_state.lock:
+            self._host_state.notary.update_rank_weights(weights)
+
+    def rank_weights(self) -> Dict[int, float]:
+        """Return the cached per-rank weights from the notary."""
+
+        with self._host_state.lock:
+            return self._host_state.notary.rank_weights()
+
     def iter_leases(self, preferred_size: int) -> Iterator[Tuple[int, int]]:
         while True:
             lease = self.request_lease(preferred_size)
@@ -219,6 +235,124 @@ def register_lease_client(
         host_state=host_state,
         root=root,
     )
+
+
+def _measure_startup_throughput(
+    lease_client: Optional[DistributedLeaseClient],
+    metrics: "TrainerMetricsEWMA | None",
+    sample_leases: int = _STARTUP_SAMPLE_LEASES,
+) -> Optional[float]:
+    """Return a throughput estimate derived from ``metrics``."""
+
+    if metrics is None or not getattr(metrics, "enabled", False):
+        return None
+
+    processed = 0
+    start_ts = time.perf_counter()
+    if lease_client is not None and sample_leases > 0:
+        sample_budget = min(sample_leases, max(0, lease_client.total_chunks))
+        for _ in range(sample_budget):
+            lease = lease_client.request_lease(1)
+            if lease is None:
+                break
+            width = max(0, int(lease[1]) - int(lease[0]))
+            processed += width
+            try:
+                lease_client.requeue_lease(*lease)
+            except Exception:
+                logger.debug("startup_lease_requeue_failed", exc_info=True)
+                break
+
+    elapsed = time.perf_counter() - start_ts
+    if processed > 0 and elapsed > 0.0:
+        try:
+            metrics.record_tokens(tokens=processed, duration_s=elapsed, leases=processed)
+        except Exception:
+            logger.debug("startup_metrics_record_failed", exc_info=True)
+
+    sample = getattr(metrics, "tokens_per_s", None)
+    if sample is None:
+        return None
+    try:
+        return float(sample)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalise_throughput_samples(samples: Sequence[Optional[float]]) -> Dict[int, float]:
+    """Convert raw throughput measurements into normalised weights."""
+
+    cleaned: List[float] = []
+    for value in samples:
+        if value is None:
+            cleaned.append(0.0)
+            continue
+        try:
+            cleaned.append(max(0.0, float(value)))
+        except (TypeError, ValueError):
+            cleaned.append(0.0)
+
+    world_size = len(cleaned)
+    if world_size == 0:
+        return {}
+
+    total = sum(cleaned)
+    if total <= 0.0:
+        uniform = 1.0 / float(world_size)
+        return {idx: uniform for idx in range(world_size)}
+
+    return {idx: (value / total) for idx, value in enumerate(cleaned)}
+
+
+def _collect_startup_throughput_samples(
+    *,
+    rank: int,
+    world_size: int,
+    lease_client: Optional[DistributedLeaseClient],
+    metrics: "TrainerMetricsEWMA | None",
+) -> None:
+    """Gather per-rank throughput samples and persist normalised weights."""
+
+    if (
+        dist is None
+        or not hasattr(dist, "gather_object")
+        or not hasattr(dist, "broadcast_object_list")
+        or not dist.is_available()
+        or not dist.is_initialized()
+        or world_size <= 1
+    ):
+        return
+
+    sample = _measure_startup_throughput(lease_client, metrics)
+    payload = float(sample) if sample is not None else 0.0
+
+    gather_list: List[Optional[float]] | None = None
+    if rank == 0:
+        gather_list = [None] * world_size
+
+    try:
+        dist.gather_object(payload, gather_list, dst=0)  # type: ignore[arg-type]
+    except Exception:
+        logger.debug("startup_throughput_gather_failed", exc_info=True)
+        return
+
+    weights: Dict[int, float] | None = None
+    if rank == 0 and gather_list is not None:
+        weights = _normalise_throughput_samples(gather_list)
+
+    message: List[object] = [weights]
+    try:
+        dist.broadcast_object_list(message, src=0)  # type: ignore[arg-type]
+    except Exception:
+        logger.debug("startup_throughput_broadcast_failed", exc_info=True)
+        return
+
+    payload_weights = message[0]
+    if isinstance(payload_weights, dict) and lease_client is not None:
+        try:
+            lease_client.update_rank_weights({int(k): float(v) for k, v in payload_weights.items()})
+        except Exception:
+            logger.debug("startup_rank_weight_update_failed", exc_info=True)
 
 
 def plan_chunk_slices(
@@ -728,6 +862,13 @@ def _worker_entry(rank: int, config: DistributedLaunchConfig, cli_args: Sequence
                 "trainer_device_count": len(trainer.devices),
                 "lease_metadata": lease_metadata,
             },
+        )
+
+        _collect_startup_throughput_samples(
+            rank=rank,
+            world_size=config.world_size,
+            lease_client=lease_client,
+            metrics=getattr(trainer, "metrics", None),
         )
     finally:
         _restore_signal_handlers(worker_previous_handlers)
