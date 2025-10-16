@@ -204,30 +204,72 @@ class GPUBatchRecord:
         valid_cpu: torch.Tensor,
         lengths_cpu: torch.Tensor,
         device: torch.device,
+        *,
+        ctx: Optional["DeviceContext"] = None,
     ) -> "GPUBatchRecord":
         storage_width = int(tokens_cpu.shape[1])
         length_dtype = length_storage_dtype(storage_width)
-        tokens_host = tokens_cpu.to(torch.int32).pin_memory()
-        valid_host = valid_cpu.to(torch.uint8).pin_memory()
+        tokens_int = tokens_cpu.to(torch.int32)
+        valid_uint = valid_cpu.to(torch.uint8)
         coerced_lengths, overflow = clamp_lengths_to_dtype(lengths_cpu, length_dtype)
-        lengths_host = coerced_lengths.pin_memory()
-        tokens_dev = tokens_host.to(device=device, non_blocking=True)
-        valid_dev = valid_host.to(device=device, non_blocking=True)
-        lengths_dev = lengths_host.to(device=device, non_blocking=True)
         overflow_dev: Optional[torch.Tensor] = None
-        if overflow is not None:
-            overflow_dev = overflow.to(device=device, non_blocking=True)
+        host_tokens: Optional[torch.Tensor]
+        host_valid: Optional[torch.Tensor]
+        host_lengths: Optional[torch.Tensor]
+        host_length_overflow: Optional[torch.Tensor]
+        transfer_event: Optional[torch.cuda.Event] = None
+        if ctx is not None and ctx.device.type == "cuda":
+            tokens_host, valid_host, lengths_host = ctx.prepare_staging_buffers(
+                tokens_int.shape, coerced_lengths.dtype
+            )
+            tokens_host.copy_(tokens_int)
+            valid_host.copy_(valid_uint)
+            lengths_host.copy_(coerced_lengths)
+            overflow_host: Optional[torch.Tensor] = None
+            if overflow is not None:
+                overflow_host = ctx.prepare_overflow_buffer(tokens_int.shape[0])
+                overflow_host.copy_(overflow)
+            with torch.cuda.device(device), torch.cuda.stream(ctx.h2d_stream):
+                tokens_dev = tokens_host.to(device=device, non_blocking=True)
+                valid_dev = valid_host.to(device=device, non_blocking=True)
+                lengths_dev = lengths_host.to(device=device, non_blocking=True)
+                if overflow is not None and overflow_host is not None:
+                    overflow_dev = overflow_host.to(device=device, non_blocking=True)
+                transfer_event = torch.cuda.Event(blocking=False)
+                transfer_event.record(ctx.h2d_stream)
+            ctx.pending_h2d_event = transfer_event
+            host_tokens = None
+            host_valid = None
+            host_lengths = None
+            host_length_overflow = None
+        else:
+            tokens_host = tokens_int.pin_memory()
+            valid_host = valid_uint.pin_memory()
+            lengths_host = coerced_lengths.pin_memory()
+            tokens_dev = tokens_host.to(device=device, non_blocking=True)
+            valid_dev = valid_host.to(device=device, non_blocking=True)
+            lengths_dev = lengths_host.to(device=device, non_blocking=True)
+            if overflow is not None:
+                host_length_overflow = overflow.pin_memory()
+                overflow_dev = host_length_overflow.to(device=device, non_blocking=True)
+            else:
+                host_length_overflow = None
+            host_tokens = tokens_host
+            host_valid = valid_host
+            host_lengths = lengths_host
         record = cls(
             tokens=tokens_dev,
             valid=valid_dev,
             lengths=lengths_dev,
-            host_tokens=tokens_host,
-            host_valid=valid_host,
-            host_lengths=lengths_host,
+            host_tokens=host_tokens,
+            host_valid=host_valid,
+            host_lengths=host_lengths,
             host_dirty=False,
             length_overflow=overflow_dev,
-            host_length_overflow=overflow,
+            host_length_overflow=host_length_overflow,
         )
+        if transfer_event is not None:
+            record.device_event = transfer_event
         record.ensure_workspaces()
         return record
 
@@ -316,6 +358,8 @@ class GPUBatchRecord:
     def wait_for_device(self, stream: torch.cuda.Stream) -> None:
         """Ensure device computations affecting this batch are completed."""
 
+        if self.host_event is not None:
+            stream.wait_event(self.host_event)
         if self.device_event is not None:
             stream.wait_event(self.device_event)
             self.device_event = None
@@ -324,7 +368,7 @@ class GPUBatchRecord:
         """Schedule an asynchronous copy of device data back to host."""
 
         self.ensure_host_buffers()
-        event = torch.cuda.Event(blocking=False)
+        event = torch.cuda.Event(blocking=False, enable_timing=True)
         with torch.cuda.stream(copy_stream):
             self.wait_for_device(copy_stream)
             assert self.host_tokens is not None
@@ -381,7 +425,8 @@ class DeviceContext:
 
     device: torch.device
     compute_stream: torch.cuda.Stream
-    copy_stream: torch.cuda.Stream
+    h2d_stream: torch.cuda.Stream
+    d2h_stream: torch.cuda.Stream
     bytes_h2d: int = 0
     bytes_d2h: int = 0
     h2d_events: int = 0
@@ -390,9 +435,50 @@ class DeviceContext:
     stage_transfers: dict[str, dict[str, int]] = field(default_factory=dict)
     memory_snapshots: list[dict[str, object]] = field(default_factory=list)
     utilization_samples: list[dict[str, float]] = field(default_factory=list)
+    staging_tokens: Optional[torch.Tensor] = None
+    staging_valid: Optional[torch.Tensor] = None
+    staging_lengths: Optional[torch.Tensor] = None
+    staging_overflow: Optional[torch.Tensor] = None
+    pending_h2d_event: Optional[torch.cuda.Event] = None
 
     def reset_activity(self) -> None:
         self.active_batches.clear()
+
+    def _await_pending_h2d(self) -> None:
+        if self.pending_h2d_event is not None:
+            self.pending_h2d_event.synchronize()
+            self.pending_h2d_event = None
+
+    def prepare_staging_buffers(
+        self, shape: tuple[int, int], length_dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self._await_pending_h2d()
+        rows, width = shape
+        if self.staging_tokens is None or self.staging_tokens.shape != (rows, width):
+            self.staging_tokens = (
+                torch.empty((rows, width), dtype=torch.int32, device="cpu").pin_memory()
+            )
+        if self.staging_valid is None or self.staging_valid.shape != (rows, width):
+            self.staging_valid = (
+                torch.empty((rows, width), dtype=torch.uint8, device="cpu").pin_memory()
+            )
+        if (
+            self.staging_lengths is None
+            or self.staging_lengths.shape != (rows,)
+            or self.staging_lengths.dtype != length_dtype
+        ):
+            self.staging_lengths = (
+                torch.empty((rows,), dtype=length_dtype, device="cpu").pin_memory()
+            )
+        return self.staging_tokens, self.staging_valid, self.staging_lengths
+
+    def prepare_overflow_buffer(self, rows: int) -> torch.Tensor:
+        self._await_pending_h2d()
+        if self.staging_overflow is None or self.staging_overflow.shape != (rows,):
+            self.staging_overflow = (
+                torch.empty((rows,), dtype=torch.bool, device="cpu").pin_memory()
+            )
+        return self.staging_overflow
 
     def log_transfer(self, stage: str, direction: str, amount: int) -> None:
         stage_key = stage or "general"
@@ -525,8 +611,11 @@ class CPUFallbackBatch:
             shard_tokens = tokens_cpu[start:end].clone()
             shard_valid = valid_cpu[start:end].clone()
             shard_lengths = lengths_cpu[start:end].clone()
-            record = GPUBatchRecord.from_cpu(shard_tokens, shard_valid, shard_lengths, device)
-            record_transfer(contexts[device], record)
+            ctx = contexts[device]
+            record = GPUBatchRecord.from_cpu(
+                shard_tokens, shard_valid, shard_lengths, device, ctx=ctx
+            )
+            record_transfer(ctx, record)
             shards[device] = record
             start = end
         return cls(shards)
@@ -2116,7 +2205,8 @@ class GPUBPETrainer:
                 device_contexts[dev] = DeviceContext(
                     device=dev,
                     compute_stream=torch.cuda.Stream(device=dev),
-                    copy_stream=torch.cuda.Stream(device=dev),
+                    h2d_stream=torch.cuda.Stream(device=dev),
+                    d2h_stream=torch.cuda.Stream(device=dev),
                 )
             self._device_contexts = device_contexts
             for ctx in device_contexts.values():
@@ -2593,17 +2683,17 @@ class GPUBPETrainer:
                                 stage="host_sync",
                             )
                             with torch.cuda.device(dev):
-                                shard.schedule_host_sync(ctx.copy_stream)
+                                shard.schedule_host_sync(ctx.d2h_stream)
                             pending_copy = True
                         elif shard.host_event is not None:
                             pending_copy = True
                 for dev, ctx in device_contexts.items():
-                    torch.cuda.current_stream(device=dev).wait_stream(ctx.copy_stream)
+                    torch.cuda.current_stream(device=dev).wait_stream(ctx.d2h_stream)
                 if profile_streams and pending_copy:
                     for dev, ctx in device_contexts.items():
                         torch.cuda.set_device(dev)
                         torch.cuda.synchronize(dev)
-                        assert ctx.copy_stream.query(), "copy stream did not drain"
+                        assert ctx.d2h_stream.query(), "copy stream did not drain"
                 for batch in records:
                     for _dev, shard in batch.iter_shards():
                         shard.resolve_host()
@@ -2980,7 +3070,7 @@ class GPUBPETrainer:
                                         stage="host_sync",
                                     )
                                     with torch.cuda.device(dev):
-                                        shard.schedule_host_sync(ctx.copy_stream)
+                                        shard.schedule_host_sync(ctx.d2h_stream)
                                     pending_copy[dev] = True
                             except RuntimeError as exc:
                                 if "CUDA out of memory" in str(exc):
@@ -3027,7 +3117,7 @@ class GPUBPETrainer:
                         _capture_device_snapshots("host_sync:merge:start")
                         sync_start = time.perf_counter()
                         for dev, ctx in device_contexts.items():
-                            torch.cuda.current_stream(device=dev).wait_stream(ctx.copy_stream)
+                            torch.cuda.current_stream(device=dev).wait_stream(ctx.d2h_stream)
                         for batch in gpu_records:
                             for _dev, shard in batch.iter_shards():
                                 shard.resolve_host()
@@ -3044,7 +3134,7 @@ class GPUBPETrainer:
                                 torch.cuda.set_device(dev)
                                 torch.cuda.synchronize(dev)
                                 if copy_pending:
-                                    assert ctx.copy_stream.query(), "copy stream did not drain"
+                                    assert ctx.d2h_stream.query(), "copy stream did not drain"
                                 if compute_pending:
                                     assert ctx.compute_stream.query(), "compute stream did not drain"
                     updated_records: list[Union[MultiDeviceBatch, CPUFallbackBatch]] = []
