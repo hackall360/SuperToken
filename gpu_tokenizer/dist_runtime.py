@@ -33,6 +33,7 @@ try:  # pragma: no cover - optional type for static analysis
 except Exception:  # pragma: no cover - fallback when torch missing
     ProcessContext = object  # type: ignore[misc,assignment]
 
+from . import utils
 from .io import make_chunker
 from .lease_queue import LeaseNotary
 
@@ -903,6 +904,8 @@ def _worker_entry(rank: int, config: DistributedLaunchConfig, cli_args: Sequence
     logging.getLogger().setLevel(config.log_level)
     worker_logger = logging.getLogger(f"{__name__}.worker")
 
+    _enable_peer_access_for_devices(config.device_ids, logger=worker_logger)
+
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(config.world_size)
     os.environ["LOCAL_RANK"] = str(rank)
@@ -1000,6 +1003,76 @@ def _worker_entry(rank: int, config: DistributedLaunchConfig, cli_args: Sequence
         )
     finally:
         _restore_signal_handlers(worker_previous_handlers)
+
+
+def _enable_peer_access_for_devices(
+    device_ids: Sequence[int], *, logger: Optional[logging.Logger] = None
+) -> None:
+    """Probe peer access between ``device_ids`` and enable it when possible."""
+
+    if torch is None or not hasattr(torch, "cuda"):
+        return
+
+    cuda_mod = torch.cuda
+    if not hasattr(cuda_mod, "is_available") or not cuda_mod.is_available():
+        return
+
+    enable_fn = getattr(cuda_mod, "device_enable_peer_access", None)
+    device_ctx = getattr(cuda_mod, "device", None)
+    if enable_fn is None or device_ctx is None:
+        return
+
+    try:
+        canonical = sorted({int(idx) for idx in device_ids})
+    except Exception:
+        return
+
+    if len(canonical) <= 1:
+        return
+
+    for src in canonical:
+        try:
+            with device_ctx(src):
+                for dst in canonical:
+                    if dst == src:
+                        continue
+                    try:
+                        if not utils.can_peer(src, dst):
+                            continue
+                    except Exception:
+                        if logger is not None:
+                            logger.debug(
+                                "peer_access_probe_failed",
+                                extra={"src_device": src, "dst_device": dst},
+                                exc_info=True,
+                            )
+                        continue
+                    try:
+                        enable_fn(dst)
+                    except RuntimeError as exc:
+                        message = str(exc).lower()
+                        if "already enabled" in message:
+                            continue
+                        if logger is not None:
+                            logger.debug(
+                                "peer_access_enable_failed",
+                                extra={"src_device": src, "dst_device": dst},
+                                exc_info=True,
+                            )
+                    except Exception:
+                        if logger is not None:
+                            logger.debug(
+                                "peer_access_enable_failed",
+                                extra={"src_device": src, "dst_device": dst},
+                                exc_info=True,
+                            )
+        except Exception:
+            if logger is not None:
+                logger.debug(
+                    "peer_access_context_failed",
+                    extra={"src_device": src},
+                    exc_info=True,
+                )
 
 
 def launch_workers(config: LaunchConfig) -> None:

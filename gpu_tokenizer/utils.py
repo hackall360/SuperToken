@@ -82,6 +82,57 @@ def can_peer(src: int, dst: int) -> bool:
     return result
 
 
+def peer_copy_tensor(
+    dst: torch.Tensor,
+    src: torch.Tensor,
+    *,
+    stream: Optional[torch.cuda.Stream] = None,
+) -> bool:
+    """Attempt to copy ``src`` into ``dst`` using CUDA peer-to-peer transfers.
+
+    When both tensors reside on CUDA devices and peer access is available, the
+    helper schedules a :func:`torch.cuda.memcpy_peer_async` on ``stream`` (or the
+    current stream when ``stream`` is ``None``).  The function returns ``True``
+    when the peer copy path was taken.  If peer access is unavailable or the
+    async copy raises an exception, the function returns ``False`` so callers can
+    fall back to a traditional ``Tensor.copy_``.
+    """
+
+    if torch is None or not torch.cuda.is_available():
+        return False
+
+    if dst.device.type != "cuda" or src.device.type != "cuda":
+        return False
+
+    memcpy_peer = getattr(torch.cuda, "memcpy_peer_async", None)
+    if memcpy_peer is None:
+        return False
+
+    src_index = src.device.index
+    dst_index = dst.device.index
+    if src_index is None:
+        src_index = torch.cuda.current_device()
+    if dst_index is None:
+        dst_index = torch.cuda.current_device()
+
+    try:
+        if not can_peer(int(src_index), int(dst_index)):
+            return False
+    except RuntimeError:
+        return False
+
+    try:
+        if stream is None:
+            memcpy_peer(dst, int(dst_index), src, int(src_index))
+        else:
+            with torch.cuda.stream(stream):
+                memcpy_peer(dst, int(dst_index), src, int(src_index))
+    except RuntimeError:
+        return False
+
+    return True
+
+
 def _clear_cached_process_groups() -> None:
     """Reset cached process-group metadata (primarily for tests)."""
 
