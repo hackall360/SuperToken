@@ -84,7 +84,8 @@ def test_state_dict_roundtrip() -> None:
     assert "rank_weights" in snap
     assert snap["rank_weights"] == {}
     assert snap["min_lease_size"] == 1
-    assert snap["max_active_leases"] == 1
+    assert snap["max_active_leases"] == 2
+    assert snap.get("idle_metrics") == {}
     assert "records" in snap["inflight"][1]
     assert isinstance(snap["inflight"][1]["records"], list)
 
@@ -159,7 +160,7 @@ def test_concurrent_grants_produce_unique_intervals() -> None:
 
 
 def test_reject_invalid_progressions() -> None:
-    notary = LeaseNotary(total_chunks=4, lease_ttl=2.0)
+    notary = LeaseNotary(total_chunks=4, lease_ttl=2.0, max_active_leases=1)
 
     notary.grant_lease(rank=0, preferred_size=2)
 
@@ -324,4 +325,18 @@ def test_rank_weights_roundtrip() -> None:
     restored.load_state_dict(snap)
 
     assert restored.rank_weights() == {0: 0.7, 1: 0.3}
+
+
+def test_record_idle_tracks_metrics() -> None:
+    notary = LeaseNotary(total_chunks=0, lease_ttl=5.0)
+
+    notary.record_idle(rank=0, duration_s=0.120)
+    notary.record_idle(rank=0, duration_s=0.020)
+
+    metrics = notary.state_dict()["idle_metrics"]
+    assert 0 in metrics
+    entry = metrics[0]
+    assert entry["samples"] == 2
+    assert entry["last_ms"] == pytest.approx(20.0)
+    assert entry["ewma_ms"] == pytest.approx((0.2 * 20.0) + (0.8 * 120.0))
 

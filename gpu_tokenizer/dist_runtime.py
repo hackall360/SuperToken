@@ -6,6 +6,7 @@ import atexit
 import contextlib
 import hashlib
 import logging
+import math
 import os
 import queue
 import signal
@@ -73,13 +74,20 @@ def _normalize_job_id(job_id: str | None) -> str:
     return job_id
 
 
-def _get_or_create_host_state(job_id: str, total_chunks: int) -> _LeaseHostState:
+def _get_or_create_host_state(
+    job_id: str, total_chunks: int, *, max_active_leases: int | None = None
+) -> _LeaseHostState:
     if total_chunks < 0:
         raise ValueError("total_chunks must be non-negative")
+    if max_active_leases is not None and max_active_leases <= 0:
+        raise ValueError("max_active_leases must be positive when provided")
     with _LEASE_REGISTRY_LOCK:
         state = _LEASE_REGISTRY.get(job_id)
         if state is None:
-            notary = LeaseNotary(total_chunks=total_chunks)
+            kwargs: dict[str, object] = {"total_chunks": total_chunks}
+            if max_active_leases is not None:
+                kwargs["max_active_leases"] = max_active_leases
+            notary = LeaseNotary(**kwargs)
             state = _LeaseHostState(notary=notary, lock=threading.Lock())
             _LEASE_REGISTRY[job_id] = state
         elif state.total_chunks != total_chunks:
@@ -87,6 +95,8 @@ def _get_or_create_host_state(job_id: str, total_chunks: int) -> _LeaseHostState
                 f"Existing lease registry for job {job_id!r} was initialised with "
                 f"{state.total_chunks} chunks but {total_chunks} were requested"
             )
+        elif max_active_leases is not None:
+            state.notary.update_max_active_leases(max_active_leases)
     return state
 
 
@@ -207,6 +217,11 @@ class DistributedLeaseClient:
         with self._host_state.lock:
             return self._host_state.notary.rank_weights()
 
+    def record_idle(self, duration_s: float) -> None:
+        """Record *duration_s* seconds of idle time for this rank."""
+
+        self._host_state.notary.record_idle(self.rank, duration_s)
+
     def iter_leases(self, preferred_size: int) -> Iterator[Tuple[int, int]]:
         while True:
             lease = self.request_lease(preferred_size)
@@ -222,6 +237,7 @@ def register_lease_client(
     rank: int,
     world_size: int,
     root: int = 0,
+    max_active_leases: int | None = None,
 ) -> DistributedLeaseClient:
     """Return a :class:`DistributedLeaseClient` registered with rank ``root``."""
 
@@ -247,7 +263,9 @@ def register_lease_client(
             normalized_job = _normalize_job_id(str(info.get("job_id")))
             total_chunks = int(info.get("total_chunks", total_chunks))
 
-    host_state = _get_or_create_host_state(normalized_job, int(total_chunks))
+    host_state = _get_or_create_host_state(
+        normalized_job, int(total_chunks), max_active_leases=max_active_leases
+    )
     return DistributedLeaseClient(
         job_id=normalized_job,
         rank=rank,
@@ -422,6 +440,8 @@ def iterate_leased_shards(
     shard_opener: Callable[[str], contextlib.AbstractContextManager],
     preferred_lease_size: int = 1,
     prefetch_threshold: int = 0,
+    min_inflight: int = 1,
+    prefetch_slack_ms: float = 50.0,
 ) -> Iterator[Iterator[int]]:
     """Yield shard iterators governed by leases from ``lease_client``."""
 
@@ -429,9 +449,24 @@ def iterate_leased_shards(
         raise ValueError("preferred_lease_size must be positive")
     if prefetch_threshold < 0:
         raise ValueError("prefetch_threshold must be non-negative")
+    if min_inflight <= 0:
+        raise ValueError("min_inflight must be positive")
+    if prefetch_slack_ms < 0:
+        raise ValueError("prefetch_slack_ms must be non-negative")
     total_chunks = len(chunk_slices)
     outstanding_chunks = 0
     active: Deque[Dict[str, int]] = deque()
+    base_target = max(min_inflight, prefetch_threshold + 1)
+    idle_threshold_s = prefetch_slack_ms / 1000.0
+    idle_start: float | None = None
+
+    def _record_idle(duration_s: float) -> None:
+        if duration_s <= 0.0 or not math.isfinite(duration_s):
+            return
+        try:
+            lease_client.record_idle(duration_s)
+        except Exception:
+            logger.debug("lease_idle_record_failed", exc_info=True)
 
     def _request_next() -> bool:
         nonlocal outstanding_chunks
@@ -458,8 +493,8 @@ def iterate_leased_shards(
         active.append({"start": start, "end": end, "cursor": start})
         return True
 
-    def _maybe_prefetch() -> None:
-        while outstanding_chunks <= prefetch_threshold:
+    def _ensure_minimum(target: int) -> None:
+        while outstanding_chunks < target:
             if not _request_next():
                 break
 
@@ -470,12 +505,15 @@ def iterate_leased_shards(
 
     if not _request_next():
         return
-    _maybe_prefetch()
+    _ensure_minimum(base_target)
 
     try:
         while True:
             if not active:
-                _maybe_prefetch()
+                if idle_start is not None:
+                    _record_idle(time.monotonic() - idle_start)
+                    idle_start = None
+                _ensure_minimum(base_target)
                 if not active:
                     break
             current = active[0]
@@ -514,8 +552,16 @@ def iterate_leased_shards(
             if current["cursor"] >= end:
                 lease_client.complete_lease(start, end)
                 active.popleft()
-            if outstanding_chunks <= prefetch_threshold:
-                _maybe_prefetch()
+            if idle_start is None and outstanding_chunks <= prefetch_threshold:
+                idle_start = time.monotonic()
+            _ensure_minimum(base_target)
+            if idle_start is not None and outstanding_chunks > prefetch_threshold:
+                idle_duration = time.monotonic() - idle_start
+                _record_idle(idle_duration)
+                if idle_duration >= idle_threshold_s:
+                    extra_target = max(base_target, outstanding_chunks + 1, min_inflight)
+                    _ensure_minimum(extra_target)
+                idle_start = None
     except GeneratorExit:
         _requeue_all()
         raise

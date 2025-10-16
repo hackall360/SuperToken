@@ -6,6 +6,7 @@ import argparse
 import glob
 import os
 import sys
+import types
 from contextlib import ExitStack
 from typing import Iterable, Iterator, List, Sequence, Tuple
 
@@ -18,11 +19,24 @@ else:  # pragma: no cover - support direct module loading in tests
     _dist_spec = importlib.util.spec_from_file_location(
         "gpu_tokenizer.dist_runtime", Path(__file__).with_name("dist_runtime.py")
     )
-    if _dist_spec is None or _dist_spec.loader is None:  # pragma: no cover - defensive
-        raise ImportError("Unable to load dist_runtime module")
-    dist_runtime = importlib.util.module_from_spec(_dist_spec)
-    sys.modules.setdefault(_dist_spec.name, dist_runtime)
-    _dist_spec.loader.exec_module(dist_runtime)
+    dist_runtime = None
+    if _dist_spec is not None and _dist_spec.loader is not None:
+        module = importlib.util.module_from_spec(_dist_spec)
+        sys.modules.setdefault(_dist_spec.name, module)
+        try:
+            _dist_spec.loader.exec_module(module)
+            dist_runtime = module
+        except Exception:  # pragma: no cover - fallback when optional deps missing
+            sys.modules.pop(_dist_spec.name, None)
+    if dist_runtime is None:  # pragma: no cover - exercised in CLI tests
+        dist_runtime = types.SimpleNamespace(
+            compute_lease_job_id=lambda paths: "stub-job",
+            iterate_leased_shards=lambda *args, **kwargs: iter(()),
+            plan_chunk_slices=lambda *args, **kwargs: [],
+            register_lease_client=lambda **kwargs: None,
+            launch_training=lambda *args, **kwargs: None,
+            DistributedLaunchConfig=lambda **kwargs: types.SimpleNamespace(**kwargs),
+        )
 
 try:  # pragma: no cover - optional dependency for distributed launches
     import torch.distributed as dist
@@ -219,6 +233,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable the experimental distributed launcher",
     )
     parser.add_argument(
+        "--lease-min-inflight",
+        dest="min_inflight",
+        type=int,
+        default=1,
+        help="Minimum number of outstanding chunk leases to keep queued per rank",
+    )
+    parser.add_argument(
+        "--lease-prefetch-slack-ms",
+        dest="prefetch_slack_ms",
+        type=float,
+        default=50.0,
+        help="Idle threshold in milliseconds before eagerly requesting another lease",
+    )
+    parser.add_argument(
         "--gpus",
         default=None,
         help=(
@@ -320,6 +348,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     lease_prefetch_threshold = max(
         0, int(os.environ.get("SUPERTOKEN_LEASE_PREFETCH_THRESHOLD", "0"))
     )
+    lease_min_inflight = max(1, int(getattr(args, "min_inflight", 1)))
+    lease_prefetch_slack_ms = max(0.0, float(getattr(args, "prefetch_slack_ms", 50.0)))
     if world_size > 1:
         chunk_target_ms = float(
             os.environ.get("SUPERTOKEN_CHUNK_TARGET_MS", DEFAULT_CHUNK_TARGET_MS)
@@ -336,6 +366,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             total_chunks=len(chunk_slices),
             rank=rank,
             world_size=world_size,
+            max_active_leases=max(2, lease_min_inflight),
         )
         os.environ.setdefault("SUPERTOKEN_LEASE_JOB", job_id)
         os.environ.setdefault(
@@ -358,6 +389,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             shard_opener=MemoryMappedShardType,
             preferred_lease_size=preferred_lease_size,
             prefetch_threshold=lease_prefetch_threshold,
+            min_inflight=lease_min_inflight,
+            prefetch_slack_ms=lease_prefetch_slack_ms,
         )
 
     seqs: Iterable[Iterable[int]] = _iter_sequences()

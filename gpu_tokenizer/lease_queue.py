@@ -49,7 +49,7 @@ class LeaseNotary:
         lease_ttl: float = 30.0,
         min_lease_size: int = 1,
         max_lease_size: Optional[int] = None,
-        max_active_leases: int = 1,
+        max_active_leases: int = 2,
     ) -> None:
         if total_chunks < 0:
             raise ValueError("total_chunks must be non-negative")
@@ -75,6 +75,7 @@ class LeaseNotary:
         self._min_lease_size = int(min_lease_size)
         self._max_lease_size = int(max_lease_size) if max_lease_size is not None else None
         self._max_active_leases = int(max_active_leases)
+        self._idle_metrics: Dict[int, Dict[str, float]] = {}
 
     @staticmethod
     def _now() -> float:
@@ -89,6 +90,56 @@ class LeaseNotary:
         """Return the configured lease time-to-live in seconds."""
 
         return self._lease_ttl
+
+    @property
+    def max_active_leases(self) -> int:
+        """Return the configured per-rank inflight lease limit."""
+
+        return self._max_active_leases
+
+    def _record_idle_locked(self, rank: int, duration_s: float) -> None:
+        if duration_s <= 0.0 or not math.isfinite(duration_s):
+            return
+        stats = self._idle_metrics.setdefault(
+            int(rank),
+            {"ewma_s": float(duration_s), "last_s": float(duration_s), "samples": 0.0},
+        )
+        samples = int(stats.get("samples", 0) or 0)
+        if samples <= 0:
+            ewma = float(duration_s)
+        else:
+            ewma = (0.2 * float(duration_s)) + (0.8 * float(stats.get("ewma_s", duration_s)))
+        stats["ewma_s"] = ewma
+        stats["last_s"] = float(duration_s)
+        stats["samples"] = float(samples + 1)
+
+    def record_idle(self, rank: int, duration_s: float) -> None:
+        """Record *duration_s* seconds of idle time for ``rank``."""
+
+        with self._lock:
+            self._record_idle_locked(rank, duration_s)
+
+    def idle_metrics(self) -> Dict[int, Dict[str, float]]:
+        """Return a snapshot of the accumulated idle telemetry."""
+
+        with self._lock:
+            snapshot: Dict[int, Dict[str, float]] = {}
+            for rank, stats in self._idle_metrics.items():
+                snapshot[int(rank)] = {
+                    "ewma_ms": float(stats.get("ewma_s", 0.0)) * 1000.0,
+                    "last_ms": float(stats.get("last_s", 0.0)) * 1000.0,
+                    "samples": int(stats.get("samples", 0) or 0),
+                }
+            return snapshot
+
+    def update_max_active_leases(self, max_active_leases: int) -> None:
+        """Increase :attr:`max_active_leases` when *max_active_leases* grows."""
+
+        if max_active_leases <= 0:
+            raise ValueError("max_active_leases must be positive")
+        with self._lock:
+            if max_active_leases > self._max_active_leases:
+                self._max_active_leases = int(max_active_leases)
 
     def grant_lease(self, rank: int, preferred_size: int) -> Optional[Tuple[int, int]]:
         """Return the next available lease for ``rank``.
@@ -236,6 +287,15 @@ class LeaseNotary:
                 lease.as_tuple() for lease in self._pending_requeue
             )
 
+            idle_metrics = {
+                rank: {
+                    "ewma_ms": float(stats.get("ewma_s", 0.0)) * 1000.0,
+                    "last_ms": float(stats.get("last_s", 0.0)) * 1000.0,
+                    "samples": int(stats.get("samples", 0) or 0),
+                }
+                for rank, stats in self._idle_metrics.items()
+            }
+
             return {
                 "total_chunks": self._total_chunks,
                 "next_idx": self._next_idx,
@@ -246,6 +306,7 @@ class LeaseNotary:
                 "min_lease_size": self._min_lease_size,
                 "max_lease_size": self._max_lease_size,
                 "max_active_leases": self._max_active_leases,
+                "idle_metrics": idle_metrics,
             }
 
     def load_state_dict(self, state: Dict[str, object]) -> None:
@@ -338,6 +399,28 @@ class LeaseNotary:
                 raise ValueError("rank weight must be non-negative")
             rank_weights[rank] = weight
 
+        idle_metrics_raw = state.get("idle_metrics", {})
+        idle_metrics: Dict[int, Dict[str, float]] = {}
+        if isinstance(idle_metrics_raw, dict):
+            for raw_rank, raw_stats in idle_metrics_raw.items():
+                try:
+                    rank = int(raw_rank)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(raw_stats, dict):
+                    continue
+                try:
+                    ewma_ms = float(raw_stats.get("ewma_ms", 0.0))
+                    last_ms = float(raw_stats.get("last_ms", 0.0))
+                    samples = int(raw_stats.get("samples", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                idle_metrics[rank] = {
+                    "ewma_s": ewma_ms / 1000.0,
+                    "last_s": last_ms / 1000.0,
+                    "samples": float(max(0, samples)),
+                }
+
         with self._lock:
             self._total_chunks = total_chunks
             self._next_idx = next_idx
@@ -348,6 +431,7 @@ class LeaseNotary:
             self._min_lease_size = min_lease_size
             self._max_lease_size = max_lease_size
             self._max_active_leases = max_active_leases
+            self._idle_metrics = idle_metrics
 
     def update_rank_weights(self, weights: Dict[int, float]) -> None:
         """Persist normalised per-rank weights for adaptive lease sizing."""

@@ -1,10 +1,35 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+fake_torch = types.ModuleType("torch")
+fake_torch.cuda = SimpleNamespace(
+    is_available=lambda: False,
+    set_device=lambda *args, **kwargs: None,
+    mem_get_info=lambda: (0, 0),
+    empty_cache=lambda: None,
+)
+fake_torch.device = lambda kind, index: f"{kind}:{index}"
+fake_torch.iinfo = lambda _dtype: SimpleNamespace(max=0)
+fake_torch.uint16 = object()
+fake_torch.int32 = object()
+fake_torch.int16 = object()
+fake_torch.int8 = object()
+fake_torch.uint8 = object()
+sys.modules.setdefault("torch", fake_torch)
+
+fake_dist = types.ModuleType("torch.distributed")
+fake_dist.is_available = lambda: False
+fake_dist.is_initialized = lambda: False
+sys.modules.setdefault("torch.distributed", fake_dist)
+
+sys.modules.setdefault("torch.multiprocessing", types.ModuleType("torch.multiprocessing"))
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "gpu_tokenizer" / "cli_train_bpe.py"
 spec = importlib.util.spec_from_file_location("cli_train_bpe_arg_parser", MODULE_PATH)
@@ -20,6 +45,8 @@ def test_parser_defaults() -> None:
     assert args.gpus is None
     assert args.target_chunk_ms is None
     assert args.log_stage_timings is False
+    assert args.min_inflight == 1
+    assert args.prefetch_slack_ms == pytest.approx(50.0)
 
 
 def test_parser_preserves_gpu_argument() -> None:
