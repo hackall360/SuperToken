@@ -27,6 +27,23 @@ from .dtypes import (
 )
 from .utils import aggregate_pair_keys, apply_merge_once, count_pairs, reduce_pair_histograms
 
+
+def _aggregate_pair_keys(
+    keys: torch.Tensor, counts: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compatibility wrapper for :func:`gpu_tokenizer.utils.aggregate_pair_keys`.
+
+    The public trainer used to expose a private helper that forwarded to the
+    shared aggregation utility.  Some downstream tests (and a few lightweight
+    integration scripts) still import ``_aggregate_pair_keys`` from
+    ``gpu_tokenizer.bpe_trainer``.  A previous refactor removed the shim which
+    broke those imports.  Restoring the wrapper keeps the historical API
+    surface while delegating the work to the canonical implementation in
+    ``gpu_tokenizer.utils``.
+    """
+
+    return aggregate_pair_keys(keys, counts)
+
 try:  # pragma: no cover - optional dependency
     from tokenizers import Tokenizer as _HFTokenizer
 except Exception:  # pragma: no cover - optional dependency in CI
