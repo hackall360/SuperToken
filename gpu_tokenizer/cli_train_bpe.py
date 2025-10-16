@@ -31,6 +31,7 @@ except Exception:  # pragma: no cover - torch may be unavailable in CI
 
 
 DEFAULT_LOG_EVERY = 100
+DEFAULT_CHUNK_TARGET_MS = 100.0
 
 
 def resolve_distributed_rank() -> Tuple[int, int]:
@@ -313,11 +314,47 @@ def main(argv: Sequence[str] | None = None) -> None:
             f"Rank {rank} (world_size={world_size}) did not receive any input shards."
         )
 
+    lease_client = None
+    chunk_slices: List[Tuple[int, int]] | None = None
+    preferred_lease_size = max(1, int(os.environ.get("SUPERTOKEN_LEASE_SIZE", "1")))
+    if world_size > 1:
+        chunk_target_ms = float(
+            os.environ.get("SUPERTOKEN_CHUNK_TARGET_MS", DEFAULT_CHUNK_TARGET_MS)
+        )
+        chunk_slices = dist_runtime.plan_chunk_slices(
+            len(shard_paths),
+            target_ms=chunk_target_ms,
+            batch_tokens=max(1, args.bs),
+            ewma=None,
+        )
+        job_id = dist_runtime.compute_lease_job_id(shard_paths)
+        lease_client = dist_runtime.register_lease_client(
+            job_id=job_id,
+            total_chunks=len(chunk_slices),
+            rank=rank,
+            world_size=world_size,
+        )
+        os.environ.setdefault("SUPERTOKEN_LEASE_JOB", job_id)
+        os.environ.setdefault(
+            "SUPERTOKEN_LEASE_TOTAL_CHUNKS", str(lease_client.total_chunks)
+        )
+
     def _iter_sequences() -> Iterator[Iterator[int]]:
-        with ExitStack() as stack:
-            for path in shard_paths:
-                shard = stack.enter_context(MemoryMappedShardType(path))
-                yield packer.encode_shard(shard)
+        if lease_client is None or chunk_slices is None:
+            with ExitStack() as stack:
+                for path in shard_paths:
+                    shard = stack.enter_context(MemoryMappedShardType(path))
+                    yield packer.encode_shard(shard)
+            return
+
+        yield from dist_runtime.iterate_leased_shards(
+            shard_paths,
+            chunk_slices,
+            lease_client=lease_client,
+            encode_shard=packer.encode_shard,
+            shard_opener=MemoryMappedShardType,
+            preferred_lease_size=preferred_lease_size,
+        )
 
     seqs: Iterable[Iterable[int]] = _iter_sequences()
 

@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import hashlib
 import logging
 import os
 import queue
 import signal
+import threading
 from dataclasses import dataclass, field
 from datetime import timedelta
 from types import FrameType
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 try:  # pragma: no cover - torch is optional in some environments
     import torch
@@ -27,6 +29,9 @@ try:  # pragma: no cover - optional type for static analysis
 except Exception:  # pragma: no cover - fallback when torch missing
     ProcessContext = object  # type: ignore[misc,assignment]
 
+from .io import make_chunker
+from .lease_queue import LeaseNotary
+
 # Configure a module level logger. Downstream applications can adjust the
 # configuration to taste but this ensures we at least emit something when the
 # module is used in isolation.
@@ -39,6 +44,229 @@ if not logger.handlers:
 
 SignalHandler = Callable[[int, Optional[FrameType]], None]
 _SHUTDOWN_SIGNALS: Tuple[int, int] = (signal.SIGINT, signal.SIGTERM)
+
+
+@dataclass
+class _LeaseHostState:
+    """Container storing the shared :class:`LeaseNotary` for a job."""
+
+    notary: LeaseNotary
+    lock: threading.Lock
+
+    @property
+    def total_chunks(self) -> int:
+        return self.notary.total_chunks
+
+
+_LEASE_REGISTRY_LOCK = threading.Lock()
+_LEASE_REGISTRY: Dict[str, _LeaseHostState] = {}
+
+
+def _normalize_job_id(job_id: str | None) -> str:
+    if not job_id:
+        return "default"
+    return job_id
+
+
+def _get_or_create_host_state(job_id: str, total_chunks: int) -> _LeaseHostState:
+    if total_chunks < 0:
+        raise ValueError("total_chunks must be non-negative")
+    with _LEASE_REGISTRY_LOCK:
+        state = _LEASE_REGISTRY.get(job_id)
+        if state is None:
+            notary = LeaseNotary(total_chunks=total_chunks)
+            state = _LeaseHostState(notary=notary, lock=threading.Lock())
+            _LEASE_REGISTRY[job_id] = state
+        elif state.total_chunks != total_chunks:
+            raise ValueError(
+                f"Existing lease registry for job {job_id!r} was initialised with "
+                f"{state.total_chunks} chunks but {total_chunks} were requested"
+            )
+    return state
+
+
+class DistributedLeaseClient:
+    """Thin wrapper around :class:`LeaseNotary` shared across distributed ranks."""
+
+    def __init__(
+        self,
+        *,
+        job_id: str,
+        rank: int,
+        world_size: int,
+        host_state: _LeaseHostState,
+    ) -> None:
+        self.job_id = job_id
+        self.rank = rank
+        self.world_size = world_size
+        self._host_state = host_state
+
+    @property
+    def total_chunks(self) -> int:
+        return self._host_state.total_chunks
+
+    def request_lease(self, preferred_size: int) -> Optional[Tuple[int, int]]:
+        if preferred_size <= 0:
+            raise ValueError("preferred_size must be positive")
+        with self._host_state.lock:
+            return self._host_state.notary.grant_lease(self.rank, preferred_size)
+
+    def complete_lease(self, start: int, end: int) -> None:
+        with self._host_state.lock:
+            self._host_state.notary.complete_lease(self.rank, start, end)
+
+    def requeue_lease(self, start: int, end: int) -> None:
+        with self._host_state.lock:
+            self._host_state.notary.requeue_lease(self.rank, start, end)
+
+    def heartbeat(self) -> float:
+        with self._host_state.lock:
+            return self._host_state.notary.heartbeat(self.rank)
+
+    def iter_leases(self, preferred_size: int) -> Iterator[Tuple[int, int]]:
+        while True:
+            lease = self.request_lease(preferred_size)
+            if lease is None:
+                break
+            yield lease
+
+
+def register_lease_client(
+    *,
+    job_id: str | None,
+    total_chunks: int,
+    rank: int,
+    world_size: int,
+    root: int = 0,
+) -> DistributedLeaseClient:
+    """Return a :class:`DistributedLeaseClient` registered with rank ``root``."""
+
+    normalized_job = _normalize_job_id(job_id)
+
+    should_broadcast = (
+        dist is not None
+        and hasattr(dist, "broadcast_object_list")
+        and dist.is_available()
+        and dist.is_initialized()
+        and world_size > 1
+    )
+
+    if should_broadcast:
+        payload: List[object] = [
+            {"job_id": normalized_job, "total_chunks": int(total_chunks)}
+            if rank == root
+            else None
+        ]
+        dist.broadcast_object_list(payload, src=root)  # type: ignore[arg-type]
+        info = payload[0]
+        if isinstance(info, dict):
+            normalized_job = _normalize_job_id(str(info.get("job_id")))
+            total_chunks = int(info.get("total_chunks", total_chunks))
+
+    host_state = _get_or_create_host_state(normalized_job, int(total_chunks))
+    return DistributedLeaseClient(
+        job_id=normalized_job,
+        rank=rank,
+        world_size=world_size,
+        host_state=host_state,
+    )
+
+
+def plan_chunk_slices(
+    total_items: int,
+    *,
+    target_ms: float,
+    batch_tokens: int,
+    ewma: "TrainerMetricsEWMA | None" = None,
+) -> List[Tuple[int, int]]:
+    """Return contiguous slices describing how ``total_items`` should be chunked."""
+
+    if total_items < 0:
+        raise ValueError("total_items must be non-negative")
+    chunker = make_chunker(target_ms=target_ms, batch_tokens=batch_tokens, ewma=ewma)
+    slices: List[Tuple[int, int]] = []
+    cursor = 0
+    for spec in chunker:
+        if cursor >= total_items:
+            break
+        width = max(1, int(getattr(spec, "batches", 1)))
+        end = min(total_items, cursor + width)
+        slices.append((cursor, end))
+        cursor = end
+    if total_items > 0 and not slices:
+        raise RuntimeError("make_chunker did not yield any slices for the corpus")
+    if slices and slices[-1][1] < total_items:
+        slices.append((slices[-1][1], total_items))
+    return slices
+
+
+def compute_lease_job_id(paths: Sequence[str]) -> str:
+    """Return a stable job identifier derived from *paths*."""
+
+    digest = hashlib.blake2s(digest_size=8)
+    for path in paths:
+        digest.update(path.encode("utf-8", "surrogatepass"))
+        digest.update(b"\0")
+    return f"lease:{digest.hexdigest()}"
+
+
+def iterate_leased_shards(
+    shard_paths: Sequence[str],
+    chunk_slices: Sequence[Tuple[int, int]],
+    *,
+    lease_client: DistributedLeaseClient,
+    encode_shard: Callable[[object], Iterator[int]],
+    shard_opener: Callable[[str], contextlib.AbstractContextManager],
+    preferred_lease_size: int = 1,
+) -> Iterator[Iterator[int]]:
+    """Yield shard iterators governed by leases from ``lease_client``."""
+
+    if preferred_lease_size <= 0:
+        raise ValueError("preferred_lease_size must be positive")
+    total_chunks = len(chunk_slices)
+    while True:
+        lease = lease_client.request_lease(preferred_lease_size)
+        if lease is None:
+            break
+        start, end = lease
+        if not (0 <= start <= end <= total_chunks):
+            lease_client.requeue_lease(start, end)
+            raise ValueError(
+                f"Lease [{start}, {end}) lies outside the planned chunk range"
+            )
+        try:
+            for chunk_idx in range(start, end):
+                slice_start, slice_end = chunk_slices[chunk_idx]
+                if slice_start >= slice_end:
+                    continue
+                stack = contextlib.ExitStack()
+                shards: List[object] = []
+                try:
+                    for path in shard_paths[slice_start:slice_end]:
+                        shard = stack.enter_context(shard_opener(path))
+                        shards.append(shard)
+                    for shard in shards:
+                        yield encode_shard(shard)
+                finally:
+                    stack.close()
+        except GeneratorExit:
+            lease_client.requeue_lease(start, end)
+            raise
+        except Exception:
+            lease_client.requeue_lease(start, end)
+            raise
+        else:
+            lease_client.complete_lease(start, end)
+
+
+def _reset_lease_registry(job_id: str | None = None) -> None:
+    """Test helper that clears cached lease state."""
+
+    with _LEASE_REGISTRY_LOCK:
+        if job_id is None:
+            _LEASE_REGISTRY.clear()
+        else:
+            _LEASE_REGISTRY.pop(_normalize_job_id(job_id), None)
 
 
 def _destroy_process_group_if_available() -> None:
@@ -377,6 +605,31 @@ def _worker_entry(rank: int, config: DistributedLaunchConfig, cli_args: Sequence
         timeout=timeout,
     )
 
+    lease_client: Optional[DistributedLeaseClient]
+    lease_client = None
+    lease_metadata: Dict[str, object] | None = None
+    total_chunks_env = os.getenv("SUPERTOKEN_LEASE_TOTAL_CHUNKS")
+    if total_chunks_env is not None:
+        try:
+            total_chunks_value = int(total_chunks_env)
+        except ValueError as exc:  # pragma: no cover - defensive branch
+            raise ValueError("SUPERTOKEN_LEASE_TOTAL_CHUNKS must be an integer") from exc
+        job_id_env = os.getenv("SUPERTOKEN_LEASE_JOB")
+        lease_client = register_lease_client(
+            job_id=job_id_env,
+            total_chunks=total_chunks_value,
+            rank=rank,
+            world_size=config.world_size,
+        )
+        lease_metadata = {
+            "job_id": lease_client.job_id,
+            "total_chunks": lease_client.total_chunks,
+        }
+        if lease_client.total_chunks > 0:
+            initial = lease_client.request_lease(1)
+            if initial is not None:
+                lease_client.requeue_lease(*initial)
+
     shutdown_state = {"triggered": False}
 
     def _initiate_shutdown(reason: str) -> None:
@@ -421,6 +674,7 @@ def _worker_entry(rank: int, config: DistributedLaunchConfig, cli_args: Sequence
                 "cli_args": list(cli_args),
                 "autoscaler": autoscaler.state_dict(),
                 "trainer_device_count": len(trainer.devices),
+                "lease_metadata": lease_metadata,
             },
         )
     finally:
