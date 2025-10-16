@@ -13,7 +13,8 @@ import threading
 from dataclasses import dataclass, field
 from datetime import timedelta
 from types import FrameType
-from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from collections import deque
+from typing import Callable, Deque, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import time
 
@@ -161,19 +162,38 @@ class DistributedLeaseClient:
         inflight_entry = snapshot["inflight"].get(self.rank)
         if not inflight_entry:
             return None
-        start, end = inflight_entry["lease"]
+        raw_records: List[Tuple[int, int]] = []
+        if isinstance(inflight_entry, dict):
+            if "records" in inflight_entry and isinstance(inflight_entry["records"], list):
+                for entry in inflight_entry["records"]:
+                    if isinstance(entry, dict) and "lease" in entry:
+                        start, end = entry["lease"]
+                        raw_records.append((int(start), int(end)))
+            elif "lease" in inflight_entry:
+                start, end = inflight_entry["lease"]
+                raw_records.append((int(start), int(end)))
+        elif isinstance(inflight_entry, list):
+            for entry in inflight_entry:
+                if isinstance(entry, dict) and "lease" in entry:
+                    start, end = entry["lease"]
+                    raw_records.append((int(start), int(end)))
+        if not raw_records:
+            return None
+        leases: List[Tuple[int, int]] = list(raw_records)
         try:
             with self._host_state.lock:
-                self._host_state.notary.requeue_lease(self.rank, int(start), int(end))
+                for start, end in leases:
+                    self._host_state.notary.requeue_lease(self.rank, int(start), int(end))
         except Exception:
             logger.debug(
                 "lease_requeue_on_shutdown_failed",
-                extra={"rank": self.rank, "lease": (start, end)},
+                extra={"rank": self.rank, "leases": leases},
                 exc_info=True,
             )
             return None
-        self._broadcast_event("requeue", lease=(int(start), int(end)))
-        return (int(start), int(end))
+        for start, end in leases:
+            self._broadcast_event("requeue", lease=(int(start), int(end)))
+        return leases[0]
 
     def update_rank_weights(self, weights: Dict[int, float]) -> None:
         """Persist *weights* into the shared :class:`LeaseNotary`."""
@@ -401,45 +421,107 @@ def iterate_leased_shards(
     encode_shard: Callable[[object], Iterator[int]],
     shard_opener: Callable[[str], contextlib.AbstractContextManager],
     preferred_lease_size: int = 1,
+    prefetch_threshold: int = 0,
 ) -> Iterator[Iterator[int]]:
     """Yield shard iterators governed by leases from ``lease_client``."""
 
     if preferred_lease_size <= 0:
         raise ValueError("preferred_lease_size must be positive")
+    if prefetch_threshold < 0:
+        raise ValueError("prefetch_threshold must be non-negative")
     total_chunks = len(chunk_slices)
-    while True:
-        lease = lease_client.request_lease(preferred_lease_size)
+    outstanding_chunks = 0
+    active: Deque[Dict[str, int]] = deque()
+
+    def _request_next() -> bool:
+        nonlocal outstanding_chunks
+        try:
+            lease = lease_client.request_lease(preferred_lease_size)
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            if "active lease" in message:
+                return False
+            raise
         if lease is None:
-            break
+            return False
         start, end = lease
         if not (0 <= start <= end <= total_chunks):
             lease_client.requeue_lease(start, end)
             raise ValueError(
                 f"Lease [{start}, {end}) lies outside the planned chunk range"
             )
-        try:
-            for chunk_idx in range(start, end):
-                slice_start, slice_end = chunk_slices[chunk_idx]
-                if slice_start >= slice_end:
-                    continue
-                stack = contextlib.ExitStack()
-                shards: List[object] = []
-                try:
-                    for path in shard_paths[slice_start:slice_end]:
-                        shard = stack.enter_context(shard_opener(path))
-                        shards.append(shard)
-                    for shard in shards:
-                        yield encode_shard(shard)
-                finally:
-                    stack.close()
-        except GeneratorExit:
-            lease_client.requeue_lease(start, end)
-            raise
-        except Exception:
-            lease_client.requeue_lease(start, end)
-            raise
-        else:
+        width = max(0, end - start)
+        if width == 0:
             lease_client.complete_lease(start, end)
+            return True
+        outstanding_chunks += width
+        active.append({"start": start, "end": end, "cursor": start})
+        return True
+
+    def _maybe_prefetch() -> None:
+        while outstanding_chunks <= prefetch_threshold:
+            if not _request_next():
+                break
+
+    def _requeue_all() -> None:
+        while active:
+            info = active.popleft()
+            lease_client.requeue_lease(info["start"], info["end"])
+
+    if not _request_next():
+        return
+    _maybe_prefetch()
+
+    try:
+        while True:
+            if not active:
+                _maybe_prefetch()
+                if not active:
+                    break
+            current = active[0]
+            start, end = current["start"], current["end"]
+            cursor = current["cursor"]
+            if cursor >= end:
+                lease_client.complete_lease(start, end)
+                active.popleft()
+                continue
+            chunk_idx = cursor
+            current["cursor"] = cursor + 1
+            try:
+                slice_start, slice_end = chunk_slices[chunk_idx]
+            except Exception:
+                _requeue_all()
+                raise
+            try:
+                if slice_start < slice_end:
+                    stack = contextlib.ExitStack()
+                    shards: List[object] = []
+                    try:
+                        for path in shard_paths[slice_start:slice_end]:
+                            shard = stack.enter_context(shard_opener(path))
+                            shards.append(shard)
+                        for shard in shards:
+                            yield encode_shard(shard)
+                    finally:
+                        stack.close()
+            except GeneratorExit:
+                _requeue_all()
+                raise
+            except Exception:
+                _requeue_all()
+                raise
+            outstanding_chunks = max(0, outstanding_chunks - 1)
+            if current["cursor"] >= end:
+                lease_client.complete_lease(start, end)
+                active.popleft()
+            if outstanding_chunks <= prefetch_threshold:
+                _maybe_prefetch()
+    except GeneratorExit:
+        _requeue_all()
+        raise
+    except Exception:
+        _requeue_all()
+        raise
 
 
 def _reset_lease_registry(job_id: str | None = None) -> None:
