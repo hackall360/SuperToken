@@ -5,8 +5,24 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import sys
 from contextlib import ExitStack
 from typing import Iterable, Iterator, List, Sequence, Tuple
+
+if __package__:
+    from . import dist_runtime  # pragma: no cover - package import path
+else:  # pragma: no cover - support direct module loading in tests
+    import importlib.util
+    from pathlib import Path
+
+    _dist_spec = importlib.util.spec_from_file_location(
+        "gpu_tokenizer.dist_runtime", Path(__file__).with_name("dist_runtime.py")
+    )
+    if _dist_spec is None or _dist_spec.loader is None:  # pragma: no cover - defensive
+        raise ImportError("Unable to load dist_runtime module")
+    dist_runtime = importlib.util.module_from_spec(_dist_spec)
+    sys.modules.setdefault(_dist_spec.name, dist_runtime)
+    _dist_spec.loader.exec_module(dist_runtime)
 
 try:  # pragma: no cover - optional dependency for distributed launches
     import torch.distributed as dist
@@ -65,23 +81,83 @@ def partition_paths_for_rank(
     return [unique_sorted[i] for i in range(rank, len(unique_sorted), world_size)]
 
 
-def _parse_gpu_list(raw: str) -> List[int]:
-    values = []
+def _expand_device_argument(raw: str) -> List[int]:
+    """Return a list of unique, zero-based GPU indices parsed from *raw*."""
+
+    values: List[int] = []
+    seen: set[int] = set()
     for item in raw.split(","):
         piece = item.strip()
         if not piece:
             continue
+
+        lowered = piece.lower()
+        for prefix in ("cuda:", "cuda", "gpu:", "gpu"):
+            if lowered.startswith(prefix):
+                piece = piece[len(prefix) :]
+                lowered = piece.lower()
+                break
+
         try:
             index = int(piece)
-        except ValueError as exc:  # pragma: no cover - argparse surfaces message
-            raise argparse.ArgumentTypeError("GPU indices must be integers") from exc
+        except ValueError as exc:
+            raise ValueError("GPU indices must be integers") from exc
         if index < 0:
-            raise argparse.ArgumentTypeError("GPU indices must be non-negative")
-        values.append(index)
+            raise ValueError("GPU indices must be non-negative")
+        if index not in seen:
+            values.append(index)
+            seen.add(index)
+
     if not values:
-        raise argparse.ArgumentTypeError("At least one GPU index must be provided")
-    # Deduplicate while preserving order to avoid redundant launches.
-    return list(dict.fromkeys(values))
+        raise ValueError("At least one GPU index must be provided with --gpus")
+
+    return values
+
+
+def _sanitize_cli_args(argv: Sequence[str] | None) -> List[str]:
+    """Return *argv* without ``--dist``/``--gpus`` flags for worker launches."""
+
+    if argv is None:
+        raw_args: Sequence[str] = sys.argv[1:]
+    else:
+        raw_args = argv
+
+    cleaned: List[str] = []
+    skip_next = False
+    for token in raw_args:
+        if skip_next:
+            skip_next = False
+            continue
+        if token == "--dist":
+            continue
+        if token.startswith("--gpus"):
+            if token == "--gpus":
+                skip_next = True
+            continue
+        cleaned.append(token)
+
+    return cleaned
+
+
+def _load_sibling_attr(module: str, attr: str):
+    """Load *attr* from a sibling module, supporting direct file execution."""
+
+    if __package__:
+        mod = __import__(f"{__package__}.{module}", fromlist=[attr])
+    else:  # pragma: no cover - exercised indirectly in tests
+        import importlib.util
+        from pathlib import Path
+
+        spec = importlib.util.spec_from_file_location(
+            f"gpu_tokenizer.{module}", Path(__file__).with_name(f"{module}.py")
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Unable to load sibling module {module!r}")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules.setdefault(spec.name, mod)
+        spec.loader.exec_module(mod)
+
+    return getattr(mod, attr)
 
 
 def _format_iteration_summary(summary: dict[str, object]) -> str:
@@ -139,13 +215,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dist",
         action="store_true",
-        help="Enable distributed launcher (experimental, not yet implemented)",
+        help="Enable the experimental distributed launcher",
     )
     parser.add_argument(
         "--gpus",
-        type=_parse_gpu_list,
         default=None,
-        help="Comma-separated list of GPU indices to use for distributed runs",
+        help=(
+            "Comma-separated list of GPU devices (e.g. 0,1 or cuda:0,cuda:1) to use"
+            " for distributed runs"
+        ),
     )
     parser.add_argument(
         "--target-chunk-ms",
@@ -172,17 +250,50 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--gpus may only be specified together with --dist")
 
     if args.dist:
-        raise SystemExit("Distributed execution is not implemented yet; omit --dist")
+        if args.gpus is None:
+            parser.error("--dist requires --gpus to specify at least one device")
+        try:
+            device_ids = _expand_device_argument(args.gpus)
+        except ValueError as exc:
+            parser.error(str(exc))
+
+        world_size = len(device_ids)
+        config = dist_runtime.DistributedLaunchConfig(
+            device_ids=tuple(device_ids),
+            world_size=world_size,
+        )
+        cli_args = _sanitize_cli_args(argv if argv is not None else sys.argv[1:])
+        dist_runtime.launch_training(config, cli_args)
+        return
 
     log_every = DEFAULT_LOG_EVERY
 
-    from .autoscaler import AutoScaler
-    from .bpe_trainer import GPUBPETrainer
-    from .cpu_packer import BytePacker
-    from .datasets import PackedBatcher
-    from .io import MemoryMappedShard
+    AutoScalerType = globals().get("AutoScaler")
+    if AutoScalerType is None:
+        AutoScalerType = _load_sibling_attr("autoscaler", "AutoScaler")
+        globals()["AutoScaler"] = AutoScalerType
 
-    packer = BytePacker()
+    GPUBPETrainerType = globals().get("GPUBPETrainer")
+    if GPUBPETrainerType is None:
+        GPUBPETrainerType = _load_sibling_attr("bpe_trainer", "GPUBPETrainer")
+        globals()["GPUBPETrainer"] = GPUBPETrainerType
+
+    BytePackerType = globals().get("BytePacker")
+    if BytePackerType is None:
+        BytePackerType = _load_sibling_attr("cpu_packer", "BytePacker")
+        globals()["BytePacker"] = BytePackerType
+
+    PackedBatcherType = globals().get("PackedBatcher")
+    if PackedBatcherType is None:
+        PackedBatcherType = _load_sibling_attr("datasets", "PackedBatcher")
+        globals()["PackedBatcher"] = PackedBatcherType
+
+    MemoryMappedShardType = globals().get("MemoryMappedShard")
+    if MemoryMappedShardType is None:
+        MemoryMappedShardType = _load_sibling_attr("io", "MemoryMappedShard")
+        globals()["MemoryMappedShard"] = MemoryMappedShardType
+
+    packer = BytePackerType()
     paths: List[str] = []
     for pattern in args.data:
         paths.extend(glob.glob(pattern, recursive=True))
@@ -205,19 +316,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     def _iter_sequences() -> Iterator[Iterator[int]]:
         with ExitStack() as stack:
             for path in shard_paths:
-                shard = stack.enter_context(MemoryMappedShard(path))
+                shard = stack.enter_context(MemoryMappedShardType(path))
                 yield packer.encode_shard(shard)
 
     seqs: Iterable[Iterable[int]] = _iter_sequences()
 
-    scaler = AutoScaler(target_util=0.80)
+    scaler = AutoScalerType(target_util=0.80)
     init = scaler.suggest(token_bytes_per_example=8 * 1024)
     bs = min(args.bs, init.batch_size)
-    batcher = PackedBatcher(seqs, batch_size=bs)
+    batcher = PackedBatcherType(seqs, batch_size=bs)
 
     warm_plan = None
     if args.warm_start_ngrams:
-        warm_plan = GPUBPETrainer.precompute_warm_start_plan(
+        warm_plan = GPUBPETrainerType.precompute_warm_start_plan(
             batcher, args.warm_start_ngrams
         )
         if warm_plan["merges"]:
@@ -226,7 +337,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 f"{warm_plan['requested_top_k']} bigrams"
             )
 
-    trainer = GPUBPETrainer(
+    trainer = GPUBPETrainerType(
         base_vocab=256,
         merges=args.merges,
         autoscaler=scaler,
