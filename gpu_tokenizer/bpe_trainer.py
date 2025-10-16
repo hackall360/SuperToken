@@ -54,6 +54,98 @@ UINT32_MAX = (1 << 32) - 1
 
 
 @dataclass
+class TrainerMetricsEWMA:
+    """Maintain exponential moving averages for trainer throughput metrics."""
+
+    alpha: float = 0.2
+    window_size: int = 16
+    enabled: bool = False
+    _tokens_per_s: float | None = None
+    _lease_per_s: float | None = None
+    _stage_windows: dict[str, deque[float]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Clamp configuration to sensible defaults while tolerating bad inputs.
+        try:
+            alpha = float(self.alpha)
+        except (TypeError, ValueError):
+            alpha = 0.2
+        if alpha <= 0.0:
+            alpha = 0.01
+        if alpha > 1.0:
+            alpha = 1.0
+        self.alpha = alpha
+        try:
+            window = int(self.window_size)
+        except (TypeError, ValueError):
+            window = 16
+        if window <= 0:
+            window = 1
+        self.window_size = window
+        self.enabled = bool(self.enabled)
+
+    def reset(self) -> None:
+        """Clear accumulated metrics."""
+
+        self._tokens_per_s = None
+        self._lease_per_s = None
+        self._stage_windows.clear()
+
+    @property
+    def tokens_per_s(self) -> float | None:
+        return self._tokens_per_s
+
+    @property
+    def lease_per_s(self) -> float | None:
+        return self._lease_per_s
+
+    def record_stage(self, stage: str, duration_s: float) -> None:
+        if not self.enabled or duration_s < 0:
+            return
+        window = self._stage_windows.setdefault(stage, deque(maxlen=self.window_size))
+        window.append(float(duration_s))
+
+    def record_tokens(self, tokens: int, duration_s: float, *, leases: int | None = None) -> None:
+        if not self.enabled or duration_s <= 0:
+            return
+        rate = float(tokens) / float(duration_s) if tokens > 0 else 0.0
+        if self._tokens_per_s is None:
+            self._tokens_per_s = rate
+        else:
+            self._tokens_per_s = (self.alpha * rate) + ((1.0 - self.alpha) * self._tokens_per_s)
+        if leases is not None:
+            lease_rate = float(leases) / float(duration_s) if leases > 0 else 0.0
+            if self._lease_per_s is None:
+                self._lease_per_s = lease_rate
+            else:
+                self._lease_per_s = (
+                    self.alpha * lease_rate
+                    + (1.0 - self.alpha) * self._lease_per_s
+                )
+
+    def summaries(self) -> dict[str, object]:
+        stage_summary: dict[str, dict[str, object]] = {}
+        for name, window in self._stage_windows.items():
+            samples = list(window)
+            count = len(samples)
+            avg = sum(samples) / count if count else 0.0
+            stage_summary[name] = {
+                "samples": count,
+                "avg_s": avg,
+                "latest_s": samples[-1] if samples else 0.0,
+                "window": samples,
+            }
+        return {
+            "enabled": self.enabled,
+            "alpha": self.alpha,
+            "window": self.window_size,
+            "tokens_per_s": self._tokens_per_s,
+            "lease_per_s": self._lease_per_s,
+            "stages": stage_summary,
+        }
+
+
+@dataclass
 class StageTiming:
     """Accumulates timing samples for a named stage."""
 
@@ -577,6 +669,39 @@ class GPUBPETrainer:
         self._frozen_pair_keys: set[int] = set()
         self.autoscaler = autoscaler or AutoScaler()
         self.sync_every = max(sync_every, 1)
+        metrics_flag = os.getenv("SUPERTOKEN_ENABLE_TRAINER_METRICS", "")
+
+        def _parse_bool(raw: str) -> bool:
+            lowered = raw.strip().lower()
+            return lowered in {"1", "true", "yes", "on"}
+
+        def _parse_float_env(name: str, default: float) -> float:
+            raw = os.getenv(name)
+            if raw is None:
+                return default
+            try:
+                return float(raw)
+            except ValueError:
+                return default
+
+        def _parse_int_env(name: str, default: int) -> int:
+            raw = os.getenv(name)
+            if raw is None:
+                return default
+            try:
+                return int(raw)
+            except ValueError:
+                return default
+
+        metrics_enabled = _parse_bool(metrics_flag)
+        metrics_alpha = _parse_float_env("SUPERTOKEN_TRAINER_METRICS_ALPHA", 0.2)
+        metrics_window = max(1, _parse_int_env("SUPERTOKEN_TRAINER_METRICS_WINDOW", 16))
+        self._metrics = TrainerMetricsEWMA(
+            alpha=metrics_alpha,
+            window_size=metrics_window,
+            enabled=metrics_enabled,
+        )
+        self._metrics_iteration_summary: dict[str, float] | None = None
         # Host↔device transfer accounting, populated during ``fit``.
         self.bytes_h2d: int = 0
         self.bytes_d2h: int = 0
@@ -603,6 +728,12 @@ class GPUBPETrainer:
 
     # ------------------------------------------------------------------
     # Transfer accounting helpers
+    @property
+    def metrics(self) -> TrainerMetricsEWMA:
+        """Expose the EWMA tracker for external consumers (e.g. CLI tooling)."""
+
+        return self._metrics
+
     def _reset_transfer_counters(self) -> None:
         self.bytes_h2d = 0
         self.bytes_d2h = 0
@@ -632,6 +763,8 @@ class GPUBPETrainer:
     ) -> None:
         if not tensors:
             return
+        metrics = self._metrics
+        start = time.perf_counter() if metrics.enabled else None
         total = sum(int(t.nbytes) for t in tensors)
         self.bytes_h2d += total
         self.h2d_events += 1
@@ -645,6 +778,13 @@ class GPUBPETrainer:
                 ctx.bytes_h2d += total
                 ctx.h2d_events += 1
                 ctx.log_transfer(stage, "h2d", total)
+        if start is not None:
+            duration = time.perf_counter() - start
+            metrics.record_stage("h2d", duration)
+            if self._metrics_iteration_summary is not None:
+                self._metrics_iteration_summary["h2d_s"] = (
+                    self._metrics_iteration_summary.get("h2d_s", 0.0) + duration
+                )
 
     def _record_d2h(
         self,
@@ -654,6 +794,8 @@ class GPUBPETrainer:
     ) -> int:
         if not tensors:
             return 0
+        metrics = self._metrics
+        start = time.perf_counter() if metrics.enabled else None
         total = sum(int(t.nbytes) for t in tensors)
         self.bytes_d2h += total
         self.d2h_events += 1
@@ -667,6 +809,13 @@ class GPUBPETrainer:
                 ctx.bytes_d2h += total
                 ctx.d2h_events += 1
                 ctx.log_transfer(stage, "d2h", total)
+        if start is not None:
+            duration = time.perf_counter() - start
+            metrics.record_stage("d2h", duration)
+            if self._metrics_iteration_summary is not None:
+                self._metrics_iteration_summary["d2h_s"] = (
+                    self._metrics_iteration_summary.get("d2h_s", 0.0) + duration
+                )
         return total
 
     # ------------------------------------------------------------------
@@ -1794,6 +1943,69 @@ class GPUBPETrainer:
         stage_event_log: list[dict[str, object]] = []
         host_sync_events: list[dict[str, object]] = []
         device_snapshot_log: list[dict[str, object]] = []
+        metrics_tracker = self._metrics
+        metrics_tracker.reset()
+        metrics_enabled = metrics_tracker.enabled
+        iteration_summary: dict[str, object] | None = None
+        iteration_summaries: list[dict[str, object]] = []
+        self._metrics_iteration_summary = None
+
+        def _new_iteration_summary(merge_idx: int, kind: str) -> dict[str, object]:
+            return {
+                "merge": merge_idx,
+                "kind": kind,
+                "h2d_s": 0.0,
+                "kernel_s": 0.0,
+                "d2h_s": 0.0,
+                "reduction_s": 0.0,
+                "tokens": 0,
+                "leases": 0,
+                "token_time_s": 0.0,
+            }
+
+        def _tally_tokens_from_batches(
+            batches_iter: Iterable[
+                Union[
+                    MultiDeviceBatch,
+                    CPUFallbackBatch,
+                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                    Tuple[
+                        torch.Tensor,
+                        torch.Tensor,
+                        torch.Tensor,
+                        list[torch.Tensor],
+                        Optional[tuple[torch.Tensor, torch.Tensor]],
+                    ],
+                ]
+            ]
+        ) -> tuple[int, int]:
+            total_tokens = 0
+            total_sequences = 0
+            for batch in batches_iter:
+                if isinstance(batch, MultiDeviceBatch):
+                    for _dev, shard in batch.iter_shards():
+                        total_sequences += int(shard.tokens.shape[0])
+                        if shard.host_lengths is not None and not shard.host_dirty:
+                            total_tokens += int(
+                                shard.host_lengths.to(torch.int64).sum().item()
+                            )
+                        else:
+                            total_tokens += int(shard.lengths.to(torch.int64).sum().item())
+                elif isinstance(batch, CPUFallbackBatch):
+                    total_sequences += int(batch.tokens.shape[0])
+                    total_tokens += int(batch.lengths.to(torch.int64).sum().item())
+                else:
+                    (
+                        tokens_cpu,
+                        _valid_cpu,
+                        lengths_cpu,
+                        _spans,
+                        _pair_keys,
+                        _pair_counts,
+                    ) = self._unpack_cpu_batch(batch)
+                    total_sequences += int(tokens_cpu.shape[0])
+                    total_tokens += int(lengths_cpu.to(torch.int64).sum().item())
+            return total_tokens, total_sequences
 
         def _unpack_cpu_batch(
             batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -2177,9 +2389,18 @@ class GPUBPETrainer:
             if global_keys:
                 combined_keys = torch.cat(global_keys, dim=0)
                 combined_counts = torch.cat(global_counts, dim=0)
+                reduction_start = time.perf_counter() if metrics_enabled else None
                 reduced_keys, reduced_counts = aggregate_pair_keys(
                     combined_keys, combined_counts
                 )
+                if reduction_start is not None:
+                    reduction_duration = time.perf_counter() - reduction_start
+                    metrics_tracker.record_stage("reduction", reduction_duration)
+                    if self._metrics_iteration_summary is not None:
+                        self._metrics_iteration_summary["reduction_s"] = (
+                            self._metrics_iteration_summary.get("reduction_s", 0.0)
+                            + reduction_duration
+                        )
             else:
                 reduced_keys = torch.empty((0,), dtype=torch.long)
                 reduced_counts = torch.empty((0,), dtype=torch.int64)
@@ -2382,6 +2603,13 @@ class GPUBPETrainer:
                 elapsed = time.perf_counter() - sync_start if pending_copy else 0.0
                 if pending_copy:
                     _capture_device_snapshots("host_sync:final:end")
+                    if metrics_enabled and elapsed > 0.0:
+                        metrics_tracker.record_stage("d2h", elapsed)
+                        if self._metrics_iteration_summary is not None:
+                            self._metrics_iteration_summary["d2h_s"] = (
+                                self._metrics_iteration_summary.get("d2h_s", 0.0)
+                                + elapsed
+                            )
                 return copied_bytes, elapsed
 
             def _count_pairs_gpu(
@@ -2561,9 +2789,18 @@ class GPUBPETrainer:
                     if local_keys and local_counts:
                         combined_keys = torch.cat(local_keys, dim=0)
                         combined_counts = torch.cat(local_counts, dim=0)
+                        reduction_start = time.perf_counter() if metrics_enabled else None
                         reduced_keys, reduced_counts = reduce_pair_histograms(
                             combined_keys, combined_counts
                         )
+                        if reduction_start is not None:
+                            reduction_duration = time.perf_counter() - reduction_start
+                            metrics_tracker.record_stage("reduction", reduction_duration)
+                            if self._metrics_iteration_summary is not None:
+                                self._metrics_iteration_summary["reduction_s"] = (
+                                    self._metrics_iteration_summary.get("reduction_s", 0.0)
+                                    + reduction_duration
+                                )
                     else:
                         reduced_keys = None
                         reduced_counts = None
@@ -2898,6 +3135,11 @@ class GPUBPETrainer:
                     raise OverflowError(
                         f"Token id overflow during warm start: encountered id above UINT32_MAX (limit {UINT32_MAX})."
                     )
+                if metrics_enabled:
+                    iteration_summary = _new_iteration_summary(step + 1, "warm_start")
+                    self._metrics_iteration_summary = iteration_summary
+                else:
+                    iteration_summary = None
                 if use_cuda:
                     _capture_device_snapshots("apply_merge:warm:start")
                     warm_merge_start = time.perf_counter()
@@ -2916,6 +3158,13 @@ class GPUBPETrainer:
                             "timestamp": time.time(),
                         }
                     )
+                    if metrics_enabled:
+                        metrics_tracker.record_stage("kernel", merge_duration)
+                        if iteration_summary is not None:
+                            iteration_summary["kernel_s"] = (
+                                float(iteration_summary.get("kernel_s", 0.0))
+                                + merge_duration
+                            )
                     if oom_seen:
                         raise RuntimeError(
                             "CUDA out of memory encountered while applying warm-start merges"
@@ -2940,6 +3189,13 @@ class GPUBPETrainer:
                                 "timestamp": time.time(),
                             }
                         )
+                        if metrics_enabled:
+                            metrics_tracker.record_stage("d2h", sync_duration)
+                            if iteration_summary is not None:
+                                iteration_summary["d2h_s"] = (
+                                    float(iteration_summary.get("d2h_s", 0.0))
+                                    + sync_duration
+                                )
                     _capture_device_snapshots("apply_merge:warm:end")
                 else:
                     warm_merge_start = time.perf_counter()
@@ -2958,6 +3214,13 @@ class GPUBPETrainer:
                             "timestamp": time.time(),
                         }
                     )
+                    if metrics_enabled:
+                        metrics_tracker.record_stage("kernel", merge_duration)
+                        if iteration_summary is not None:
+                            iteration_summary["kernel_s"] = (
+                                float(iteration_summary.get("kernel_s", 0.0))
+                                + merge_duration
+                            )
                 self.merges.append((a_id, b_id))
                 self.vocab_size += 1
                 step += 1
@@ -2966,6 +3229,11 @@ class GPUBPETrainer:
                     key = (int(a_id) << 32) | int(b_id)
                     self._frozen_pair_keys.add(key)
                 self._record_merge_snapshot(step)
+                if metrics_enabled and iteration_summary is not None:
+                    iteration_summary["tokens_per_s"] = 0.0
+                    iteration_summary["lease_per_s"] = 0.0
+                    iteration_summaries.append(dict(iteration_summary))
+                    self._metrics_iteration_summary = None
             warm_meta["applied"] = applied_merges
             self._warm_start_applied = True
             if use_cuda:
@@ -2989,6 +3257,12 @@ class GPUBPETrainer:
                 _reconfigure_batches(scale_state.batch_size)
                 self._active_batch_size = scale_state.batch_size
             t0 = time.time()
+            if metrics_enabled:
+                iteration_summary = _new_iteration_summary(step + 1, "merge")
+                self._metrics_iteration_summary = iteration_summary
+            else:
+                iteration_summary = None
+            merge_applied = False
             candidate_key: Optional[int] = None
             candidate_count = 0
             best_seen = 0
@@ -3027,6 +3301,14 @@ class GPUBPETrainer:
                             "timestamp": time.time(),
                         }
                     )
+                    if metrics_enabled:
+                        metrics_tracker.record_stage("kernel", count_duration)
+                        if iteration_summary is not None:
+                            iteration_summary["kernel_s"] = (
+                                float(iteration_summary.get("kernel_s", 0.0))
+                                + count_duration
+                            )
+                            iteration_summary["token_time_s"] = count_duration
                     gpu_batches = [
                         batch
                         for batch in consumed_batches
@@ -3052,11 +3334,41 @@ class GPUBPETrainer:
                             "timestamp": time.time(),
                         }
                     )
+                    if metrics_enabled:
+                        metrics_tracker.record_stage("kernel", count_duration)
+                        if iteration_summary is not None:
+                            iteration_summary["kernel_s"] = (
+                                float(iteration_summary.get("kernel_s", 0.0))
+                                + count_duration
+                            )
+                            iteration_summary["token_time_s"] = count_duration
                 if global_keys is None or global_keys.numel() == 0:
                     print("No pairs left to merge.")
+                    if metrics_enabled:
+                        self._metrics_iteration_summary = None
                     break
                 current_batches = consumed_batches
+                if metrics_enabled and iteration_summary is not None:
+                    tokens_processed, leases_processed = _tally_tokens_from_batches(
+                        consumed_batches
+                    )
+                    iteration_summary["tokens"] = tokens_processed
+                    iteration_summary["leases"] = leases_processed
+                    metrics_tracker.record_tokens(
+                        tokens_processed,
+                        count_duration,
+                        leases=leases_processed,
+                    )
+                reduction_start = time.perf_counter() if metrics_enabled else None
                 agg_keys, agg_counts = aggregate_pair_keys(global_keys, global_counts)
+                if reduction_start is not None:
+                    reduction_duration = time.perf_counter() - reduction_start
+                    metrics_tracker.record_stage("reduction", reduction_duration)
+                    if self._metrics_iteration_summary is not None:
+                        self._metrics_iteration_summary["reduction_s"] = (
+                            self._metrics_iteration_summary.get("reduction_s", 0.0)
+                            + reduction_duration
+                        )
                 best_tensor_count = torch.max(agg_counts)
                 candidate_indices = torch.nonzero(
                     agg_counts == best_tensor_count, as_tuple=False
@@ -3070,11 +3382,15 @@ class GPUBPETrainer:
                 best_count = int(best_tensor_count.item())
             if best_key_value is None:
                 print("No pairs left to merge.")
+                if metrics_enabled:
+                    self._metrics_iteration_summary = None
                 break
             a_id = int(best_key_value >> 32)
             b_id = int(best_key_value & ((1 << 32) - 1))
             if best_count <= 1:
                 print("Stopping: no frequent pairs.")
+                if metrics_enabled:
+                    self._metrics_iteration_summary = None
                 break
             new_id = self.vocab_size
             if max(a_id, b_id, new_id) > UINT32_MAX:
@@ -3085,33 +3401,41 @@ class GPUBPETrainer:
                 print(f"merge {step:6d}: ({a_id},{b_id}) -> {new_id}  count={best_count}")
             self.merges.append((a_id, b_id))
             self.vocab_size += 1
+            merge_applied = True
             if self.vocab_size > UINT32_MAX:
                 raise OverflowError(
                     f"Vocabulary size exceeded UINT32_MAX (limit {UINT32_MAX})."
                 )
-            if use_cuda:
-                _capture_device_snapshots("apply_merge:start")
-                merge_start = time.perf_counter()
-                current_batches, oom_seen, sync_report = _apply_merge_gpu(
-                    current_batches, a_id, b_id, new_id, step + 1
-                )
-                merge_duration = time.perf_counter() - merge_start
-                stage_timings["apply_merge"].record(merge_duration)
-                stage_event_log.append(
-                    {
-                        "stage": "apply_merge",
+                if use_cuda:
+                    _capture_device_snapshots("apply_merge:start")
+                    merge_start = time.perf_counter()
+                    current_batches, oom_seen, sync_report = _apply_merge_gpu(
+                        current_batches, a_id, b_id, new_id, step + 1
+                    )
+                    merge_duration = time.perf_counter() - merge_start
+                    stage_timings["apply_merge"].record(merge_duration)
+                    stage_event_log.append(
+                        {
+                            "stage": "apply_merge",
                         "duration_s": merge_duration,
                         "mode": "gpu",
                         "merge": step,
                         "type": "merge",
-                        "timestamp": time.time(),
-                    }
-                )
-                gpu_batches = [
-                    batch
-                    for batch in current_batches
-                    if isinstance(batch, MultiDeviceBatch)
-                ]
+                            "timestamp": time.time(),
+                        }
+                    )
+                    if metrics_enabled:
+                        metrics_tracker.record_stage("kernel", merge_duration)
+                        if iteration_summary is not None:
+                            iteration_summary["kernel_s"] = (
+                                float(iteration_summary.get("kernel_s", 0.0))
+                                + merge_duration
+                            )
+                    gpu_batches = [
+                        batch
+                        for batch in current_batches
+                        if isinstance(batch, MultiDeviceBatch)
+                    ]
                 self._interval_merges += 1
                 if sync_report.get("sync"):
                     self._close_sync_interval(step + 1, sync_report.get("bytes", 0))
@@ -3127,22 +3451,36 @@ class GPUBPETrainer:
                             "timestamp": time.time(),
                         }
                     )
+                    if metrics_enabled:
+                        metrics_tracker.record_stage("d2h", sync_duration)
+                        if iteration_summary is not None:
+                            iteration_summary["d2h_s"] = (
+                                float(iteration_summary.get("d2h_s", 0.0))
+                                + sync_duration
+                            )
                 _capture_device_snapshots("apply_merge:end")
             else:
                 merge_start = time.perf_counter()
                 current_batches, oom_seen, _ = _apply_merge_cpu(current_batches, a_id, b_id, new_id)
                 merge_duration = time.perf_counter() - merge_start
                 stage_timings["apply_merge"].record(merge_duration)
-                stage_event_log.append(
-                    {
-                        "stage": "apply_merge",
-                        "duration_s": merge_duration,
-                        "mode": "cpu",
+                    stage_event_log.append(
+                        {
+                            "stage": "apply_merge",
+                            "duration_s": merge_duration,
+                            "mode": "cpu",
                         "merge": step,
                         "type": "merge",
-                        "timestamp": time.time(),
-                    }
-                )
+                            "timestamp": time.time(),
+                        }
+                    )
+                    if metrics_enabled:
+                        metrics_tracker.record_stage("kernel", merge_duration)
+                        if iteration_summary is not None:
+                            iteration_summary["kernel_s"] = (
+                                float(iteration_summary.get("kernel_s", 0.0))
+                                + merge_duration
+                            )
             step += 1
             self._merge_step = step
             if not use_cuda:
@@ -3153,6 +3491,19 @@ class GPUBPETrainer:
                 oom=oom_seen,
                 cpu_fallback_rate=self._last_cpu_fallback_ratio,
             )
+            if metrics_enabled:
+                if merge_applied and iteration_summary is not None:
+                    token_time = float(iteration_summary.get("token_time_s", 0.0))
+                    tokens_val = int(iteration_summary.get("tokens", 0))
+                    leases_val = int(iteration_summary.get("leases", 0))
+                    iteration_summary["tokens_per_s"] = (
+                        tokens_val / token_time if token_time > 0 else 0.0
+                    )
+                    iteration_summary["lease_per_s"] = (
+                        leases_val / token_time if token_time > 0 else 0.0
+                    )
+                    iteration_summaries.append(dict(iteration_summary))
+                self._metrics_iteration_summary = None
             if (
                 checkpoint_interval is not None
                 and checkpoint_dir_path is not None
@@ -3180,6 +3531,8 @@ class GPUBPETrainer:
                         "type": "final",
                     }
                 )
+                if metrics_enabled:
+                    metrics_tracker.record_stage("d2h", final_duration)
             if self._interval_merges > 0:
                 self._close_sync_interval(step, final_bytes)
         per_device_metrics = {
@@ -3206,6 +3559,10 @@ class GPUBPETrainer:
             "host_sync_events": host_sync_events,
             "device_snapshots": device_snapshot_log,
             "autoscaler": autoscaler_metrics,
+        }
+        telemetry_summary["iteration_metrics"] = {
+            "ewma": metrics_tracker.summaries(),
+            "iterations": iteration_summaries,
         }
         return {
             "base_vocab": self.base_vocab,
