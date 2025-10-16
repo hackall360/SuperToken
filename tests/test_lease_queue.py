@@ -34,7 +34,7 @@ def _sorted_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]
 
 
 def test_basic_grant_and_complete() -> None:
-    notary = LeaseNotary(total_chunks=10)
+    notary = LeaseNotary(total_chunks=10, lease_ttl=5.0)
 
     lease = notary.grant_lease(rank=0, preferred_size=4)
     assert lease == (0, 4)
@@ -53,7 +53,7 @@ def test_basic_grant_and_complete() -> None:
 
 
 def test_requeue_prioritised_before_new_work() -> None:
-    notary = LeaseNotary(total_chunks=6)
+    notary = LeaseNotary(total_chunks=6, lease_ttl=5.0)
 
     lease = notary.grant_lease(rank=0, preferred_size=6)
     assert lease == (0, 6)
@@ -68,7 +68,7 @@ def test_requeue_prioritised_before_new_work() -> None:
 
 
 def test_state_dict_roundtrip() -> None:
-    notary = LeaseNotary(total_chunks=12)
+    notary = LeaseNotary(total_chunks=12, lease_ttl=7.5)
 
     lease_a = notary.grant_lease(rank=0, preferred_size=5)
     lease_b = notary.grant_lease(rank=1, preferred_size=5)
@@ -81,7 +81,7 @@ def test_state_dict_roundtrip() -> None:
 
     snap = notary.state_dict()
 
-    restored = LeaseNotary(total_chunks=0)
+    restored = LeaseNotary(total_chunks=0, lease_ttl=3.0)
     restored.load_state_dict(snap)
 
     assert restored.state_dict() == snap
@@ -96,7 +96,7 @@ def test_state_dict_roundtrip() -> None:
 
 def test_concurrent_grants_produce_unique_intervals() -> None:
     total_chunks = 317
-    notary = LeaseNotary(total_chunks=total_chunks)
+    notary = LeaseNotary(total_chunks=total_chunks, lease_ttl=1.0)
 
     completed: List[Tuple[int, int]] = []
     completion_lock = threading.Lock()
@@ -152,7 +152,7 @@ def test_concurrent_grants_produce_unique_intervals() -> None:
 
 
 def test_reject_invalid_progressions() -> None:
-    notary = LeaseNotary(total_chunks=4)
+    notary = LeaseNotary(total_chunks=4, lease_ttl=2.0)
 
     notary.grant_lease(rank=0, preferred_size=2)
 
@@ -168,4 +168,39 @@ def test_reject_invalid_progressions() -> None:
 
     with pytest.raises(RuntimeError):
         notary.grant_lease(rank=1, preferred_size=1)
+
+
+def test_timed_out_leases_requeue_and_are_reattributed() -> None:
+    ttl = 0.5
+    notary = LeaseNotary(total_chunks=6, lease_ttl=ttl)
+
+    lease_a = notary.grant_lease(rank=0, preferred_size=3)
+    lease_b = notary.grant_lease(rank=1, preferred_size=3)
+    assert lease_a == (0, 3)
+    assert lease_b == (3, 6)
+
+    # Advance time beyond the TTL for rank 0 but keep rank 1 active.
+    state = notary.state_dict()
+    heartbeat_0 = state["inflight"][0]["last_heartbeat"]
+
+    # Ensure rank 1 remains within the TTL window by nudging its heartbeat forward.
+    with notary._lock:  # type: ignore[attr-defined]
+        record = notary._inflight[1]  # type: ignore[attr-defined]
+        record.last_heartbeat = heartbeat_0 + ttl / 2
+
+    timed_out = notary.check_timeouts(now=heartbeat_0 + ttl + 0.01)
+    assert timed_out == {0: (0, 3)}
+
+    state_after = notary.state_dict()
+    assert 0 not in state_after["inflight"]
+    assert state_after["pending_requeue"] and state_after["pending_requeue"][0] == (0, 3)
+    assert 1 in state_after["inflight"]
+
+    reassigned = notary.grant_lease(rank=2, preferred_size=3)
+    assert reassigned == (0, 3)
+    notary.complete_lease(rank=2, start=0, end=3)
+    notary.complete_lease(rank=1, start=3, end=6)
+
+    # Ensure no extra work becomes available.
+    assert notary.grant_lease(rank=3, preferred_size=1) is None
 

@@ -95,15 +95,39 @@ class DistributedLeaseClient:
         rank: int,
         world_size: int,
         host_state: _LeaseHostState,
+        root: int = 0,
     ) -> None:
         self.job_id = job_id
         self.rank = rank
         self.world_size = world_size
         self._host_state = host_state
+        self._root = root
 
     @property
     def total_chunks(self) -> int:
         return self._host_state.total_chunks
+
+    def _dist_ready(self) -> bool:
+        return (
+            dist is not None
+            and hasattr(dist, "broadcast_object_list")
+            and dist.is_available()
+            and dist.is_initialized()
+            and self.world_size > 1
+        )
+
+    def _broadcast_event(self, event: str, **payload: object) -> None:
+        if not self._dist_ready():
+            return
+        message = [{"event": event, "rank": self.rank, **payload}]
+        try:
+            dist.broadcast_object_list(message, src=self.rank)  # type: ignore[arg-type]
+        except Exception:  # pragma: no cover - best effort notification
+            logger.debug(
+                "lease_client_broadcast_failed",
+                extra={"event": event, "rank": self.rank},
+                exc_info=True,
+            )
 
     def request_lease(self, preferred_size: int) -> Optional[Tuple[int, int]]:
         if preferred_size <= 0:
@@ -114,14 +138,38 @@ class DistributedLeaseClient:
     def complete_lease(self, start: int, end: int) -> None:
         with self._host_state.lock:
             self._host_state.notary.complete_lease(self.rank, start, end)
+        self._broadcast_event("complete", lease=(int(start), int(end)))
 
     def requeue_lease(self, start: int, end: int) -> None:
         with self._host_state.lock:
             self._host_state.notary.requeue_lease(self.rank, start, end)
+        self._broadcast_event("requeue", lease=(int(start), int(end)))
 
     def heartbeat(self) -> float:
         with self._host_state.lock:
             return self._host_state.notary.heartbeat(self.rank)
+
+    def requeue_outstanding(self) -> Optional[Tuple[int, int]]:
+        """Best-effort requeue of the inflight lease for this rank."""
+
+        with self._host_state.lock:
+            snapshot = self._host_state.notary.state_dict()
+        inflight_entry = snapshot["inflight"].get(self.rank)
+        if not inflight_entry:
+            return None
+        start, end = inflight_entry["lease"]
+        try:
+            with self._host_state.lock:
+                self._host_state.notary.requeue_lease(self.rank, int(start), int(end))
+        except Exception:
+            logger.debug(
+                "lease_requeue_on_shutdown_failed",
+                extra={"rank": self.rank, "lease": (start, end)},
+                exc_info=True,
+            )
+            return None
+        self._broadcast_event("requeue", lease=(int(start), int(end)))
+        return (int(start), int(end))
 
     def iter_leases(self, preferred_size: int) -> Iterator[Tuple[int, int]]:
         while True:
@@ -169,6 +217,7 @@ def register_lease_client(
         rank=rank,
         world_size=world_size,
         host_state=host_state,
+        root=root,
     )
 
 
@@ -636,6 +685,9 @@ def _worker_entry(rank: int, config: DistributedLaunchConfig, cli_args: Sequence
         if shutdown_state["triggered"]:
             return
         shutdown_state["triggered"] = True
+        if lease_client is not None:
+            with contextlib.suppress(Exception):
+                lease_client.requeue_outstanding()
         worker_logger.info(
             "worker_shutdown",
             extra={

@@ -41,15 +41,18 @@ class LeaseNotary:
     to indicate they are still making progress.
     """
 
-    def __init__(self, total_chunks: int) -> None:
+    def __init__(self, total_chunks: int, *, lease_ttl: float = 30.0) -> None:
         if total_chunks < 0:
             raise ValueError("total_chunks must be non-negative")
+        if lease_ttl <= 0:
+            raise ValueError("lease_ttl must be positive")
 
         self._lock = threading.Lock()
         self._total_chunks = total_chunks
         self._next_idx = 0
         self._inflight: Dict[int, _LeaseRecord] = {}
         self._pending_requeue: Deque[Lease] = deque()
+        self._lease_ttl = float(lease_ttl)
 
     @staticmethod
     def _now() -> float:
@@ -58,6 +61,12 @@ class LeaseNotary:
     @property
     def total_chunks(self) -> int:
         return self._total_chunks
+
+    @property
+    def lease_ttl(self) -> float:
+        """Return the configured lease time-to-live in seconds."""
+
+        return self._lease_ttl
 
     def grant_lease(self, rank: int, preferred_size: int) -> Optional[Tuple[int, int]]:
         """Return the next available lease for ``rank``.
@@ -124,6 +133,39 @@ class LeaseNotary:
             record.last_heartbeat = new_ts
             return new_ts
 
+    def check_timeouts(self, now: Optional[float] = None) -> Dict[int, Tuple[int, int]]:
+        """Requeue leases whose heartbeats have exceeded :attr:`lease_ttl`.
+
+        Parameters
+        ----------
+        now:
+            Optional wall clock timestamp (``time.monotonic`` seconds). When not
+            provided the current monotonic time is used.
+
+        Returns
+        -------
+        dict
+            Mapping of timed-out ranks to the lease that was requeued.
+        """
+
+        deadline = self._now() if now is None else float(now)
+        timed_out: Dict[int, Tuple[int, int]] = {}
+
+        with self._lock:
+            expired_ranks = [
+                rank
+                for rank, record in self._inflight.items()
+                if deadline - record.last_heartbeat >= self._lease_ttl
+            ]
+
+            for rank in expired_ranks:
+                record = self._inflight.pop(rank)
+                lease = record.lease
+                self._pending_requeue.appendleft(lease)
+                timed_out[rank] = lease.as_tuple()
+
+        return timed_out
+
     def state_dict(self) -> Dict[str, object]:
         """Return a serialisable snapshot of the notary state."""
 
@@ -144,12 +186,18 @@ class LeaseNotary:
                 "next_idx": self._next_idx,
                 "inflight": dict(inflight),
                 "pending_requeue": list(pending),
+                "lease_ttl": self._lease_ttl,
             }
 
     def load_state_dict(self, state: Dict[str, object]) -> None:
         """Restore state produced by :meth:`state_dict`."""
 
-        required_keys = {"total_chunks", "next_idx", "inflight", "pending_requeue"}
+        required_keys = {
+            "total_chunks",
+            "next_idx",
+            "inflight",
+            "pending_requeue",
+        }
         if not required_keys.issubset(state):
             missing = required_keys - set(state)
             raise KeyError(f"state missing keys: {sorted(missing)}")
@@ -158,6 +206,7 @@ class LeaseNotary:
         next_idx = int(state["next_idx"])
         inflight_raw = state["inflight"]
         pending_raw = state["pending_requeue"]
+        lease_ttl = float(state.get("lease_ttl", self._lease_ttl))
 
         if total_chunks < 0:
             raise ValueError("total_chunks must be non-negative")
@@ -167,6 +216,8 @@ class LeaseNotary:
             raise TypeError("inflight must be a mapping")
         if not isinstance(pending_raw, list):
             raise TypeError("pending_requeue must be a list")
+        if lease_ttl <= 0:
+            raise ValueError("lease_ttl must be positive")
 
         inflight: Dict[int, _LeaseRecord] = {}
         for raw_rank, raw_entry in inflight_raw.items():
@@ -190,4 +241,5 @@ class LeaseNotary:
             self._next_idx = next_idx
             self._inflight = inflight
             self._pending_requeue = pending_queue
+            self._lease_ttl = lease_ttl
 
