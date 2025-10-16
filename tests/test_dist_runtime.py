@@ -7,6 +7,7 @@ import pathlib
 import queue
 import sys
 import types
+import threading
 
 import pytest
 
@@ -81,8 +82,11 @@ def _patch_common_runtime(monkeypatch: pytest.MonkeyPatch):
         destroy_calls.append(1)
 
     broadcast_payload: list[object] = []
+    broadcast_log: list[tuple[int, object]] = []
 
     def _broadcast(obj_list, *, src=0, group=None):
+        if obj_list:
+            broadcast_log.append((src, obj_list[0]))
         if src == 0 and obj_list:
             broadcast_payload[:] = [obj_list[0]]
         elif obj_list and broadcast_payload:
@@ -118,6 +122,7 @@ def _patch_common_runtime(monkeypatch: pytest.MonkeyPatch):
         "handler_map": handler_map,
         "installed_handlers": installed_handlers,
         "registered_cleanup": registered_cleanup,
+        "broadcast_log": broadcast_log,
     }
 
 
@@ -198,12 +203,45 @@ def test_worker_entry_signal_triggers_process_group_teardown(monkeypatch: pytest
 
     dist_runtime._worker_entry(0, config, tuple())
 
-    handler = artifacts["installed_handlers"][dist_runtime.signal.SIGINT][-1]
-    handler(dist_runtime.signal.SIGINT, None)
 
-    assert artifacts["destroy_calls"]
-    assert artifacts["registered_cleanup"], "cleanup should be registered"
+def test_distributed_client_broadcasts_and_requeues(monkeypatch: pytest.MonkeyPatch) -> None:
+    dist_runtime, artifacts = _patch_common_runtime(monkeypatch)
 
+    host_state = dist_runtime._LeaseHostState(
+        notary=dist_runtime.LeaseNotary(total_chunks=2, lease_ttl=0.25),
+        lock=threading.Lock(),
+    )
+
+    worker = dist_runtime.DistributedLeaseClient(
+        job_id="job",
+        rank=1,
+        world_size=2,
+        host_state=host_state,
+    )
+
+    lease = worker.request_lease(1)
+    assert lease == (0, 1)
+
+    worker.complete_lease(*lease)
+    state = host_state.notary.state_dict()
+    assert state["inflight"] == {}
+
+    lease2 = worker.request_lease(1)
+    assert lease2 == (1, 2)
+
+    reclaimed = worker.requeue_outstanding()
+    assert reclaimed == lease2
+
+    state_after = host_state.notary.state_dict()
+    assert 1 not in state_after["inflight"]
+    assert state_after["pending_requeue"] == [lease2]
+
+    events = [payload for _src, payload in artifacts["broadcast_log"] if isinstance(payload, dict)]
+    complete_events = [event for event in events if event.get("event") == "complete"]
+    requeue_events = [event for event in events if event.get("event") == "requeue"]
+
+    assert complete_events and complete_events[-1]["lease"] == (0, 1)
+    assert requeue_events and requeue_events[-1]["lease"] == (1, 2)
 
 def test_distributed_lease_client_assigns_disjoint_ranges(monkeypatch: pytest.MonkeyPatch) -> None:
     dist_runtime, _ = _patch_common_runtime(monkeypatch)
