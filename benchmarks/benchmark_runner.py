@@ -40,6 +40,10 @@ def _ensure_trainers_available() -> None:
         The function exists purely for its side effect of raising when the
         trainers cannot be used.
 
+    Side Effects
+    ------------
+    None.
+
     Raises
     ------
     RuntimeError
@@ -148,6 +152,10 @@ def _iter_shard_sequences(
     The helper streams data directly from the memory map without requiring GPU
     availability. Callers are responsible for keeping the ``shard`` context
     alive for as long as iteration continues.
+
+    Side Effects
+    ------------
+    None. The caller is responsible for managing the lifetime of ``shard``.
     """
     encoded = packer.encode_shard(shard)
     seq = list(encoded)
@@ -354,6 +362,8 @@ def _build_unigram_batches(
     propagate.
     """
     packed = PackedBatcher(sequences, batch_size=batch_size, seed=seed)
+    # Clone the packed tensors so the unigram trainer can mutate batches without
+    # touching the shared memory map backing the iterator.
     return [tokens.clone() for tokens, _valid, _lengths in packed]
 
 
@@ -433,6 +443,8 @@ def run_bpe_benchmark(
     1000
     """
     _ensure_trainers_available()
+    # Keep ``min_bs`` and ``max_bs`` identical so the autoscaler never alters
+    # batch sizes during benchmarking, preserving deterministic timings.
     autoscaler = AutoScaler(min_bs=batch_size, max_bs=batch_size, device=device)
     batches = _build_bpe_batches(sequences, batch_size=batch_size, seed=seed)
     trainer = GPUBPETrainer(
