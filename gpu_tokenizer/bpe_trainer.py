@@ -54,8 +54,8 @@ from .utils import (
     compact_histogram,
     count_pairs,
     peer_copy_tensor,
-    reduce_pair_histograms,
 )
+from .dist.launcher import get_histogram_reducer
 
 
 def _aggregate_pair_keys(
@@ -3342,7 +3342,8 @@ class GPUBPETrainer(BaseTrainer):
                             hist_results, target_device=reduction_device
                         )
                         reduction_start = time.perf_counter() if metrics_enabled else None
-                        reduced_keys, reduced_counts = reduce_pair_histograms(
+                        reducer = get_histogram_reducer()
+                        reduced_keys, reduced_counts = reducer(
                             combined.keys, combined.counts
                         )
                         if reduction_start is not None:
