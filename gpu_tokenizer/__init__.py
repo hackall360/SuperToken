@@ -6,6 +6,7 @@ from .autoscaler import AutoScaler
 from .cpu_packer import BytePacker
 from .datasets import PackedBatcher, StreamingPackedBatcher
 from .io import CorpusStreamer, MemoryMappedShard
+from .trainers import BaseTrainer
 from . import dist_runtime, lease_queue, ngram_stats, utils
 
 try:  # pragma: no cover - optional torch dependency
@@ -23,6 +24,7 @@ __all__ = [
     for name in [
         "GPUBPETrainer",
         "GPUUnigramTrainer",
+        "BaseTrainer",
         "BytePacker",
         "PackedBatcher",
         "StreamingPackedBatcher",

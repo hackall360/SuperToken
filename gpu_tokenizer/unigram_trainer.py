@@ -6,14 +6,15 @@ import math
 import time
 from os import PathLike
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import torch
 
 from . import cuda_kernels
+from .trainers.base import BaseTrainer
 
 
-class GPUUnigramTrainer:
+class GPUUnigramTrainer(BaseTrainer):
     """Minimal unigram trainer using GPU-accelerated forward/backward passes."""
 
     def __init__(
@@ -383,6 +384,38 @@ class GPUUnigramTrainer:
         logZ, exp = self._forward_backward_batch(batch_seq, valid)
         return logZ[0], exp[0]
 
+    def fit(
+        self,
+        batches: Iterable[torch.Tensor] | Sequence[torch.Tensor],
+        *,
+        epochs: int = 1,
+    ) -> dict[str, object]:
+        """Run one or more epochs of unigram training over ``batches``."""
+
+        cached_batches = list(batches)
+        try:
+            epochs_int = int(epochs)
+        except (TypeError, ValueError):
+            epochs_int = 1
+        if epochs_int <= 0:
+            epochs_int = 1
+
+        history: list[dict[str, object]] = []
+        last_result: dict[str, object] | None = None
+        for epoch_idx in range(epochs_int):
+            epoch_result = self.fit_epoch(cached_batches)
+            last_result = epoch_result
+            history.append({"epoch": epoch_idx + 1, **epoch_result})
+
+        if last_result is None:
+            last_result = {"vocab": len(self.id2piece), "telemetry": {}}
+
+        summary = dict(last_result)
+        summary.setdefault("telemetry", {})
+        summary["epochs_ran"] = epochs_int
+        summary["history"] = history
+        return summary
+
     def fit_epoch(self, batches: List[torch.Tensor]) -> dict[str, object]:
         epoch_start = time.perf_counter()
         candidate_time = 0.0
@@ -437,6 +470,12 @@ class GPUUnigramTrainer:
         }
 
         return {"vocab": len(self.id2piece), "telemetry": telemetry}
+
+    def save_artifacts(self, path: str | PathLike[str]) -> dict[str, object]:
+        """Persist the trained unigram model and return its location."""
+
+        model_path = self.save(path)
+        return {"model": str(model_path)}
 
     def save(self, path: str | PathLike[str]) -> Path:
         """Serialize the unigram model to a SentencePiece ``.model`` file.

@@ -37,6 +37,7 @@ from .dtypes import (
     length_storage_dtype,
     promote_length_sum_dtype,
 )
+from .trainers.base import BaseTrainer
 from .utils import (
     aggregate_pair_keys,
     apply_merge_once,
@@ -997,7 +998,7 @@ class GPUBPETokenizer:
         return getattr(self._tokenizer, name)
 
 
-class GPUBPETrainer:
+class GPUBPETrainer(BaseTrainer):
     """Train byte-pair encodings on the GPU."""
 
     def __init__(
@@ -4366,9 +4367,16 @@ class GPUBPETrainer:
             )
         return GPUBPETokenizer.from_config(tokenizer_config)
 
-    def save(self, out_dir: str) -> None:
+    def save_artifacts(self, out_dir: str | os.PathLike[str]) -> dict[str, str]:
+        """Persist tokenizer artifacts and return their filesystem paths."""
+
         vocab, merges, tokenizer_config = self._build_tokenizer_artifacts()
-        paths = self._write_tokenizer_artifacts(out_dir, vocab, merges, tokenizer_config)
+        return self._write_tokenizer_artifacts(
+            os.fspath(out_dir), vocab, merges, tokenizer_config
+        )
+
+    def save(self, out_dir: str | os.PathLike[str]) -> None:
+        paths = self.save_artifacts(out_dir)
         print(
             "Saved tokenizer artifacts → "
             f"{paths['vocab']}, {paths['merges']}, {paths['tokenizer']}"
