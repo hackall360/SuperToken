@@ -1,5 +1,6 @@
 import pytest
 from types import MethodType
+from typing import Sequence
 import time
 
 torch = pytest.importorskip("torch")
@@ -32,6 +33,7 @@ from gpu_tokenizer.cpu_fastpath import (
     should_route_to_cpu,
 )
 from gpu_tokenizer.utils import apply_merge_once, count_pairs
+from tests.adversarial_corpora import get_adversarial_corpora
 
 
 def test_aggregate_pair_keys_repeated_counts():
@@ -88,6 +90,38 @@ def _make_batch(seqs: list[list[int]]):
         tokens = tokens.pin_memory()
         valid = valid.pin_memory()
     return tokens, valid, lengths
+
+
+def _encode_corpus_to_batches(corpus: Sequence[str], batch_rows: int = 2):
+    byte_sequences = [list(sample.encode("utf-8")) for sample in corpus]
+    batches: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    for start in range(0, len(byte_sequences), batch_rows):
+        chunk = byte_sequences[start : start + batch_rows]
+        if not chunk:
+            continue
+        width = max(1, max((len(seq) for seq in chunk), default=0))
+        tokens = torch.full((len(chunk), width), -1, dtype=torch.int32)
+        valid = torch.zeros((len(chunk), width), dtype=torch.uint8)
+        length_dtype = length_storage_dtype(width)
+        lengths = torch.zeros((len(chunk),), dtype=length_dtype)
+        for row, seq in enumerate(chunk):
+            if not seq:
+                continue
+            seq_tensor = torch.tensor(seq, dtype=torch.int32)
+            tokens[row, : seq_tensor.numel()] = seq_tensor
+            valid[row, : seq_tensor.numel()] = 1
+            lengths[row] = seq_tensor.numel()
+        batches.append((tokens, valid, lengths))
+    return batches
+
+
+def _clone_batches(
+    batches: Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+):
+    cloned: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    for tokens, valid, lengths in batches:
+        cloned.append((tokens.clone(), valid.clone(), lengths.clone()))
+    return cloned
 
 
 def test_handle_chunk_start_resets_cache_state():
@@ -207,6 +241,28 @@ def test_cpu_fastpath_merge_matches_reference():
     assert torch.equal(tokens_fast, tokens_ref)
     assert torch.equal(valid_fast, valid_ref)
     assert torch.equal(lengths_fast.to(torch.int64), lengths_ref.to(torch.int64))
+
+
+@pytest.mark.parametrize("corpus", get_adversarial_corpora(), ids=lambda c: c.name)
+def test_gpu_cpu_parity_tiny_batches_adversarial(corpus):
+    if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+        pytest.skip("CUDA device required for GPU/CPU parity checks")
+
+    base_batches = _encode_corpus_to_batches(corpus.corpus, batch_rows=2)
+    if not base_batches:
+        pytest.skip("Corpus did not yield any batches")
+
+    merges_budget = min(12, max(4, corpus.target_merge_operations // 4))
+
+    gpu_trainer = GPUBPETrainer(base_vocab=256, merges=merges_budget, device="cuda")
+    gpu_result = gpu_trainer.fit(_clone_batches(base_batches), log_every=0)
+
+    cpu_trainer = GPUBPETrainer(base_vocab=256, merges=merges_budget, device="cpu")
+    cpu_result = cpu_trainer.fit(_clone_batches(base_batches), log_every=0)
+
+    assert gpu_trainer._cpu_fallback_batches > 0
+    assert gpu_result["merges"] == cpu_result["merges"]
+    assert gpu_result["vocab_size"] == cpu_result["vocab_size"]
 
 
 def test_should_route_to_cpu_heuristic():

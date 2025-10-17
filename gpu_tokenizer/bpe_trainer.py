@@ -2363,6 +2363,107 @@ class GPUBPETrainer(BaseTrainer):
         ) -> list[list[int]]:
             return self._collect_sequences_from_batches(batches_iter)
 
+        def _schedule_iteration_batches(
+            batches_iter: Iterable[
+                Union[
+                    MultiDeviceBatch,
+                    CPUFallbackBatch,
+                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]],
+                    Tuple[
+                        torch.Tensor,
+                        torch.Tensor,
+                        torch.Tensor,
+                        list[torch.Tensor],
+                        Optional[tuple[torch.Tensor, torch.Tensor]],
+                    ],
+                ]
+            ]
+        ) -> list[
+            Union[
+                MultiDeviceBatch,
+                CPUFallbackBatch,
+                Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]],
+                Tuple[
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                    list[torch.Tensor],
+                    Optional[tuple[torch.Tensor, torch.Tensor]],
+                ],
+            ]
+        ]:
+            materialized = list(batches_iter)
+            if not use_cuda or not materialized:
+                return materialized
+
+            scheduled: list[
+                Union[
+                    MultiDeviceBatch,
+                    CPUFallbackBatch,
+                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]],
+                    Tuple[
+                        torch.Tensor,
+                        torch.Tensor,
+                        torch.Tensor,
+                        list[torch.Tensor],
+                        Optional[tuple[torch.Tensor, torch.Tensor]],
+                    ],
+                ]
+            ] = []
+            for batch in materialized:
+                if not isinstance(batch, MultiDeviceBatch):
+                    scheduled.append(batch)
+                    continue
+
+                rerouted: list[CPUFallbackBatch] = []
+                retained: dict[torch.device, GPUBatchRecord] = {}
+                for dev, shard in batch.iter_shards():
+                    rows = int(shard.tokens.shape[0])
+                    width = max(int(shard.tokens.shape[1]) - 1, 0)
+                    if should_route_to_cpu(rows, width):
+                        tokens_host, valid_host, lengths_host = shard.resolve_host()
+                        tokens_cpu = tokens_host.detach().clone().to("cpu")
+                        valid_cpu = valid_host.detach().clone().to("cpu")
+                        lengths_cpu = lengths_host.detach().clone().to("cpu")
+                        span_list = [
+                            span.detach().clone().to("cpu") for span in shard.span_history
+                        ]
+                        pair_keys_cpu = (
+                            None
+                            if shard.pair_keys is None
+                            else shard.pair_keys.detach().clone().to("cpu")
+                        )
+                        pair_counts_cpu = (
+                            None
+                            if shard.pair_counts is None
+                            else shard.pair_counts.detach().clone().to("cpu")
+                        )
+                        fallback = _pack_cpu_batch(
+                            tokens_cpu,
+                            valid_cpu,
+                            lengths_cpu,
+                            spans=span_list,
+                            pair_keys=pair_keys_cpu,
+                            pair_counts=pair_counts_cpu,
+                            as_fallback=True,
+                        )
+                        if isinstance(fallback, CPUFallbackBatch):
+                            rerouted.append(fallback)
+                        continue
+
+                    retained[dev] = shard
+
+                scheduled.extend(rerouted)
+                if retained:
+                    if len(retained) == len(batch.shards):
+                        scheduled.append(batch)
+                    else:
+                        scheduled.append(MultiDeviceBatch(shards=retained))
+            return scheduled
+
         gpu_devices = [dev for dev in self.devices if dev.type == "cuda"]
         if gpu_devices and not torch.cuda.is_available():
             raise RuntimeError("CUDA devices requested but CUDA is not available")
@@ -2633,10 +2734,12 @@ class GPUBPETrainer(BaseTrainer):
                     b_ids = pairs_view[:, 1].to(torch.long)
                     keys = ((a_ids << 32) | b_ids).to(torch.long)
                     counts_cpu = counts_view.to(torch.int64)
+                    compact_keys, compact_counts = compact_histogram(keys, counts_cpu)
+                    keys_cpu, counts_cpu = aggregate_pair_keys(compact_keys, compact_counts)
                 else:
-                    keys = torch.empty((0,), dtype=torch.long, device=cpu_device)
+                    keys_cpu = torch.empty((0,), dtype=torch.long, device=cpu_device)
                     counts_cpu = torch.empty((0,), dtype=torch.int64, device=cpu_device)
-                keys_cpu = keys.clone().to("cpu")
+                keys_cpu = keys_cpu.clone().to("cpu")
                 counts_cpu = counts_cpu.clone().to("cpu")
                 consumed.append(
                     _pack_cpu_batch(
@@ -3423,6 +3526,13 @@ class GPUBPETrainer(BaseTrainer):
 
         if warm_merges_to_apply and not self._warm_start_applied:
             applied_merges: list[tuple[int, int]] = []
+            if use_cuda:
+                current_batches = _schedule_iteration_batches(current_batches)
+                gpu_batches = [
+                    batch
+                    for batch in current_batches
+                    if isinstance(batch, MultiDeviceBatch)
+                ]
             for idx, (a_id, b_id) in enumerate(warm_merges_to_apply, start=1):
                 new_id = self.vocab_size
                 if max(a_id, b_id, new_id) > UINT32_MAX:
@@ -3562,6 +3672,13 @@ class GPUBPETrainer(BaseTrainer):
                 self._metrics_iteration_summary = iteration_summary
             else:
                 iteration_summary = None
+            if use_cuda:
+                current_batches = _schedule_iteration_batches(current_batches)
+                gpu_batches = [
+                    batch
+                    for batch in current_batches
+                    if isinstance(batch, MultiDeviceBatch)
+                ]
             merge_applied = False
             candidate_key: Optional[int] = None
             candidate_count = 0

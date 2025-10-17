@@ -15,7 +15,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from .utils import apply_merge_once, count_pairs
+from .utils import aggregate_pair_keys, apply_merge_once, compact_histogram, count_pairs
 
 
 @dataclass
@@ -87,7 +87,9 @@ def count_pairs_fastpath(
     a_ids = pairs[:, 0].to(torch.long)
     b_ids = pairs[:, 1].to(torch.long)
     keys = (a_ids << 32) | b_ids
-    return keys, counts
+    compact_keys, compact_counts = compact_histogram(keys, counts)
+    aggregated_keys, aggregated_counts = aggregate_pair_keys(compact_keys, compact_counts)
+    return aggregated_keys, aggregated_counts
 
 
 def apply_merge_fastpath(
