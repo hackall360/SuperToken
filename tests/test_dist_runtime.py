@@ -10,7 +10,7 @@ import queue
 import sys
 import types
 import threading
-from collections import deque
+from collections import Counter, deque
 from typing import Dict
 
 import pytest
@@ -284,14 +284,16 @@ def test_distributed_client_broadcasts_and_requeues(monkeypatch: pytest.MonkeyPa
     )
 
     lease = worker.request_lease(1)
-    assert lease == (0, 1)
+    assert lease is not None
+    assert lease[:2] == (0, 1)
 
     worker.complete_lease(*lease)
     state = host_state.notary.state_dict()
     assert state["inflight"] == {}
 
     lease2 = worker.request_lease(1)
-    assert lease2 == (1, 2)
+    assert lease2 is not None
+    assert lease2[:2] == (1, 2)
 
     reclaimed = worker.requeue_outstanding()
     assert reclaimed == lease2
@@ -304,8 +306,8 @@ def test_distributed_client_broadcasts_and_requeues(monkeypatch: pytest.MonkeyPa
     complete_events = [event for event in events if event.get("event") == "complete"]
     requeue_events = [event for event in events if event.get("event") == "requeue"]
 
-    assert complete_events and complete_events[-1]["lease"] == (0, 1)
-    assert requeue_events and requeue_events[-1]["lease"] == (1, 2)
+    assert complete_events and complete_events[-1]["lease"] == lease
+    assert requeue_events and requeue_events[-1]["lease"] == lease2
 
 def test_distributed_lease_client_assigns_disjoint_ranges(monkeypatch: pytest.MonkeyPatch) -> None:
     dist_runtime, _ = _patch_common_runtime(monkeypatch)
@@ -323,7 +325,7 @@ def test_distributed_lease_client_assigns_disjoint_ranges(monkeypatch: pytest.Mo
         job_id="test-job", total_chunks=len(chunk_slices), rank=1, world_size=2
     )
 
-    assigned: dict[int, list[tuple[int, int]]] = {0: [], 1: []}
+    assigned: dict[int, list[tuple[int, int, int]]] = {0: [], 1: []}
     while True:
         lease0 = client0.request_lease(1)
         lease1 = client1.request_lease(1)
@@ -339,7 +341,7 @@ def test_distributed_lease_client_assigns_disjoint_ranges(monkeypatch: pytest.Mo
     all_leases = assigned[0] + assigned[1]
     assert all_leases, "at least one lease should be granted"
     seen: set[int] = set()
-    for start, end in all_leases:
+    for start, end, _ in all_leases:
         for idx in range(start, end):
             assert idx not in seen, "leases must be disjoint across ranks"
             seen.add(idx)
@@ -375,7 +377,7 @@ def test_requeued_leases_are_reassigned(monkeypatch: pytest.MonkeyPatch) -> None
     assert next_lease[0] >= reassigned[1]
     client0.complete_lease(*next_lease)
 
-    remaining: list[tuple[int, int]] = []
+    remaining: list[tuple[int, int, int]] = []
     while True:
         l0 = client0.request_lease(1)
         l1 = client1.request_lease(1)
@@ -389,11 +391,13 @@ def test_requeued_leases_are_reassigned(monkeypatch: pytest.MonkeyPatch) -> None
             client1.complete_lease(*l1)
 
     covered = set()
-    for start, end in remaining:
+    for start, end, _ in remaining:
         covered.update(range(start, end))
 
     assert set(range(len(chunk_slices))).issubset(
-        covered | set(range(reassigned[0], reassigned[1])) | set(range(next_lease[0], next_lease[1]))
+        covered
+        | set(range(reassigned[0], reassigned[1]))
+        | set(range(next_lease[0], next_lease[1]))
     ), "all chunk indices should eventually be processed"
 
 
@@ -517,6 +521,90 @@ def test_iterate_leased_shards_prefetches_additional_lease(
     assert observed_lengths
     assert max(observed_lengths) >= 2
     assert notary.state_dict()["inflight"] == {}
+
+
+def test_iterate_leased_shards_reprocess_resets_histograms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dist_runtime, _ = _patch_common_runtime(monkeypatch)
+
+    notary = dist_runtime.LeaseNotary(total_chunks=1, lease_ttl=5.0)
+    host_state = dist_runtime._LeaseHostState(notary=notary, lock=threading.Lock())
+    client = dist_runtime.DistributedLeaseClient(
+        job_id="reprocess",
+        rank=0,
+        world_size=1,
+        host_state=host_state,
+    )
+
+    shard_paths = ["shard-0"]
+    chunk_slices = [(0, 1)]
+    sequence = [1, 2, 1, 2, 3]
+
+    current_info: dict[str, object | None] = {"value": None}
+    reset_calls = {"count": 0}
+    cache: dict[str, object] = {"counts": None, "merges": []}
+    fail_once = {"fired": False}
+
+    def _on_chunk(info) -> None:
+        current_info["value"] = info
+        if getattr(info, "reprocessed", False):
+            cache["counts"] = None
+            cache["merges"] = []
+            reset_calls["count"] += 1
+
+    @contextlib.contextmanager
+    def _open(_path: str):
+        yield _path
+
+    def _encode(_shard: str):
+        info = current_info.get("value")
+        assert info is not None, "chunk info should be available before encoding"
+        if getattr(info, "attempts", 1) == 1 and not fail_once["fired"]:
+            fail_once["fired"] = True
+            raise RuntimeError("transient chunk failure")
+        pair_counts = Counter(zip(sequence, sequence[1:]))
+        cache["counts"] = Counter(pair_counts)
+        if pair_counts:
+            best = max(pair_counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+            cache["merges"] = [best]
+        return iter(sequence)
+
+    iterator = dist_runtime.iterate_leased_shards(
+        shard_paths,
+        chunk_slices,
+        lease_client=client,
+        encode_shard=_encode,
+        shard_opener=_open,
+        on_chunk_start=_on_chunk,
+    )
+
+    with pytest.raises(RuntimeError):
+        next(iterator)
+
+    iterator = dist_runtime.iterate_leased_shards(
+        shard_paths,
+        chunk_slices,
+        lease_client=client,
+        encode_shard=_encode,
+        shard_opener=_open,
+        on_chunk_start=_on_chunk,
+    )
+
+    materialized = [list(seq) for seq in iterator]
+    assert materialized == [sequence]
+
+    assert reset_calls["count"] == 1
+    expected_counts = Counter(zip(sequence, sequence[1:]))
+    assert cache["counts"] == expected_counts
+    if expected_counts:
+        assert cache["merges"] == [
+            max(expected_counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+        ]
+
+    state = notary.state_dict()
+    assert state["inflight"] == {}
+    assert state["pending_requeue"] == []
 
 
 def test_idle_metrics_drop_with_extra_prefetch(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -677,11 +765,14 @@ def test_slow_gpu_quota_reduces_smoothly(monkeypatch: pytest.MonkeyPatch) -> Non
         assert snap["rank_max_active"][1] == 4
         assert snap["rank_lease_scale"][0] <= baseline["rank_lease_scale"][0]
         assert snap["rank_lease_scale"][1] >= baseline["rank_lease_scale"][1]
-        held: list[tuple[int, int]] = []
+        held: list[tuple[int, int, int]] = []
         for _ in range(expected_limit):
             lease = host_state.notary.grant_lease(rank=0, preferred_size=2)
+            assert lease is not None
             held.append(lease)
         with pytest.raises(RuntimeError):
             host_state.notary.grant_lease(rank=0, preferred_size=2)
-        for start, end in held:
-            host_state.notary.complete_lease(rank=0, start=start, end=end)
+        for start, end, chunk_id in held:
+            host_state.notary.complete_lease(
+                rank=0, start=start, end=end, chunk_id=chunk_id
+            )

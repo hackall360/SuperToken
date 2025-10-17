@@ -15,7 +15,18 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from types import FrameType
 from collections import deque
-from typing import Callable, Deque, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Callable,
+    Deque,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import time
 
@@ -101,6 +112,24 @@ def _get_or_create_host_state(
             state.notary.update_max_active_leases(max_active_leases)
     return state
 
+@dataclass(frozen=True)
+class ChunkLeaseInfo:
+    """Describe a leased chunk handed to a worker."""
+
+    start: int
+    end: int
+    chunk_id: int
+    attempts: int
+    completed: bool
+
+    @property
+    def width(self) -> int:
+        return max(0, self.end - self.start)
+
+    @property
+    def reprocessed(self) -> bool:
+        return self.attempts > 1
+
 
 class DistributedLeaseClient:
     """Thin wrapper around :class:`LeaseNotary` shared across distributed ranks."""
@@ -146,27 +175,27 @@ class DistributedLeaseClient:
                 exc_info=True,
             )
 
-    def request_lease(self, preferred_size: int) -> Optional[Tuple[int, int]]:
+    def request_lease(self, preferred_size: int) -> Optional[Tuple[int, int, int]]:
         if preferred_size <= 0:
             raise ValueError("preferred_size must be positive")
         with self._host_state.lock:
             return self._host_state.notary.grant_lease(self.rank, preferred_size)
 
-    def complete_lease(self, start: int, end: int) -> None:
+    def complete_lease(self, start: int, end: int, chunk_id: int) -> None:
         with self._host_state.lock:
-            self._host_state.notary.complete_lease(self.rank, start, end)
-        self._broadcast_event("complete", lease=(int(start), int(end)))
+            self._host_state.notary.complete_lease(self.rank, start, end, chunk_id)
+        self._broadcast_event("complete", lease=(int(start), int(end), int(chunk_id)))
 
-    def requeue_lease(self, start: int, end: int) -> None:
+    def requeue_lease(self, start: int, end: int, chunk_id: int) -> None:
         with self._host_state.lock:
-            self._host_state.notary.requeue_lease(self.rank, start, end)
-        self._broadcast_event("requeue", lease=(int(start), int(end)))
+            self._host_state.notary.requeue_lease(self.rank, start, end, chunk_id)
+        self._broadcast_event("requeue", lease=(int(start), int(end), int(chunk_id)))
 
     def heartbeat(self) -> float:
         with self._host_state.lock:
             return self._host_state.notary.heartbeat(self.rank)
 
-    def requeue_outstanding(self) -> Optional[Tuple[int, int]]:
+    def requeue_outstanding(self) -> Optional[Tuple[int, int, int]]:
         """Best-effort requeue of the inflight lease for this rank."""
 
         with self._host_state.lock:
@@ -174,28 +203,48 @@ class DistributedLeaseClient:
         inflight_entry = snapshot["inflight"].get(self.rank)
         if not inflight_entry:
             return None
-        raw_records: List[Tuple[int, int]] = []
+        raw_records: List[Tuple[int, int, int]] = []
         if isinstance(inflight_entry, dict):
             if "records" in inflight_entry and isinstance(inflight_entry["records"], list):
                 for entry in inflight_entry["records"]:
                     if isinstance(entry, dict) and "lease" in entry:
-                        start, end = entry["lease"]
-                        raw_records.append((int(start), int(end)))
+                        lease = entry["lease"]
+                        if isinstance(lease, (list, tuple)):
+                            if len(lease) >= 3:
+                                start, end, chunk_id = lease[:3]
+                            else:
+                                start, end = lease[:2]
+                                chunk_id = entry.get("chunk_id", 0)
+                            raw_records.append((int(start), int(end), int(chunk_id)))
             elif "lease" in inflight_entry:
-                start, end = inflight_entry["lease"]
-                raw_records.append((int(start), int(end)))
+                lease = inflight_entry["lease"]
+                if isinstance(lease, (list, tuple)):
+                    if len(lease) >= 3:
+                        start, end, chunk_id = lease[:3]
+                    else:
+                        start, end = lease[:2]
+                        chunk_id = inflight_entry.get("chunk_id", 0)
+                    raw_records.append((int(start), int(end), int(chunk_id)))
         elif isinstance(inflight_entry, list):
             for entry in inflight_entry:
                 if isinstance(entry, dict) and "lease" in entry:
-                    start, end = entry["lease"]
-                    raw_records.append((int(start), int(end)))
+                    lease = entry["lease"]
+                    if isinstance(lease, (list, tuple)):
+                        if len(lease) >= 3:
+                            start, end, chunk_id = lease[:3]
+                        else:
+                            start, end = lease[:2]
+                            chunk_id = entry.get("chunk_id", 0)
+                        raw_records.append((int(start), int(end), int(chunk_id)))
         if not raw_records:
             return None
-        leases: List[Tuple[int, int]] = list(raw_records)
+        leases: List[Tuple[int, int, int]] = list(raw_records)
         try:
             with self._host_state.lock:
-                for start, end in leases:
-                    self._host_state.notary.requeue_lease(self.rank, int(start), int(end))
+                for start, end, chunk_id in leases:
+                    self._host_state.notary.requeue_lease(
+                        self.rank, int(start), int(end), int(chunk_id)
+                    )
         except Exception:
             logger.debug(
                 "lease_requeue_on_shutdown_failed",
@@ -203,9 +252,14 @@ class DistributedLeaseClient:
                 exc_info=True,
             )
             return None
-        for start, end in leases:
-            self._broadcast_event("requeue", lease=(int(start), int(end)))
+        for start, end, chunk_id in leases:
+            self._broadcast_event("requeue", lease=(int(start), int(end), int(chunk_id)))
         return leases[0]
+
+    def describe_chunk(self, chunk_id: int) -> Optional[Dict[str, object]]:
+        """Return metadata describing ``chunk_id`` if known."""
+
+        return self._host_state.notary.chunk_status(int(chunk_id))
 
     def update_rank_weights(self, weights: Dict[int, float]) -> None:
         """Persist *weights* into the shared :class:`LeaseNotary`."""
@@ -224,7 +278,7 @@ class DistributedLeaseClient:
 
         self._host_state.notary.record_idle(self.rank, duration_s)
 
-    def iter_leases(self, preferred_size: int) -> Iterator[Tuple[int, int]]:
+    def iter_leases(self, preferred_size: int) -> Iterator[Tuple[int, int, int]]:
         while True:
             lease = self.request_lease(preferred_size)
             if lease is None:
@@ -295,7 +349,8 @@ def _measure_startup_throughput(
             lease = lease_client.request_lease(1)
             if lease is None:
                 break
-            width = max(0, int(lease[1]) - int(lease[0]))
+            start, end, _chunk_id = lease
+            width = max(0, int(end) - int(start))
             processed += width
             try:
                 lease_client.requeue_lease(*lease)
@@ -616,6 +671,7 @@ def iterate_leased_shards(
     prefetch_threshold: int = 0,
     min_inflight: int = 1,
     prefetch_slack_ms: float = 50.0,
+    on_chunk_start: Optional[Callable[[ChunkLeaseInfo], None]] = None,
 ) -> Iterator[Iterator[int]]:
     """Yield shard iterators governed by leases from ``lease_client``."""
 
@@ -653,18 +709,42 @@ def iterate_leased_shards(
             raise
         if lease is None:
             return False
-        start, end = lease
+        start, end, chunk_id = lease
         if not (0 <= start <= end <= total_chunks):
-            lease_client.requeue_lease(start, end)
+            lease_client.requeue_lease(start, end, chunk_id)
             raise ValueError(
                 f"Lease [{start}, {end}) lies outside the planned chunk range"
             )
         width = max(0, end - start)
         if width == 0:
-            lease_client.complete_lease(start, end)
+            lease_client.complete_lease(start, end, chunk_id)
             return True
         outstanding_chunks += width
-        active.append({"start": start, "end": end, "cursor": start})
+        attempts = 0
+        completed = False
+        if on_chunk_start is not None:
+            status = lease_client.describe_chunk(chunk_id)
+            if status is not None:
+                attempts = int(status.get("attempts", 0))
+                completed = bool(status.get("completed", False))
+        info = ChunkLeaseInfo(
+            start=start,
+            end=end,
+            chunk_id=chunk_id,
+            attempts=max(1, attempts or 1),
+            completed=completed,
+        )
+        if on_chunk_start is not None:
+            try:
+                on_chunk_start(info)
+            except Exception:
+                logger.debug("chunk_start_callback_failed", exc_info=True)
+        active.append({
+            "start": start,
+            "end": end,
+            "cursor": start,
+            "chunk_id": chunk_id,
+        })
         return True
 
     def _ensure_minimum(target: int) -> None:
@@ -675,7 +755,7 @@ def iterate_leased_shards(
     def _requeue_all() -> None:
         while active:
             info = active.popleft()
-            lease_client.requeue_lease(info["start"], info["end"])
+            lease_client.requeue_lease(info["start"], info["end"], info["chunk_id"])
 
     if not _request_next():
         return
@@ -691,10 +771,14 @@ def iterate_leased_shards(
                 if not active:
                     break
             current = active[0]
-            start, end = current["start"], current["end"]
+            start, end, chunk_id = (
+                current["start"],
+                current["end"],
+                current["chunk_id"],
+            )
             cursor = current["cursor"]
             if cursor >= end:
-                lease_client.complete_lease(start, end)
+                lease_client.complete_lease(start, end, chunk_id)
                 active.popleft()
                 continue
             chunk_idx = cursor
@@ -724,7 +808,7 @@ def iterate_leased_shards(
                 raise
             outstanding_chunks = max(0, outstanding_chunks - 1)
             if current["cursor"] >= end:
-                lease_client.complete_lease(start, end)
+                lease_client.complete_lease(start, end, chunk_id)
                 active.popleft()
             if idle_start is None and outstanding_chunks <= prefetch_threshold:
                 idle_start = time.monotonic()

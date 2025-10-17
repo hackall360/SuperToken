@@ -38,18 +38,24 @@ def test_basic_grant_and_complete() -> None:
     notary = LeaseNotary(total_chunks=10, lease_ttl=5.0)
 
     lease = notary.grant_lease(rank=0, preferred_size=4)
-    assert lease == (0, 4)
+    assert lease is not None
+    start, end, chunk_id = lease
+    assert (start, end) == (0, 4)
+    assert chunk_id == 0
 
     heartbeat_ts = notary.heartbeat(rank=0)
     assert isinstance(heartbeat_ts, float)
 
-    notary.complete_lease(rank=0, start=0, end=4)
+    notary.complete_lease(rank=0, start=start, end=end, chunk_id=chunk_id)
     assert notary.state_dict()["inflight"] == {}
 
     lease = notary.grant_lease(rank=1, preferred_size=8)
-    assert lease == (4, 10)
+    assert lease is not None
+    start, end, chunk_id = lease
+    assert (start, end) == (4, 10)
+    assert chunk_id == 1
 
-    notary.complete_lease(rank=1, start=4, end=10)
+    notary.complete_lease(rank=1, start=start, end=end, chunk_id=chunk_id)
     assert notary.grant_lease(rank=1, preferred_size=1) is None
 
 
@@ -57,14 +63,18 @@ def test_requeue_prioritised_before_new_work() -> None:
     notary = LeaseNotary(total_chunks=6, lease_ttl=5.0)
 
     lease = notary.grant_lease(rank=0, preferred_size=6)
-    assert lease == (0, 6)
+    assert lease is not None
+    start, end, chunk_id = lease
+    assert (start, end) == (0, 6)
 
-    notary.requeue_lease(rank=0, start=0, end=6)
+    notary.requeue_lease(rank=0, start=start, end=end, chunk_id=chunk_id)
 
     lease = notary.grant_lease(rank=1, preferred_size=2)
-    assert lease == (0, 6)
+    assert lease is not None
+    start, end, chunk_id = lease
+    assert (start, end) == (0, 6)
 
-    notary.complete_lease(rank=1, start=0, end=6)
+    notary.complete_lease(rank=1, start=start, end=end, chunk_id=chunk_id)
     assert notary.grant_lease(rank=2, preferred_size=3) is None
 
 
@@ -74,11 +84,12 @@ def test_state_dict_roundtrip() -> None:
     lease_a = notary.grant_lease(rank=0, preferred_size=5)
     lease_b = notary.grant_lease(rank=1, preferred_size=5)
 
-    assert lease_a == (0, 5)
-    assert lease_b == (5, 10)
+    assert lease_a is not None and lease_b is not None
+    assert lease_a[:2] == (0, 5)
+    assert lease_b[:2] == (5, 10)
 
     notary.heartbeat(rank=1)
-    notary.requeue_lease(rank=0, start=0, end=5)
+    notary.requeue_lease(rank=0, start=lease_a[0], end=lease_a[1], chunk_id=lease_a[2])
 
     snap = notary.state_dict()
     assert "rank_weights" in snap
@@ -98,11 +109,15 @@ def test_state_dict_roundtrip() -> None:
     assert restored.state_dict() == snap
 
     lease = restored.grant_lease(rank=2, preferred_size=5)
-    assert lease == (0, 5)
+    assert lease is not None
+    start, end, chunk_id = lease
+    assert (start, end) == (0, 5)
 
-    restored.complete_lease(rank=2, start=0, end=5)
-    restored.complete_lease(rank=1, start=5, end=10)
-    assert restored.grant_lease(rank=3, preferred_size=5) == (10, 12)
+    restored.complete_lease(rank=2, start=start, end=end, chunk_id=chunk_id)
+    restored.complete_lease(rank=1, start=lease_b[0], end=lease_b[1], chunk_id=lease_b[2])
+    follow_up = restored.grant_lease(rank=3, preferred_size=5)
+    assert follow_up is not None
+    assert follow_up[:2] == (10, 12)
 
 
 def test_concurrent_grants_produce_unique_intervals() -> None:
@@ -120,16 +135,16 @@ def test_concurrent_grants_produce_unique_intervals() -> None:
             if lease is None:
                 break
 
-            start, end = lease
+            start, end, chunk_id = lease
 
             if rng.random() < 0.15:
                 time.sleep(rng.random() * 0.002)
-                notary.requeue_lease(rank=rank, start=start, end=end)
+                notary.requeue_lease(rank=rank, start=start, end=end, chunk_id=chunk_id)
                 continue
 
             notary.heartbeat(rank=rank)
             time.sleep(rng.random() * 0.002)
-            notary.complete_lease(rank=rank, start=start, end=end)
+            notary.complete_lease(rank=rank, start=start, end=end, chunk_id=chunk_id)
 
             with completion_lock:
                 completed.append((start, end))
@@ -165,17 +180,19 @@ def test_concurrent_grants_produce_unique_intervals() -> None:
 def test_reject_invalid_progressions() -> None:
     notary = LeaseNotary(total_chunks=4, lease_ttl=2.0, max_active_leases=1)
 
-    notary.grant_lease(rank=0, preferred_size=2)
+    lease = notary.grant_lease(rank=0, preferred_size=2)
+    assert lease is not None
 
     with pytest.raises(ValueError):
-        notary.complete_lease(rank=0, start=0, end=1)
+        notary.complete_lease(rank=0, start=0, end=1, chunk_id=lease[2])
 
     with pytest.raises(ValueError):
-        notary.requeue_lease(rank=0, start=1, end=3)
+        notary.requeue_lease(rank=0, start=1, end=3, chunk_id=lease[2])
 
-    notary.requeue_lease(rank=0, start=0, end=2)
+    notary.requeue_lease(rank=0, start=lease[0], end=lease[1], chunk_id=lease[2])
 
-    notary.grant_lease(rank=1, preferred_size=2)
+    lease_other = notary.grant_lease(rank=1, preferred_size=2)
+    assert lease_other is not None
 
     with pytest.raises(RuntimeError):
         notary.grant_lease(rank=1, preferred_size=1)
@@ -187,8 +204,9 @@ def test_timed_out_leases_requeue_and_are_reattributed() -> None:
 
     lease_a = notary.grant_lease(rank=0, preferred_size=3)
     lease_b = notary.grant_lease(rank=1, preferred_size=3)
-    assert lease_a == (0, 3)
-    assert lease_b == (3, 6)
+    assert lease_a is not None and lease_b is not None
+    assert lease_a[:2] == (0, 3)
+    assert lease_b[:2] == (3, 6)
 
     # Advance time beyond the TTL for rank 0 but keep rank 1 active.
     state = notary.state_dict()
@@ -201,11 +219,11 @@ def test_timed_out_leases_requeue_and_are_reattributed() -> None:
         notary._rank_heartbeats[1] = heartbeat_0 + ttl / 2  # type: ignore[attr-defined]
 
     timed_out = notary.check_timeouts(now=heartbeat_0 + ttl + 0.01)
-    assert timed_out == {0: (0, 3)}
+    assert timed_out == {0: lease_a}
 
     state_after = notary.state_dict()
     assert 0 not in state_after["inflight"]
-    assert state_after["pending_requeue"] and state_after["pending_requeue"][0] == (0, 3)
+    assert state_after["pending_requeue"] and state_after["pending_requeue"][0][:2] == (0, 3)
     assert 1 in state_after["inflight"]
     assert 1 in state_after["rank_heartbeats"]
 
@@ -216,8 +234,9 @@ def test_rank_heartbeat_timeout_requeues_all_active_leases() -> None:
 
     lease_a = notary.grant_lease(rank=0, preferred_size=2)
     lease_b = notary.grant_lease(rank=0, preferred_size=2)
-    assert lease_a == (0, 2)
-    assert lease_b == (2, 4)
+    assert lease_a is not None and lease_b is not None
+    assert lease_a[:2] == (0, 2)
+    assert lease_b[:2] == (2, 4)
 
     with notary._lock:  # type: ignore[attr-defined]
         stale = notary._rank_heartbeats[0] - (ttl + 0.1)  # type: ignore[attr-defined]
@@ -242,31 +261,40 @@ def test_grant_lease_respects_weights_and_bounds() -> None:
     notary.update_rank_weights({0: 0.2, 1: 1.6})
 
     lease_fast = notary.grant_lease(rank=1, preferred_size=5)
-    assert lease_fast == (0, 7)
+    assert lease_fast is not None
+    assert lease_fast[:2] == (0, 7)
 
     lease_slow = notary.grant_lease(rank=0, preferred_size=5)
-    assert lease_slow == (7, 9)
+    assert lease_slow is not None
+    assert lease_slow[:2] == (7, 9)
 
-    notary.complete_lease(rank=1, start=lease_fast[0], end=lease_fast[1])
-    notary.complete_lease(rank=0, start=lease_slow[0], end=lease_slow[1])
+    notary.complete_lease(
+        rank=1, start=lease_fast[0], end=lease_fast[1], chunk_id=lease_fast[2]
+    )
+    notary.complete_lease(
+        rank=0, start=lease_slow[0], end=lease_slow[1], chunk_id=lease_slow[2]
+    )
 
 
 def test_max_active_leases_enforced() -> None:
     notary = LeaseNotary(total_chunks=12, lease_ttl=5.0, max_active_leases=2)
 
     first = notary.grant_lease(rank=0, preferred_size=3)
-    assert first == (0, 3)
+    assert first is not None
+    assert first[:2] == (0, 3)
 
     second = notary.grant_lease(rank=0, preferred_size=3)
-    assert second == (3, 6)
+    assert second is not None
+    assert second[:2] == (3, 6)
 
     with pytest.raises(RuntimeError):
         notary.grant_lease(rank=0, preferred_size=3)
 
-    notary.complete_lease(rank=0, start=first[0], end=first[1])
+    notary.complete_lease(rank=0, start=first[0], end=first[1], chunk_id=first[2])
 
     third = notary.grant_lease(rank=0, preferred_size=3)
-    assert third == (6, 9)
+    assert third is not None
+    assert third[:2] == (6, 9)
 
 
 def test_weighted_prefetch_simulation_hits_target() -> None:
@@ -290,7 +318,7 @@ def test_weighted_prefetch_simulation_hits_target() -> None:
     outstanding_chunks: Dict[int, int] = {rank: 0 for rank in throughputs}
     available_at: Dict[int, float] = {rank: 0.0 for rank in throughputs}
     assigned: Dict[int, int] = {rank: 0 for rank in throughputs}
-    event_queue: List[Tuple[float, int, Tuple[int, int, int, int]]] = []
+    event_queue: List[Tuple[float, int, Tuple[int, int, int, int, int]]] = []
     counter = 0
 
     def _prefetch(rank: int) -> None:
@@ -299,10 +327,10 @@ def test_weighted_prefetch_simulation_hits_target() -> None:
             lease = notary.grant_lease(rank=rank, preferred_size=base_lease)
             if lease is None:
                 break
-            start, end = lease
+            start, end, chunk_id = lease
             width = max(0, end - start)
             if width == 0:
-                notary.complete_lease(rank=rank, start=start, end=end)
+                notary.complete_lease(rank=rank, start=start, end=end, chunk_id=chunk_id)
                 continue
             outstanding_chunks[rank] += width
             assigned[rank] += width
@@ -310,7 +338,9 @@ def test_weighted_prefetch_simulation_hits_target() -> None:
             start_time = available_at[rank]
             finish = start_time + width / throughputs[rank]
             available_at[rank] = finish
-            heapq.heappush(event_queue, (finish, counter, (rank, start, end, width)))
+            heapq.heappush(
+                event_queue, (finish, counter, (rank, start, end, width, chunk_id))
+            )
 
     for rank in throughputs:
         _prefetch(rank)
@@ -318,10 +348,10 @@ def test_weighted_prefetch_simulation_hits_target() -> None:
     wall_time = 0.0
     while event_queue:
         finish_time, _idx, payload = heapq.heappop(event_queue)
-        rank, start, end, width = payload
+        rank, start, end, width, chunk_id = payload
         wall_time = finish_time
         outstanding_chunks[rank] -= width
-        notary.complete_lease(rank=rank, start=start, end=end)
+        notary.complete_lease(rank=rank, start=start, end=end, chunk_id=chunk_id)
         _prefetch(rank)
 
     state = notary.state_dict()
@@ -370,6 +400,32 @@ def test_record_idle_tracks_metrics() -> None:
     assert entry["ewma_ms"] == pytest.approx((0.2 * 20.0) + (0.8 * 120.0))
 
 
+def test_chunk_status_tracks_attempts_and_completion() -> None:
+    notary = LeaseNotary(total_chunks=3, lease_ttl=5.0)
+
+    lease = notary.grant_lease(rank=0, preferred_size=2)
+    assert lease is not None
+    chunk_id = lease[2]
+    status = notary.chunk_status(chunk_id)
+    assert status == {"lease": (0, 2), "completed": False, "attempts": 1}
+
+    notary.requeue_lease(rank=0, start=lease[0], end=lease[1], chunk_id=chunk_id)
+    retry = notary.grant_lease(rank=1, preferred_size=1)
+    assert retry is not None
+    assert retry[2] == chunk_id
+    status_retry = notary.chunk_status(chunk_id)
+    assert status_retry == {"lease": (0, 2), "completed": False, "attempts": 2}
+
+    notary.complete_lease(rank=1, start=retry[0], end=retry[1], chunk_id=chunk_id)
+    final_status = notary.chunk_status(chunk_id)
+    assert final_status == {"lease": (0, 2), "completed": True, "attempts": 2}
+
+    snap = notary.state_dict()
+    restored = LeaseNotary(total_chunks=0, lease_ttl=5.0)
+    restored.load_state_dict(snap)
+    assert restored.chunk_status(chunk_id) == final_status
+
+
 def test_per_rank_quota_adjusts_smoothly() -> None:
     notary = LeaseNotary(total_chunks=200, lease_ttl=10.0, max_active_leases=4)
 
@@ -390,15 +446,15 @@ def test_per_rank_quota_adjusts_smoothly() -> None:
         assert state["rank_max_active"][0] == expected_limit
         assert state["rank_max_active"][1] == 4
         assert state["rank_lease_scale"][0] <= baseline["rank_lease_scale"][0]
-        held: List[Tuple[int, int]] = []
+        held: List[Tuple[int, int, int]] = []
         for _ in range(expected_limit):
             lease = notary.grant_lease(rank=0, preferred_size=2)
             assert lease is not None
             held.append(lease)
         with pytest.raises(RuntimeError):
             notary.grant_lease(rank=0, preferred_size=2)
-        for start, end in held:
-            notary.complete_lease(rank=0, start=start, end=end)
+        for start, end, chunk_id in held:
+            notary.complete_lease(rank=0, start=start, end=end, chunk_id=chunk_id)
 
     assert slow_limits == [3, 2, 1]
     assert fast_scales[0] >= 1.0

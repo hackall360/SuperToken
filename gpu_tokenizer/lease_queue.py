@@ -16,15 +16,18 @@ class Lease:
 
     start: int
     end: int
+    chunk_id: int
 
-    def as_tuple(self) -> Tuple[int, int]:
-        return (self.start, self.end)
+    def as_tuple(self) -> Tuple[int, int, int]:
+        return (self.start, self.end, self.chunk_id)
 
     def __post_init__(self) -> None:  # pragma: no cover - dataclass hook
         if self.start < 0:
             raise ValueError("Lease start must be non-negative")
         if self.end < self.start:
             raise ValueError("Lease end must be greater or equal to start")
+        if self.chunk_id < 0:
+            raise ValueError("chunk_id must be non-negative")
 
 
 @dataclass
@@ -68,6 +71,7 @@ class LeaseNotary:
         self._lock = threading.Lock()
         self._total_chunks = total_chunks
         self._next_idx = 0
+        self._next_chunk_id = 0
         self._inflight: Dict[int, Deque[_LeaseRecord]] = {}
         self._pending_requeue: Deque[Lease] = deque()
         self._lease_ttl = float(lease_ttl)
@@ -79,6 +83,7 @@ class LeaseNotary:
         self._max_active_leases = int(max_active_leases)
         self._idle_metrics: Dict[int, Dict[str, float]] = {}
         self._rank_heartbeats: Dict[int, float] = {}
+        self._chunk_records: Dict[int, Dict[str, object]] = {}
 
     @staticmethod
     def _now() -> float:
@@ -147,7 +152,34 @@ class LeaseNotary:
                     if limit > self._max_active_leases:
                         self._rank_max_active[rank] = self._max_active_leases
 
-    def grant_lease(self, rank: int, preferred_size: int) -> Optional[Tuple[int, int]]:
+    def _record_new_chunk(self, lease: Lease, *, attempts: int = 1) -> None:
+        record = self._chunk_records.setdefault(
+            lease.chunk_id,
+            {
+                "lease": (lease.start, lease.end),
+                "completed": False,
+                "attempts": 0,
+            },
+        )
+        record["lease"] = (lease.start, lease.end)
+        record["attempts"] = int(record.get("attempts", 0)) + attempts
+
+    def _mark_chunk_complete(self, lease: Lease) -> None:
+        if lease.chunk_id in self._chunk_records:
+            self._chunk_records[lease.chunk_id]["completed"] = True
+
+    def chunk_status(self, chunk_id: int) -> Optional[Dict[str, object]]:
+        with self._lock:
+            entry = self._chunk_records.get(int(chunk_id))
+            if entry is None:
+                return None
+            return {
+                "lease": tuple(entry.get("lease", (0, 0))),
+                "completed": bool(entry.get("completed", False)),
+                "attempts": int(entry.get("attempts", 0)),
+            }
+
+    def grant_lease(self, rank: int, preferred_size: int) -> Optional[Tuple[int, int, int]]:
         """Return the next available lease for ``rank``.
 
         Leases are granted from the ``pending_requeue`` queue first and then
@@ -166,8 +198,10 @@ class LeaseNotary:
             if len(queue) >= limit:
                 raise RuntimeError("rank already holds an active lease")
 
+            attempts_increment = 1
             if self._pending_requeue:
                 lease = self._pending_requeue.popleft()
+                attempts_increment = 1
             else:
                 if self._next_idx >= self._total_chunks:
                     if not queue:
@@ -183,8 +217,11 @@ class LeaseNotary:
                 if self._max_lease_size is not None:
                     size = min(size, self._max_lease_size)
                 end = min(self._total_chunks, start + size)
-                lease = Lease(start, end)
+                chunk_id = self._next_chunk_id
+                self._next_chunk_id += 1
+                lease = Lease(start, end, chunk_id)
                 self._next_idx = end
+            self._record_new_chunk(lease, attempts=attempts_increment)
 
             now = self._now()
             record = _LeaseRecord(lease=lease, last_heartbeat=now)
@@ -192,10 +229,10 @@ class LeaseNotary:
             self._rank_heartbeats[rank] = now
             return lease.as_tuple()
 
-    def complete_lease(self, rank: int, start: int, end: int) -> None:
+    def complete_lease(self, rank: int, start: int, end: int, chunk_id: int) -> None:
         """Mark the specified lease as completed by ``rank``."""
 
-        lease = Lease(start, end)
+        lease = Lease(start, end, chunk_id)
         with self._lock:
             queue = self._inflight.get(rank)
             if not queue:
@@ -207,11 +244,12 @@ class LeaseNotary:
             if not queue:
                 self._inflight.pop(rank, None)
                 self._rank_heartbeats.pop(rank, None)
+            self._mark_chunk_complete(lease)
 
-    def requeue_lease(self, rank: int, start: int, end: int) -> None:
+    def requeue_lease(self, rank: int, start: int, end: int, chunk_id: int) -> None:
         """Return an inflight lease to the queue for reassignment."""
 
-        lease = Lease(start, end)
+        lease = Lease(start, end, chunk_id)
         with self._lock:
             queue = self._inflight.get(rank)
             if not queue:
@@ -299,9 +337,18 @@ class LeaseNotary:
                     entry["last_heartbeat"] = records[0]["last_heartbeat"]
                 inflight[rank] = entry
 
-            pending: Iterable[Tuple[int, int]] = (
+            pending: Iterable[Tuple[int, int, int]] = (
                 lease.as_tuple() for lease in self._pending_requeue
             )
+
+            chunk_records = {
+                chunk_id: {
+                    "lease": tuple(entry.get("lease", (0, 0))),
+                    "completed": bool(entry.get("completed", False)),
+                    "attempts": int(entry.get("attempts", 0)),
+                }
+                for chunk_id, entry in self._chunk_records.items()
+            }
 
             idle_metrics = {
                 rank: {
@@ -315,6 +362,7 @@ class LeaseNotary:
             return {
                 "total_chunks": self._total_chunks,
                 "next_idx": self._next_idx,
+                "next_chunk_id": self._next_chunk_id,
                 "inflight": dict(inflight),
                 "pending_requeue": list(pending),
                 "lease_ttl": self._lease_ttl,
@@ -326,6 +374,7 @@ class LeaseNotary:
                 "max_active_leases": self._max_active_leases,
                 "idle_metrics": idle_metrics,
                 "rank_heartbeats": dict(self._rank_heartbeats),
+                "chunk_records": chunk_records,
             }
 
     def load_state_dict(self, state: Dict[str, object]) -> None:
@@ -345,6 +394,7 @@ class LeaseNotary:
         next_idx = int(state["next_idx"])
         inflight_raw = state["inflight"]
         pending_raw = state["pending_requeue"]
+        next_chunk_id = int(state.get("next_chunk_id", 0))
         lease_ttl = float(state.get("lease_ttl", self._lease_ttl))
         rank_weights_raw = state.get("rank_weights", {})
         rank_lease_scale_raw = state.get("rank_lease_scale", {})
@@ -401,8 +451,13 @@ class LeaseNotary:
                     raise TypeError("inflight record must be a mapping")
                 if "lease" not in record_entry or "last_heartbeat" not in record_entry:
                     raise KeyError("inflight record missing required fields")
-                start, end = record_entry["lease"]
-                lease = Lease(int(start), int(end))
+                raw_lease = record_entry["lease"]
+                if not isinstance(raw_lease, (tuple, list)) or len(raw_lease) < 3:
+                    start, end = raw_lease[:2]
+                    chunk_id = record_entry.get("chunk_id", 0)
+                else:
+                    start, end, chunk_id = raw_lease[:3]
+                lease = Lease(int(start), int(end), int(chunk_id))
                 last_hb = float(record_entry["last_heartbeat"])
                 queue.append(_LeaseRecord(lease=lease, last_heartbeat=last_hb))
             if queue:
@@ -410,8 +465,12 @@ class LeaseNotary:
 
         pending_queue: Deque[Lease] = deque()
         for entry in pending_raw:
-            start, end = entry
-            pending_queue.append(Lease(int(start), int(end)))
+            if isinstance(entry, (tuple, list)) and len(entry) >= 3:
+                start, end, chunk_id = entry[:3]
+            else:
+                start, end = entry[:2]
+                chunk_id = 0
+            pending_queue.append(Lease(int(start), int(end), int(chunk_id)))
 
         rank_weights: Dict[int, float] = {}
         for raw_rank, raw_weight in rank_weights_raw.items():
@@ -475,9 +534,31 @@ class LeaseNotary:
                     continue
                 rank_heartbeats[rank] = ts
 
+        chunk_records_raw = state.get("chunk_records", {})
+        chunk_records: Dict[int, Dict[str, object]] = {}
+        if isinstance(chunk_records_raw, dict):
+            for raw_chunk, raw_entry in chunk_records_raw.items():
+                try:
+                    chunk_id = int(raw_chunk)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(raw_entry, dict):
+                    continue
+                lease_entry = raw_entry.get("lease", (0, 0))
+                if isinstance(lease_entry, (tuple, list)):
+                    lease_tuple = tuple(int(x) for x in lease_entry[:2])
+                else:
+                    lease_tuple = (0, 0)
+                chunk_records[chunk_id] = {
+                    "lease": lease_tuple,
+                    "completed": bool(raw_entry.get("completed", False)),
+                    "attempts": int(raw_entry.get("attempts", 0)),
+                }
+
         with self._lock:
             self._total_chunks = total_chunks
             self._next_idx = next_idx
+            self._next_chunk_id = max(0, next_chunk_id)
             self._inflight = inflight
             self._pending_requeue = pending_queue
             self._lease_ttl = lease_ttl
@@ -492,6 +573,7 @@ class LeaseNotary:
             self._max_active_leases = max_active_leases
             self._idle_metrics = idle_metrics
             self._rank_heartbeats = rank_heartbeats
+            self._chunk_records = chunk_records
 
     def update_rank_weights(self, weights: Dict[int, float]) -> None:
         """Persist normalised per-rank weights for adaptive lease sizing."""
