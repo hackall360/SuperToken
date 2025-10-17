@@ -2,7 +2,7 @@ import pytest
 
 pytest.importorskip("torch")
 
-from gpu_tokenizer.bpe_trainer import TrainerMetricsEWMA
+from gpu_tokenizer.trainers.metrics import TrainerMetricsEWMA
 
 
 def test_trainer_metrics_ewma_smoothing_and_window():

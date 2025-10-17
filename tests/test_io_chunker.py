@@ -22,11 +22,11 @@ def _install_package_stub() -> None:
     sys.modules["gpu_tokenizer"] = package
 
 
-def _install_bpe_trainer_stub() -> None:
-    if "gpu_tokenizer.bpe_trainer" in sys.modules:
+def _install_metrics_stub() -> None:
+    if "gpu_tokenizer.trainers.metrics" in sys.modules:
         return
 
-    module = types.ModuleType("gpu_tokenizer.bpe_trainer")
+    module = types.ModuleType("gpu_tokenizer.trainers.metrics")
 
     class TrainerMetricsEWMA:
         def __init__(
@@ -89,7 +89,11 @@ def _install_bpe_trainer_stub() -> None:
                     )
 
     module.TrainerMetricsEWMA = TrainerMetricsEWMA
-    sys.modules["gpu_tokenizer.bpe_trainer"] = module
+    trainers_pkg = sys.modules.setdefault(
+        "gpu_tokenizer.trainers", types.ModuleType("gpu_tokenizer.trainers")
+    )
+    setattr(trainers_pkg, "metrics", module)
+    sys.modules["gpu_tokenizer.trainers.metrics"] = module
 
 
 def _install_torch_stub() -> None:
@@ -165,10 +169,10 @@ def _install_torch_stub() -> None:
 
 
 _install_package_stub()
-_install_bpe_trainer_stub()
+_install_metrics_stub()
 _install_torch_stub()
 
-from gpu_tokenizer.bpe_trainer import TrainerMetricsEWMA
+from gpu_tokenizer.trainers.metrics import TrainerMetricsEWMA
 from gpu_tokenizer.io import ChunkSpec, make_chunker
 
 

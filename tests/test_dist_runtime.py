@@ -669,7 +669,7 @@ def test_idle_metrics_drop_with_extra_prefetch(monkeypatch: pytest.MonkeyPatch) 
 def test_rebalance_converges_within_30s(monkeypatch: pytest.MonkeyPatch) -> None:
     dist_runtime, _ = _patch_common_runtime(monkeypatch)
 
-    from gpu_tokenizer.bpe_trainer import TrainerMetricsEWMA
+    from gpu_tokenizer.trainers.metrics import TrainerMetricsEWMA
 
     world_size = 2
     os.environ["WORLD_SIZE"] = str(world_size)

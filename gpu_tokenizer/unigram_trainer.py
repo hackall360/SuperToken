@@ -6,12 +6,13 @@ import math
 import time
 from os import PathLike
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import torch
 
 from . import cuda_kernels
 from .trainers.base import BaseTrainer
+from .trainers.metrics import TrainerMetricsEWMA
 
 
 class GPUUnigramTrainer(BaseTrainer):
@@ -27,6 +28,7 @@ class GPUUnigramTrainer(BaseTrainer):
         seed: int | None = None,
         generator: torch.Generator | None = None,
     ) -> None:
+        super().__init__()
         self.base_vocab = base_vocab
         self.target_vocab = vocab_size
         self.max_len = max_subword_len
@@ -41,6 +43,8 @@ class GPUUnigramTrainer(BaseTrainer):
         self._vocab_trie_next: torch.Tensor | None = None
         self._vocab_trie_terminal: torch.Tensor | None = None
         self._piece_lens_tensor: torch.Tensor | None = None
+        self._metrics = TrainerMetricsEWMA(enabled=False)
+        self.register_metrics_tracker("throughput", self._metrics)
         self.reset_rng(seed=seed, generator=generator)
 
     def _clone_generator(self, generator: torch.Generator) -> torch.Generator:
@@ -83,6 +87,17 @@ class GPUUnigramTrainer(BaseTrainer):
             assert self._rng_template_device is not None  # ``_rng_template_state`` guards this path.
             self._rng = torch.Generator(device=self._rng_template_device)
             self._rng.set_state(self._rng_template_state.clone())
+
+    def metrics(self) -> Mapping[str, TrainerMetricsEWMA]:
+        """Expose registered metrics trackers for telemetry consumers."""
+
+        return self._metrics_mapping()
+
+    @property
+    def throughput_metrics(self) -> TrainerMetricsEWMA:
+        """Return the primary throughput tracker."""
+
+        return self._metrics
 
     def _ensure_base_powers(self) -> None:
         if self._base_powers is None or self._base_powers.device != torch.device(self.device):
@@ -424,6 +439,9 @@ class GPUUnigramTrainer(BaseTrainer):
         sequence_count = 0
         forward_backward_time = 0.0
         accumulation_time = 0.0
+        metrics_tracker = self._metrics
+        metrics_tracker.reset()
+        metrics_enabled = metrics_tracker.enabled
 
         if batches:
             if len(self.id2piece) < self.target_vocab:
@@ -440,16 +458,21 @@ class GPUUnigramTrainer(BaseTrainer):
             batch_count += 1
             x = x.to(self.device)
             valid = x >= 0
-            token_count += int(valid.sum().item())
+            tokens_this_batch = int(valid.sum().item())
+            token_count += tokens_this_batch
             sequence_count += int(x.shape[0])
             if x.numel() == 0:
                 continue
-            t_fb_start = time.perf_counter()
+            iteration_start = time.perf_counter()
+            t_fb_start = iteration_start
             _, exp = self._forward_backward_batch(x, valid)
             forward_backward_time += time.perf_counter() - t_fb_start
             t_accum_start = time.perf_counter()
             exp_counts += exp.sum(dim=0)
             accumulation_time += time.perf_counter() - t_accum_start
+            if metrics_enabled:
+                batch_duration = time.perf_counter() - iteration_start
+                metrics_tracker.record_tokens(tokens=tokens_this_batch, duration_s=batch_duration)
 
         t_update_start = time.perf_counter()
         smoothed = exp_counts + 1e-6
@@ -468,6 +491,23 @@ class GPUUnigramTrainer(BaseTrainer):
             "sequences": sequence_count,
             "tokens": token_count,
         }
+
+        metrics_payload: dict[str, object] = {}
+        for name, tracker in self.metrics().items():
+            try:
+                metrics_payload[name] = tracker.snapshot()
+            except Exception:
+                continue
+        if metrics_payload:
+            telemetry["metrics"] = metrics_payload
+            throughput = metrics_payload.get("throughput")
+            if isinstance(throughput, Mapping):
+                tokens_rate = throughput.get("tokens_per_s")
+                if tokens_rate is not None:
+                    telemetry["tokens_per_s"] = float(tokens_rate)
+                leases_rate = throughput.get("lease_per_s")
+                if leases_rate is not None:
+                    telemetry["lease_per_s"] = float(leases_rate)
 
         return {"vocab": len(self.id2piece), "telemetry": telemetry}
 

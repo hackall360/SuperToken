@@ -15,12 +15,7 @@ from ._stubs import install_package_stub, install_torch_stub
 install_package_stub()
 install_torch_stub()
 
-_BPE_PATH = Path(__file__).resolve().parents[1] / "gpu_tokenizer" / "bpe_trainer.py"
-_BPE_SPEC = importlib.util.spec_from_file_location("gpu_tokenizer.bpe_trainer", _BPE_PATH)
-assert _BPE_SPEC and _BPE_SPEC.loader
-_BPE_MODULE = importlib.util.module_from_spec(_BPE_SPEC)
-sys.modules[_BPE_SPEC.name] = _BPE_MODULE
-_BPE_SPEC.loader.exec_module(_BPE_MODULE)
+import gpu_tokenizer.trainers.metrics as _METRICS_MODULE
 
 _DIST_PATH = Path(__file__).resolve().parents[1] / "gpu_tokenizer" / "dist_runtime.py"
 _DIST_SPEC = importlib.util.spec_from_file_location("gpu_tokenizer.dist_runtime", _DIST_PATH)
@@ -29,7 +24,7 @@ _DIST_MODULE = importlib.util.module_from_spec(_DIST_SPEC)
 sys.modules[_DIST_SPEC.name] = _DIST_MODULE
 _DIST_SPEC.loader.exec_module(_DIST_MODULE)
 
-TrainerMetricsEWMA = _BPE_MODULE.TrainerMetricsEWMA
+TrainerMetricsEWMA = _METRICS_MODULE.TrainerMetricsEWMA
 dist_runtime = _DIST_MODULE
 
 
