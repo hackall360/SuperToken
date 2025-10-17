@@ -39,6 +39,12 @@ from .dtypes import (
 )
 from .trainers.base import BaseTrainer
 from .trainers.metrics import TrainerMetricsEWMA
+from .trainers.bpe_gpu import (
+    PairHistogramResult,
+    combine_histogram_results,
+    count_pairs_on_device,
+    select_best_pair,
+)
 from .utils import (
     aggregate_pair_keys,
     apply_merge_once,
@@ -3005,6 +3011,21 @@ class GPUBPETrainer(BaseTrainer):
                 list[Union[MultiDeviceBatch, CPUFallbackBatch]],
             ]:
                 nonlocal current_batches, gpu_batches, scale_state
+
+                def _histogram_from_workspace(shard: GPUBatchRecord) -> PairHistogramResult:
+                    assert shard.pair_count_length is not None
+                    length = int(shard.pair_count_length.item())
+                    if length <= 0:
+                        return PairHistogramResult.empty(shard.tokens.device)
+                    assert shard.pair_keys_buffer is not None
+                    assert shard.pair_counts_buffer is not None
+                    pairs_view = shard.pair_keys_buffer.narrow(0, 0, length)
+                    counts_view = shard.pair_counts_buffer.narrow(0, 0, length)
+                    a_ids = pairs_view[:, 0].to(torch.long)
+                    b_ids = pairs_view[:, 1].to(torch.long)
+                    keys = (a_ids << 32) | b_ids
+                    counts = counts_view.to(torch.int64)
+                    return PairHistogramResult(keys, counts)
                 if (
                     self._enable_histogram_cache
                     and self._hist_cache_valid
@@ -3021,13 +3042,12 @@ class GPUBPETrainer(BaseTrainer):
                 while True:
                     for ctx in device_contexts.values():
                         ctx.reset_activity()
-                    local_keys: list[torch.Tensor] = []
-                    local_counts: list[torch.Tensor] = []
+                    hist_results: list[PairHistogramResult] = []
                     consumed: list[Union[MultiDeviceBatch, CPUFallbackBatch]] = []
                     cpu_consumed: list[CPUFallbackBatch] = []
-                    pair_results: Dict[torch.device, list[GPUBatchRecord]] = {
-                        dev: [] for dev in device_contexts
-                    }
+                    pair_results: Dict[
+                        torch.device, list[tuple[GPUBatchRecord, PairHistogramResult]]
+                    ] = {dev: [] for dev in device_contexts}
                     pending_compute: Dict[torch.device, bool] = {
                         dev: False for dev in device_contexts
                     }
@@ -3043,10 +3063,15 @@ class GPUBPETrainer(BaseTrainer):
                                 tokens_cpu, valid_cpu, _lengths_cpu, _, _, _ = _unpack_cpu_batch(
                                     batch
                                 )
-                                keys_cpu, counts_cpu = count_pairs_fastpath(tokens_cpu, valid_cpu)
+                                keys_cpu, counts_cpu = count_pairs_fastpath(
+                                    tokens_cpu, valid_cpu
+                                )
                                 if keys_cpu.numel() > 0:
-                                    local_keys.append(keys_cpu.to(torch.long))
-                                    local_counts.append(counts_cpu.to(torch.int64))
+                                    hist_results.append(
+                                        PairHistogramResult(
+                                            keys_cpu.to(torch.long), counts_cpu.to(torch.int64)
+                                        )
+                                    )
                                 if self._enable_histogram_cache:
                                     batch.pair_keys = keys_cpu.clone()
                                     batch.pair_counts = counts_cpu.clone()
@@ -3073,14 +3098,24 @@ class GPUBPETrainer(BaseTrainer):
                                         assert shard.pair_keys_buffer is not None
                                         assert shard.pair_counts_buffer is not None
                                         assert shard.pair_count_length is not None
-                                        count_pairs(
-                                            shard.tokens,
-                                            shard.valid,
-                                            shard.pair_keys_buffer,
-                                            shard.pair_counts_buffer,
-                                            shard.pair_count_length,
-                                        )
-                                    pair_results[dev].append(shard)
+                                        try:
+                                            histogram = count_pairs_on_device(
+                                                shard.tokens,
+                                                shard.valid,
+                                                shard.pair_keys_buffer,
+                                                shard.pair_counts_buffer,
+                                                shard.pair_count_length,
+                                            )
+                                        except RuntimeError:
+                                            count_pairs(
+                                                shard.tokens,
+                                                shard.valid,
+                                                shard.pair_keys_buffer,
+                                                shard.pair_counts_buffer,
+                                                shard.pair_count_length,
+                                            )
+                                            histogram = _histogram_from_workspace(shard)
+                                    pair_results[dev].append((shard, histogram))
                                     pending_compute[dev] = True
                                     shard.pair_keys = None
                                     shard.pair_counts = None
@@ -3146,35 +3181,31 @@ class GPUBPETrainer(BaseTrainer):
                                 torch.cuda.synchronize(dev)
                                 assert device_contexts[dev].compute_stream.query(), "compute stream did not drain"
                     for dev, per_device_records in pair_results.items():
-                        for shard in per_device_records:
-                            assert shard.pair_count_length is not None
-                            length = int(shard.pair_count_length.item())
-                            if length <= 0:
+                        for shard, histogram in per_device_records:
+                            if histogram.is_empty():
                                 if self._enable_histogram_cache:
                                     shard.pair_keys = torch.empty((0,), dtype=torch.long)
                                     shard.pair_counts = torch.empty((0,), dtype=torch.int64)
                                 continue
-                            assert shard.pair_keys_buffer is not None
-                            assert shard.pair_counts_buffer is not None
-                            pairs_view = shard.pair_keys_buffer.narrow(0, 0, length)
-                            counts_view = shard.pair_counts_buffer.narrow(0, 0, length)
-                            a_ids = pairs_view[:, 0].to(torch.long)
-                            b_ids = pairs_view[:, 1].to(torch.long)
-                            keys = (a_ids << 32) | b_ids
-                            local_keys.append(keys)
-                            local_counts.append(counts_view.to(torch.int64))
+                            hist_results.append(histogram)
                             if self._enable_histogram_cache:
-                                shard.pair_keys = keys.to(torch.long).to("cpu")
-                                shard.pair_counts = counts_view.to(torch.int64).to("cpu")
-                    if local_keys and local_counts:
-                        combined_keys = torch.cat(local_keys, dim=0)
-                        combined_counts = torch.cat(local_counts, dim=0)
-                        compacted_keys, compacted_counts = compact_histogram(
-                            combined_keys, combined_counts
+                                shard.pair_keys = histogram.keys.to(torch.long).to("cpu")
+                                shard.pair_counts = histogram.counts.to(torch.int64).to("cpu")
+                    if hist_results:
+                        gpu_candidates = [
+                            res for res in hist_results if res.keys.device.type == "cuda"
+                        ]
+                        reduction_device: torch.device
+                        if gpu_candidates:
+                            reduction_device = gpu_candidates[0].keys.device
+                        else:
+                            reduction_device = hist_results[0].keys.device
+                        combined = combine_histogram_results(
+                            hist_results, target_device=reduction_device
                         )
                         reduction_start = time.perf_counter() if metrics_enabled else None
                         reduced_keys, reduced_counts = reduce_pair_histograms(
-                            compacted_keys, compacted_counts
+                            combined.keys, combined.counts
                         )
                         if reduction_start is not None:
                             reduction_duration = time.perf_counter() - reduction_start
@@ -3189,6 +3220,7 @@ class GPUBPETrainer(BaseTrainer):
                                     stage_kind,
                                 )
                     else:
+                        reduction_device = torch.device("cpu")
                         reduced_keys = None
                         reduced_counts = None
                     gpu_batches = [
@@ -3198,9 +3230,13 @@ class GPUBPETrainer(BaseTrainer):
                         cached_keys = torch.empty((0,), dtype=torch.long)
                         cached_counts = torch.empty((0,), dtype=torch.int64)
                         gpu_source: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+                        returned_keys = cached_keys
+                        returned_counts = cached_counts
                     else:
                         gpu_keys = reduced_keys.to(torch.long)
                         gpu_counts = reduced_counts.to(torch.int64)
+                        returned_keys = gpu_keys
+                        returned_counts = gpu_counts
                         gpu_source = (gpu_keys, gpu_counts)
                         cached_keys = gpu_keys.to("cpu")
                         cached_counts = gpu_counts.to("cpu")
@@ -3218,7 +3254,7 @@ class GPUBPETrainer(BaseTrainer):
                     total_batches = max(1, len(consumed))
                     self._cpu_fallback_batches += len(cpu_consumed)
                     self._last_cpu_fallback_ratio = len(cpu_consumed) / float(total_batches)
-                    return cached_keys, cached_counts, consumed
+                    return returned_keys.clone(), returned_counts.clone(), consumed
 
             def _apply_merge_gpu(
                 batch_iter: Iterable[Union[MultiDeviceBatch, CPUFallbackBatch]],
@@ -3792,17 +3828,10 @@ class GPUBPETrainer(BaseTrainer):
                             reduction_duration,
                             stage_kind,
                         )
-                best_tensor_count = torch.max(agg_counts)
-                candidate_indices = torch.nonzero(
-                    agg_counts == best_tensor_count, as_tuple=False
-                ).flatten()
-                if candidate_indices.numel() == 1:
-                    best_idx = candidate_indices[0]
-                else:
-                    best_idx = candidate_indices[torch.argmin(agg_keys[candidate_indices])]
-                best_key = agg_keys[best_idx]
-                best_key_value = int(best_key.item())
-                best_count = int(best_tensor_count.item())
+                histogram = PairHistogramResult(agg_keys, agg_counts)
+                selected_key, selected_count, _ = select_best_pair(histogram)
+                best_key_value = selected_key
+                best_count = selected_count
             if best_key_value is None:
                 print("No pairs left to merge.")
                 if metrics_enabled:

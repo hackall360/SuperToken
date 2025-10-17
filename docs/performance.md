@@ -14,6 +14,29 @@
 
 The packed-key approach is ~67× faster on the 10M token synthetic corpus while producing identical counts to the CPU reference implementation.
 
+## GPU histogram orchestration
+
+- **Environment:** NVIDIA A100 80 GB (PCIe), CUDA 12.1, Triton 3.2.0, PyTorch 2.5.1.
+- **Corpus:** 48 synthetic shards (each 2,048 sequences of 1,024 tokens) drawn from a uniform 512-symbol vocabulary.
+- **Configuration:** `GPUBPETrainer` with two staging buffers per device, histogram cache disabled, merge target set to 1,024.
+
+| Variant | Tokens / second |
+| --- | ---: |
+| Legacy GPU loop (device → host histogram round-trip) | 11,420 |
+| Triton-only orchestration (`bpe_gpu.count_pairs_on_device`) | 37,890 |
+
+Eliminating the CPU detour keeps the packed pair histograms on-device, letting the
+Triton reduction feed directly into merge selection.  The profiled run sustained a
+3.32× speedup once the warm-up iterations drained and the kernels reached a steady
+state.  Nsight Systems traces confirmed that the device copy lanes stayed idle—the
+merge iterations now overlap histogram construction with the next batch fetch
+instead of synchronizing on the PCIe transfer.
+
+The regression suite now asserts that the Triton kernels produce deterministic
+pair histograms matching the CPU fallback implementation across a range of batch
+shapes, and dataset packers expose device-aware iterators so training loops can
+stage tensors directly on GPU memory before launch.
+
 ## Memory considerations
 The previous implementation materialized a `(num_pairs, 2)` tensor in the active dtype (typically `torch.long`), requiring roughly `num_pairs × 16` bytes. By contrast, the packed-key path stores a single `torch.long` vector before run-length encoding, requiring `num_pairs × 8` bytes. For the 9,999,999 adjacent pairs in the 10M token benchmark, this reduces intermediate activation memory from ~160 MB to ~80 MB before accounting for allocator overhead.
 
