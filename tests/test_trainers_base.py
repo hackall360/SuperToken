@@ -66,6 +66,26 @@ class DummyTrainer(BaseTrainer):
         artifact.write_text(json.dumps({"history": self._history}))
         return {"dummy": str(artifact)}
 
+    def save_checkpoint(
+        self, path: str | Path, *args: Any, **kwargs: Any
+    ) -> dict[str, Any]:
+        output_path = Path(path)
+        output_path.mkdir(parents=True, exist_ok=True)
+        state = self.state_dict()
+        meta_path = output_path / "state.json"
+        meta_path.write_text(json.dumps(state))
+        return {"payload": state, "tensors": {}}
+
+    def load_checkpoint(
+        self, path: str | Path, *args: Any, **kwargs: Any
+    ) -> dict[str, Any]:
+        meta_path = Path(path) / "state.json"
+        if meta_path.exists():
+            payload = json.loads(meta_path.read_text())
+        else:
+            payload = {}
+        return {"payload": payload, "tensors": {}}
+
     def metrics(self) -> Mapping[str, TrainerMetricsEWMA]:
         return self._metrics_mapping()
 

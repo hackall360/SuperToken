@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import math
+import os
 import time
 from os import PathLike
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Sequence, Tuple, cast
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, cast
 
 import torch
 
 from . import cuda_kernels
-from .trainers.base import BaseTrainer
+from .trainers.base import BaseTrainer, CheckpointPayload
 from .trainers.metrics import TrainerMetricsEWMA
 
 
@@ -89,6 +91,82 @@ class GPUUnigramTrainer(BaseTrainer):
             new_gen.manual_seed(seed)
         return new_gen
 
+    @staticmethod
+    def _encode_piece(piece: bytes) -> str:
+        return piece.hex()
+
+    @staticmethod
+    def _decode_piece(value: object) -> bytes:
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value)
+        if isinstance(value, str):
+            try:
+                return bytes.fromhex(value)
+            except ValueError:
+                return value.encode("latin-1", errors="ignore")
+        if isinstance(value, Sequence):
+            try:
+                return bytes(int(elem) & 0xFF for elem in value)
+            except Exception:
+                return bytes()
+        return bytes(str(value), "latin-1", errors="ignore")
+
+    def _serialize_rng_state(self) -> dict[str, object]:
+        rng_meta: dict[str, object] = {}
+        template_state = getattr(self, "_rng_template_state", None)
+        if isinstance(template_state, torch.Tensor):
+            rng_meta["template_state"] = template_state.detach().cpu().tolist()
+        template_device = getattr(self, "_rng_template_device", None)
+        if template_device is not None:
+            rng_meta["template_device"] = str(template_device)
+        current = getattr(self, "_rng", None)
+        if isinstance(current, torch.Generator):
+            try:
+                state_tensor = current.get_state()
+            except Exception:
+                state_tensor = None
+            if state_tensor is not None:
+                rng_meta["current_state"] = state_tensor.detach().cpu().tolist()
+                device = getattr(current, "device", torch.device("cpu"))
+                rng_meta["current_device"] = str(device)
+        return rng_meta
+
+    def _restore_rng_state(self, rng_meta: Mapping[str, Any]) -> None:
+        if not isinstance(rng_meta, Mapping):
+            return
+        template_state = rng_meta.get("template_state")
+        template_device = rng_meta.get("template_device")
+        if isinstance(template_state, list):
+            try:
+                tensor = torch.tensor(template_state, dtype=torch.uint8)
+            except Exception:
+                tensor = None
+            if tensor is not None:
+                self._rng_template_state = tensor
+                try:
+                    device = torch.device(str(template_device)) if template_device is not None else torch.device("cpu")
+                except Exception:
+                    device = torch.device("cpu")
+                self._rng_template_device = device
+        current_state = rng_meta.get("current_state")
+        current_device = rng_meta.get("current_device", template_device)
+        if isinstance(current_state, list):
+            try:
+                generator_device = torch.device(str(current_device)) if current_device is not None else torch.device("cpu")
+            except Exception:
+                generator_device = torch.device("cpu")
+            try:
+                generator = torch.Generator(device=generator_device)
+                state_tensor = torch.tensor(current_state, dtype=torch.uint8)
+                generator.set_state(state_tensor)
+            except Exception:
+                generator = None
+            if generator is not None:
+                self._rng = generator
+                return
+        if getattr(self, "_rng_template_state", None) is not None:
+            self.reset_rng()
+
     def reset_rng(
         self,
         *,
@@ -128,6 +206,34 @@ class GPUUnigramTrainer(BaseTrainer):
     def load_state_dict(self, state_dict: Mapping[str, object]) -> dict[str, object]:
         """Restore the trainer state from ``state_dict``."""
 
+        if isinstance(state_dict, Mapping) and "payload" in state_dict:
+            payload_map = state_dict.get("payload")
+            tensors_map = state_dict.get("tensors")
+            if isinstance(payload_map, Mapping):
+                payload = CheckpointPayload.from_mapping(payload_map)
+                trainer_meta = payload.trainer
+                model_section = trainer_meta.get("model")
+                if not isinstance(model_section, Mapping):
+                    model_section = trainer_meta
+                vocab_section = trainer_meta.get("vocab")
+                if not isinstance(vocab_section, Mapping):
+                    vocab_section = {}
+                id2piece = vocab_section.get("id2piece", {})
+                piece2id = vocab_section.get("piece2id", {})
+                tensor_payload = tensors_map if isinstance(tensors_map, Mapping) else {}
+                state_dict = {
+                    "base_vocab": model_section.get("base_vocab", self.base_vocab),
+                    "target_vocab": model_section.get("target_vocab", self.target_vocab),
+                    "max_len": model_section.get("max_len", self.max_len),
+                    "device": model_section.get("device", self.device),
+                    "id2piece": id2piece,
+                    "piece2id": piece2id,
+                    "logp": tensor_payload.get("logp"),
+                }
+                self._restore_rng_state(payload.rng)
+            else:
+                state_dict = {}
+
         self.base_vocab = int(state_dict.get("base_vocab", self.base_vocab))
         self.target_vocab = int(state_dict.get("target_vocab", self.target_vocab))
         self.max_len = int(state_dict.get("max_len", self.max_len))
@@ -136,9 +242,25 @@ class GPUUnigramTrainer(BaseTrainer):
         id2piece = state_dict.get("id2piece")
         piece2id = state_dict.get("piece2id")
         if isinstance(id2piece, Mapping):
-            self.id2piece = {int(k): bytes(v) for k, v in id2piece.items()}
+            decoded: Dict[int, bytes] = {}
+            for k, v in id2piece.items():
+                try:
+                    idx = int(k)
+                except (TypeError, ValueError):
+                    continue
+                decoded[idx] = self._decode_piece(v)
+            if decoded:
+                self.id2piece = decoded
         if isinstance(piece2id, Mapping):
-            self.piece2id = {bytes(k): int(v) for k, v in piece2id.items()}
+            decoded_rev: Dict[bytes, int] = {}
+            for k, v in piece2id.items():
+                try:
+                    idx = int(v)
+                except (TypeError, ValueError):
+                    continue
+                decoded_rev[self._decode_piece(k)] = idx
+            if decoded_rev:
+                self.piece2id = decoded_rev
 
         logp = state_dict.get("logp")
         if isinstance(logp, torch.Tensor):
@@ -785,6 +907,59 @@ class GPUUnigramTrainer(BaseTrainer):
 
         model_path = self.save(path)
         return {"model": str(model_path)}
+
+    def save_checkpoint(
+        self, path: str | PathLike[str], *args: Any, **kwargs: Any
+    ) -> dict[str, object]:
+        trainer_payload = {
+            "model": {
+                "base_vocab": int(self.base_vocab),
+                "target_vocab": int(self.target_vocab),
+                "max_len": int(self.max_len),
+                "device": self.device,
+            },
+            "vocab": {
+                "id2piece": {
+                    str(idx): self._encode_piece(piece)
+                    for idx, piece in sorted(self.id2piece.items())
+                },
+                "piece2id": {
+                    self._encode_piece(piece): int(idx)
+                    for piece, idx in self.piece2id.items()
+                },
+            },
+        }
+        tensors: dict[str, torch.Tensor] = {}
+        if isinstance(self.logp, torch.Tensor):
+            tensors["logp"] = self.logp.detach().clone().cpu()
+        payload = CheckpointPayload(
+            version=CheckpointPayload.CURRENT_VERSION,
+            trainer=trainer_payload,
+            rng=self._serialize_rng_state(),
+        )
+        os.makedirs(path, exist_ok=True)
+        meta_path = os.path.join(path, "state.json")
+        tensor_path = os.path.join(path, "tensors.pt")
+        with open(meta_path, "w", encoding="utf-8") as handle:
+            json.dump(payload.to_dict(), handle, indent=2, sort_keys=True)
+        torch.save({name: tensor for name, tensor in tensors.items()}, tensor_path)
+        return {"payload": payload.to_dict(), "tensors": tensors}
+
+    def load_checkpoint(
+        self, path: str | PathLike[str], *args: Any, **kwargs: Any
+    ) -> dict[str, object]:
+        meta_path = os.path.join(path, "state.json")
+        tensor_path = os.path.join(path, "tensors.pt")
+        if not os.path.exists(meta_path):
+            raise FileNotFoundError(f"Checkpoint metadata missing at {meta_path}")
+        with open(meta_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        tensors: dict[str, torch.Tensor] = {}
+        if os.path.exists(tensor_path):
+            loaded = torch.load(tensor_path, map_location="cpu")
+            if isinstance(loaded, dict):
+                tensors = loaded
+        return {"payload": payload, "tensors": tensors}
 
     def save(self, path: str | PathLike[str]) -> Path:
         """Serialize the unigram model to a SentencePiece ``.model`` file.

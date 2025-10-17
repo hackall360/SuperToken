@@ -10,7 +10,7 @@ import types
 from dataclasses import asdict
 from pathlib import Path
 from contextlib import ExitStack
-from typing import Iterable, Iterator, Sequence
+from typing import Iterable, Iterator, Mapping, Sequence
 
 import torch
 
@@ -25,7 +25,7 @@ from gpu_tokenizer import (
 )
 from gpu_tokenizer.io import CorpusStreamer, MemoryMappedShard
 from gpu_tokenizer.dtypes import length_storage_dtype
-from gpu_tokenizer.trainers.base import BaseTrainer
+from gpu_tokenizer.trainers.base import BaseTrainer, CheckpointPayload
 from benchmarks import benchmark_runner
 
 __all__ = [
@@ -527,13 +527,63 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
     #    pipeline that will be recreated whenever the autoscaler resizes.
     if args.resume_from:
         resume_state = trainer.load_checkpoint(str(args.resume_from))
-        metadata = dict(resume_state.get("metadata", {}))
-        merge_step = metadata.get("merge_step")
+        payload_mapping = resume_state.get("payload")
+        if isinstance(payload_mapping, Mapping):
+            checkpoint_payload = CheckpointPayload.from_mapping(payload_mapping)
+        else:
+            legacy_meta = resume_state.get("metadata")
+            if isinstance(legacy_meta, Mapping):
+                checkpoint_payload = CheckpointPayload.from_legacy_metadata(legacy_meta)
+            else:
+                checkpoint_payload = CheckpointPayload()
+
+        model_section = checkpoint_payload.trainer.get("model")
+        if not isinstance(model_section, Mapping):
+            model_section = checkpoint_payload.trainer
+        merge_step = model_section.get("merge_step")
         print(
             f"[checkpoint] Restored checkpoint from {args.resume_from}"
             + (f" at merge {merge_step}" if merge_step is not None else "")
         )
-        serialized_batches = metadata.get("batches")
+
+        if checkpoint_payload.version != CheckpointPayload.CURRENT_VERSION:
+            print(
+                "[checkpoint] Warning: checkpoint schema version "
+                f"{checkpoint_payload.version} differs from expected "
+                f"{CheckpointPayload.CURRENT_VERSION}",
+                file=sys.stderr,
+            )
+
+        config_warnings: list[str] = []
+        target_merges = model_section.get("target_merges")
+        try:
+            target_merges_int = int(target_merges) if target_merges is not None else None
+        except (TypeError, ValueError):
+            target_merges_int = None
+        if target_merges_int is None:
+            merges_list = model_section.get("merges")
+            if isinstance(merges_list, list):
+                target_merges_int = len(merges_list)
+        if target_merges_int is not None and target_merges_int != int(args.merges):
+            config_warnings.append(
+                "CLI --merges does not match checkpoint target_merges"
+            )
+        base_vocab_val = model_section.get("base_vocab")
+        try:
+            base_vocab_int = int(base_vocab_val) if base_vocab_val is not None else None
+        except (TypeError, ValueError):
+            base_vocab_int = None
+        if base_vocab_int is not None and base_vocab_int != int(args.base_vocab):
+            config_warnings.append(
+                "CLI --base-vocab does not match checkpoint base_vocab"
+            )
+        for warning in config_warnings:
+            print(f"[checkpoint] Warning: {warning}", file=sys.stderr)
+
+        dataset_meta = checkpoint_payload.dataset
+        serialized_batches = dataset_meta.get("batches") if isinstance(dataset_meta, Mapping) else None
+        if serialized_batches is None:
+            serialized_batches = checkpoint_payload.trainer.get("batches")
         if isinstance(serialized_batches, dict):
             restored_bs, restored_iter = _build_serialized_batches(
                 serialized_batches,

@@ -37,7 +37,7 @@ from .dtypes import (
     length_storage_dtype,
     promote_length_sum_dtype,
 )
-from .trainers.base import BaseTrainer
+from .trainers.base import BaseTrainer, CheckpointPayload
 from .trainers.metrics import TrainerMetricsEWMA
 from .trainers.bpe_gpu import (
     PairHistogramResult,
@@ -1337,56 +1337,47 @@ class GPUBPETrainer(BaseTrainer):
         host_sync_events: Optional[list[dict[str, object]]] = None,
         device_snapshot_log: Optional[list[dict[str, object]]] = None,
     ) -> dict[str, object]:
-        metadata: dict[str, object] = {
+        model_section = {
             "base_vocab": int(self.base_vocab),
             "target_merges": int(self.target_merges),
             "vocab_size": int(self.vocab_size),
             "merges": [list(map(int, pair)) for pair in self.merges],
             "merge_step": int(self._merge_step),
-            "warm_start_plan": (
+        }
+        warm_start_section = {
+            "plan": (
                 {k: v for k, v in self._warm_start_plan.items()}
                 if self._warm_start_plan is not None
                 else None
             ),
-            "warm_start_applied": bool(self._warm_start_applied),
-            "freeze_warm_start": bool(self.freeze_warm_start),
-            "seed_warm_start_merges": [
-                list(map(int, pair)) for pair in self._seed_warm_start_merges
-            ],
+            "applied": bool(self._warm_start_applied),
+            "freeze": bool(self.freeze_warm_start),
+            "seed_merges": [list(map(int, pair)) for pair in self._seed_warm_start_merges],
             "frozen_pair_keys": [int(key) for key in sorted(self._frozen_pair_keys)],
-            "histogram_cache": {
-                "enable": bool(self._enable_histogram_cache),
-                "valid": bool(self._hist_cache_valid),
-                "force_recount": bool(self._force_recount),
-            },
-            "cached_histogram_sizes": {
+        }
+        histogram_section = {
+            "enable": bool(self._enable_histogram_cache),
+            "valid": bool(self._hist_cache_valid),
+            "force_recount": bool(self._force_recount),
+            "sizes": {
                 "keys": int(self._cached_pair_keys.numel()),
                 "counts": int(self._cached_pair_counts.numel()),
             },
+        }
+        counters_section = {
             "bytes_h2d": int(self.bytes_h2d),
             "bytes_d2h": int(self.bytes_d2h),
             "h2d_events": int(self.h2d_events),
             "d2h_events": int(self.d2h_events),
+        }
+        logs_section: dict[str, object] = {
             "merge_transfer_log": [dict(entry) for entry in self.merge_transfer_log],
             "sync_intervals": [dict(entry) for entry in self.sync_intervals],
             "transfer_stage_totals": {
                 key: {"h2d": int(val.get("h2d", 0)), "d2h": int(val.get("d2h", 0))}
                 for key, val in self._transfer_stage_totals.items()
             },
-            "cpu_fallback_batches": int(self._cpu_fallback_batches),
-            "last_cpu_fallback_ratio": float(self._last_cpu_fallback_ratio),
-            "active_batch_size": (
-                int(self._active_batch_size)
-                if self._active_batch_size is not None
-                else None
-            ),
-            "autoscaler": self.autoscaler.state_dict(),
-            "autoscaler_metrics": self.autoscaler.snapshot_metrics(),
-            "autoscaler_window": [dict(entry) for entry in self._autoscaler_window_log],
         }
-        if include_batches and current_batches is not None:
-            serialized_batches = self._serialize_batches(current_batches)
-            metadata["batches"] = serialized_batches
         telemetry_progress: dict[str, object] = {}
         if stage_timings is not None:
             telemetry_progress["stage_timings"] = {
@@ -1399,11 +1390,47 @@ class GPUBPETrainer(BaseTrainer):
         if device_snapshot_log is not None:
             telemetry_progress["device_snapshot_log"] = [dict(evt) for evt in device_snapshot_log]
         if telemetry_progress:
-            metadata["telemetry_progress"] = telemetry_progress
-        tensors: dict[str, torch.Tensor] = {}
-        tensors["cached_pair_keys"] = self._cached_pair_keys.detach().clone().cpu()
-        tensors["cached_pair_counts"] = self._cached_pair_counts.detach().clone().cpu()
-        return {"metadata": metadata, "tensors": tensors}
+            logs_section["telemetry_progress"] = telemetry_progress
+
+        dataset_section: dict[str, object] = {
+            "cpu_fallback_batches": int(self._cpu_fallback_batches),
+            "last_cpu_fallback_ratio": float(self._last_cpu_fallback_ratio),
+        }
+        if self._active_batch_size is not None:
+            dataset_section["active_batch_size"] = int(self._active_batch_size)
+        if include_batches and current_batches is not None:
+            dataset_section["batches"] = self._serialize_batches(current_batches)
+
+        autoscaler_section: dict[str, object] = {
+            "state": self.autoscaler.state_dict(),
+        }
+        autoscaler_metrics = self.autoscaler.snapshot_metrics()
+        if autoscaler_metrics:
+            autoscaler_section["metrics"] = autoscaler_metrics
+        if self._autoscaler_window_log:
+            autoscaler_section["window"] = [dict(entry) for entry in self._autoscaler_window_log]
+
+        trainer_section = {
+            "model": model_section,
+            "warm_start": warm_start_section,
+            "histogram_cache": histogram_section,
+            "counters": counters_section,
+            "logs": logs_section,
+        }
+
+        payload = CheckpointPayload(
+            version=CheckpointPayload.CURRENT_VERSION,
+            trainer=trainer_section,
+            autoscaler=autoscaler_section,
+            dataset=dataset_section,
+            rng={},
+        )
+
+        tensors: dict[str, torch.Tensor] = {
+            "cached_pair_keys": self._cached_pair_keys.detach().clone().cpu(),
+            "cached_pair_counts": self._cached_pair_counts.detach().clone().cpu(),
+        }
+        return {"payload": payload.to_dict(), "tensors": tensors}
 
     def load_state_dict(
         self,
@@ -1423,28 +1450,55 @@ class GPUBPETrainer(BaseTrainer):
                 "host_sync_events": [],
                 "device_snapshot_log": [],
             }
-        metadata = dict(state_dict.get("metadata", {}))
+        payload_mapping = state_dict.get("payload")
         tensors = state_dict.get("tensors", {})
-        self.base_vocab = int(metadata.get("base_vocab", self.base_vocab))
-        self.target_merges = int(metadata.get("target_merges", self.target_merges))
-        merges_raw = metadata.get("merges", [])
+        payload: CheckpointPayload
+        if isinstance(payload_mapping, Mapping):
+            payload = CheckpointPayload.from_mapping(payload_mapping)
+        else:
+            legacy_metadata = state_dict.get("metadata")
+            if isinstance(legacy_metadata, Mapping):
+                payload = CheckpointPayload.from_legacy_metadata(legacy_metadata)
+            else:
+                payload = CheckpointPayload()
+
+        trainer_meta = payload.trainer
+        if not trainer_meta:
+            trainer_meta = {}
+        model_section = trainer_meta.get("model")
+        if not isinstance(model_section, Mapping):
+            model_section = trainer_meta
+        self.base_vocab = int(model_section.get("base_vocab", self.base_vocab))
+        self.target_merges = int(model_section.get("target_merges", self.target_merges))
+        merges_raw = model_section.get("merges", [])
         self.merges = [tuple(map(int, pair)) for pair in merges_raw]
-        self.vocab_size = int(metadata.get("vocab_size", self.vocab_size))
-        self._merge_step = int(metadata.get("merge_step", len(self.merges)))
-        warm_plan = metadata.get("warm_start_plan")
-        self._warm_start_plan = warm_plan
-        self._warm_start_applied = bool(metadata.get("warm_start_applied", self._warm_start_applied))
-        self.freeze_warm_start = bool(metadata.get("freeze_warm_start", self.freeze_warm_start))
-        self._seed_warm_start_merges = [
-            tuple(map(int, pair))
-            for pair in metadata.get(
-                "seed_warm_start_merges", list(self._seed_warm_start_merges)
-            )
-        ]
-        self._frozen_pair_keys = set(
-            int(key) for key in metadata.get("frozen_pair_keys", list(self._frozen_pair_keys))
+        self.vocab_size = int(model_section.get("vocab_size", self.vocab_size))
+        self._merge_step = int(model_section.get("merge_step", len(self.merges)))
+
+        warm_section = trainer_meta.get("warm_start")
+        if not isinstance(warm_section, Mapping):
+            warm_section = {}
+        self._warm_start_plan = warm_section.get("plan")
+        self._warm_start_applied = bool(
+            warm_section.get("applied", self._warm_start_applied)
         )
-        hist_meta = metadata.get("histogram_cache", {})
+        self.freeze_warm_start = bool(
+            warm_section.get("freeze", self.freeze_warm_start)
+        )
+        seed_merges = warm_section.get("seed_merges")
+        if seed_merges is None:
+            seed_merges = trainer_meta.get(
+                "seed_warm_start_merges", self._seed_warm_start_merges
+            )
+        self._seed_warm_start_merges = [tuple(map(int, pair)) for pair in seed_merges]
+        frozen_keys = warm_section.get("frozen_pair_keys")
+        if frozen_keys is None:
+            frozen_keys = trainer_meta.get("frozen_pair_keys", self._frozen_pair_keys)
+        self._frozen_pair_keys = {int(key) for key in frozen_keys}
+
+        hist_meta = trainer_meta.get("histogram_cache")
+        if not isinstance(hist_meta, Mapping):
+            hist_meta = {}
         self._enable_histogram_cache = bool(
             hist_meta.get("enable", self._enable_histogram_cache)
         )
@@ -1465,71 +1519,96 @@ class GPUBPETrainer(BaseTrainer):
             self._reset_top_pairs()
         if use_cuda:
             self._materialize_histogram_cache_on_devices(device_contexts)
-        self.bytes_h2d = int(metadata.get("bytes_h2d", self.bytes_h2d))
-        self.bytes_d2h = int(metadata.get("bytes_d2h", self.bytes_d2h))
-        self.h2d_events = int(metadata.get("h2d_events", self.h2d_events))
-        self.d2h_events = int(metadata.get("d2h_events", self.d2h_events))
-        self.merge_transfer_log = [dict(entry) for entry in metadata.get("merge_transfer_log", self.merge_transfer_log)]
-        self.sync_intervals = [dict(entry) for entry in metadata.get("sync_intervals", self.sync_intervals)]
-        stage_totals_raw = metadata.get("transfer_stage_totals", {})
+        counters_meta = trainer_meta.get("counters")
+        if not isinstance(counters_meta, Mapping):
+            counters_meta = trainer_meta
+        self.bytes_h2d = int(counters_meta.get("bytes_h2d", self.bytes_h2d))
+        self.bytes_d2h = int(counters_meta.get("bytes_d2h", self.bytes_d2h))
+        self.h2d_events = int(counters_meta.get("h2d_events", self.h2d_events))
+        self.d2h_events = int(counters_meta.get("d2h_events", self.d2h_events))
+
+        logs_meta = trainer_meta.get("logs")
+        if not isinstance(logs_meta, Mapping):
+            logs_meta = trainer_meta
+        self.merge_transfer_log = [
+            dict(entry)
+            for entry in logs_meta.get("merge_transfer_log", self.merge_transfer_log)
+        ]
+        self.sync_intervals = [
+            dict(entry) for entry in logs_meta.get("sync_intervals", self.sync_intervals)
+        ]
+        stage_totals_raw = logs_meta.get("transfer_stage_totals", {})
         self._transfer_stage_totals = {
             key: {"h2d": int(val.get("h2d", 0)), "d2h": int(val.get("d2h", 0))}
             for key, val in stage_totals_raw.items()
         }
+        telemetry_progress = logs_meta.get("telemetry_progress", trainer_meta.get("telemetry_progress", {}))
+
+        dataset_meta = payload.dataset or {}
+        if not isinstance(dataset_meta, Mapping):
+            dataset_meta = {}
+        active_batch_size = dataset_meta.get("active_batch_size")
+        self._active_batch_size = (
+            int(active_batch_size) if active_batch_size is not None else None
+        )
         self._cpu_fallback_batches = int(
-            metadata.get("cpu_fallback_batches", self._cpu_fallback_batches)
+            dataset_meta.get("cpu_fallback_batches", self._cpu_fallback_batches)
         )
         self._last_cpu_fallback_ratio = float(
-            metadata.get("last_cpu_fallback_ratio", self._last_cpu_fallback_ratio)
+            dataset_meta.get("last_cpu_fallback_ratio", self._last_cpu_fallback_ratio)
         )
-        active_batch_size = metadata.get("active_batch_size")
-        self._active_batch_size = int(active_batch_size) if active_batch_size is not None else None
-        autoscaler_meta = metadata.get("autoscaler") or {}
+
+        autoscaler_meta = payload.autoscaler or {}
+        if not isinstance(autoscaler_meta, Mapping):
+            autoscaler_meta = {}
+        state_section = autoscaler_meta.get("state")
+        if not isinstance(state_section, Mapping) and autoscaler_meta:
+            state_section = autoscaler_meta
         scale_state = self.autoscaler.state
-        if autoscaler_meta:
-            if "state" in autoscaler_meta or "h2d_mb" in autoscaler_meta:
-                self.autoscaler.load_state_dict(autoscaler_meta)
+        if state_section:
+            if "state" in autoscaler_meta or "h2d_mb" in state_section:
+                self.autoscaler.load_state_dict(state_section)
                 scale_state = self.autoscaler.state
             else:
-                # Backwards compatibility for checkpoints created before autoscaler
-                # serialization helpers were introduced.
-                self.autoscaler.device = autoscaler_meta.get("device", self.autoscaler.device)
+                # Backwards compatibility path for legacy autoscaler metadata.
+                self.autoscaler.device = state_section.get(
+                    "device", self.autoscaler.device
+                )
                 self.autoscaler.tu = float(
-                    autoscaler_meta.get("target_util", self.autoscaler.tu)
+                    state_section.get("target_util", self.autoscaler.tu)
                 )
                 window_size = int(
-                    autoscaler_meta.get("window_size", self.autoscaler._window_size)
+                    state_section.get("window_size", self.autoscaler._window_size)
                 )
                 self.autoscaler._window_size = window_size
-                step_times = autoscaler_meta.get("step_times", [])
-                vram_util = autoscaler_meta.get("vram_utilization", [])
+                step_times = state_section.get("step_times", [])
+                vram_util = state_section.get("vram_utilization", [])
                 self.autoscaler._step_times = deque(step_times, maxlen=window_size)
                 self.autoscaler._vram_fracs = deque(vram_util, maxlen=window_size)
-                state_payload = autoscaler_meta.get("state")
-                if state_payload is not None:
+                legacy_state = state_section.get("state")
+                if legacy_state is not None:
                     scale_state = ScaleState(
-                        batch_size=int(state_payload.get("batch_size", 0)),
-                        cpu_workers=int(state_payload.get("cpu_workers", 0)),
-                        h2d_mb=int(state_payload.get("h2d_mb", 0)),
+                        batch_size=int(legacy_state.get("batch_size", 0)),
+                        cpu_workers=int(legacy_state.get("cpu_workers", 0)),
+                        h2d_mb=int(legacy_state.get("h2d_mb", 0)),
                         cpu_fallback_rate=float(
-                            state_payload.get("cpu_fallback_rate", 0.0)
+                            legacy_state.get("cpu_fallback_rate", 0.0)
                         ),
                     )
                     self.autoscaler.state = scale_state
                 else:
                     self.autoscaler.state = None
-        window_log = metadata.get("autoscaler_window")
+        window_log = autoscaler_meta.get("window")
         if isinstance(window_log, list):
             self._autoscaler_window_log = [dict(entry) for entry in window_log]
         else:
             self._autoscaler_window_log = []
-        batches_payload = metadata.get("batches")
+        batches_payload = dataset_meta.get("batches") or trainer_meta.get("batches")
         current_batches, gpu_batches = self._deserialize_batches(
             batches_payload,
             device_contexts=device_contexts,
             use_cuda=use_cuda,
         )
-        telemetry_progress = metadata.get("telemetry_progress") or {}
         stage_timings_data = telemetry_progress.get("stage_timings")
         stage_event_log = telemetry_progress.get("stage_event_log", [])
         host_sync_events = telemetry_progress.get("host_sync_events", [])
@@ -1584,7 +1663,7 @@ class GPUBPETrainer(BaseTrainer):
         meta_path = os.path.join(path, "state.json")
         tensor_path = os.path.join(path, "tensors.pt")
         with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(state["metadata"], f, indent=2, sort_keys=True)
+            json.dump(state["payload"], f, indent=2, sort_keys=True)
         tensor_payload = {
             name: tensor.detach().clone().cpu() for name, tensor in state["tensors"].items()
         }
@@ -1595,13 +1674,13 @@ class GPUBPETrainer(BaseTrainer):
         meta_path = os.path.join(path, "state.json")
         tensor_path = os.path.join(path, "tensors.pt")
         with open(meta_path, "r", encoding="utf-8") as f:
-            metadata = json.load(f)
+            payload = json.load(f)
         tensors: dict[str, torch.Tensor] = {}
         if os.path.exists(tensor_path):
             loaded = torch.load(tensor_path, map_location="cpu")
             if isinstance(loaded, dict):
                 tensors = loaded
-        return {"metadata": metadata, "tensors": tensors}
+        return {"payload": payload, "tensors": tensors}
 
     def _record_merge_snapshot(self, merge_idx: int) -> None:
         self.merge_transfer_log.append(

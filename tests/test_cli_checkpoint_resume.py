@@ -4,6 +4,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Mapping
 
 import pytest
 
@@ -86,9 +87,23 @@ def test_train_bpe_resume_cli(tmp_path):
         proc.wait(timeout=5)
     partial_stdout, partial_stderr = proc.communicate()
 
+    def _extract_merges(payload: Mapping[str, object]) -> list[object]:
+        trainer = payload.get("trainer") if isinstance(payload, Mapping) else None
+        if isinstance(trainer, Mapping):
+            model = trainer.get("model")
+            if isinstance(model, Mapping):
+                merges = model.get("merges")
+                if isinstance(merges, list):
+                    return merges
+            merges = trainer.get("merges")
+            if isinstance(merges, list):
+                return merges
+        merges = payload.get("merges") if isinstance(payload, Mapping) else None
+        return merges if isinstance(merges, list) else []
+
     with state_path.open("r", encoding="utf-8") as f:
         partial_state = json.load(f)
-    partial_merges = partial_state.get("merges", [])
+    partial_merges = _extract_merges(partial_state)
     assert partial_merges, "expected checkpoint to contain completed merges"
     assert len(partial_merges) < merges
 
@@ -107,6 +122,6 @@ def test_train_bpe_resume_cli(tmp_path):
 
     with state_path.open("r", encoding="utf-8") as f:
         final_state = json.load(f)
-    final_merges = final_state.get("merges", [])
+    final_merges = _extract_merges(final_state)
     assert len(final_merges) == merges
     assert final_merges[: len(partial_merges)] == partial_merges
