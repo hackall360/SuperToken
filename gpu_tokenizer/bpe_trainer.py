@@ -28,6 +28,7 @@ from .dtypes import (
 from .utils import (
     aggregate_pair_keys,
     apply_merge_once,
+    compact_histogram,
     count_pairs,
     peer_copy_tensor,
     reduce_pair_histograms,
@@ -3083,9 +3084,12 @@ class GPUBPETrainer:
                     if local_keys and local_counts:
                         combined_keys = torch.cat(local_keys, dim=0)
                         combined_counts = torch.cat(local_counts, dim=0)
+                        compacted_keys, compacted_counts = compact_histogram(
+                            combined_keys, combined_counts
+                        )
                         reduction_start = time.perf_counter() if metrics_enabled else None
                         reduced_keys, reduced_counts = reduce_pair_histograms(
-                            combined_keys, combined_counts
+                            compacted_keys, compacted_counts
                         )
                         if reduction_start is not None:
                             reduction_duration = time.perf_counter() - reduction_start
