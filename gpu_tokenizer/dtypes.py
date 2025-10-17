@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import torch
 
-UINT16_MAX: int = int(torch.iinfo(torch.uint16).max)
+if not hasattr(torch, "uint16"):
+    torch.uint16 = torch.int32  # type: ignore[attr-defined]
+
+UINT16_MAX: int = (1 << 16) - 1
+UINT16_DTYPE: torch.dtype = torch.uint16
 INT32_MAX: int = int(torch.iinfo(torch.int32).max)
 
 
@@ -16,14 +20,14 @@ def length_storage_dtype(storage_width: int) -> torch.dtype:
     """
 
     if storage_width <= UINT16_MAX:
-        return torch.uint16
+        return UINT16_DTYPE
     return torch.int32
 
 
 def promote_length_sum_dtype(length_dtype: torch.dtype) -> torch.dtype:
     """Return a dtype suitable for summing valid-token masks safely."""
 
-    if length_dtype == torch.uint16:
+    if length_dtype == UINT16_DTYPE:
         return torch.int32
     if length_dtype == torch.int16:
         return torch.int32
@@ -47,11 +51,11 @@ def clamp_lengths_to_dtype(
     working = values.to(torch.int64)
     overflow: torch.Tensor | None = None
 
-    if target_dtype == torch.uint16:
+    if target_dtype == UINT16_DTYPE:
         if working.numel() > 0:
             overflow = working > UINT16_MAX
             working = working.clamp(max=UINT16_MAX)
-        result = working.to(torch.uint16)
+        result = working.to(UINT16_DTYPE)
         return result, overflow
 
     if target_dtype == torch.int32:

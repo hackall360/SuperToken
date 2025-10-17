@@ -88,6 +88,22 @@ class PackedBatcher:
             )
             buf_idx = 1 - buf_idx
 
+    def iter_device(
+        self,
+        device: torch.device | str,
+        *,
+        non_blocking: bool = True,
+    ) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Yield batches staged on ``device`` without reallocating host buffers."""
+
+        device_obj = torch.device(device)
+        for tokens, valid, lengths in self:
+            yield (
+                tokens.to(device=device_obj, non_blocking=non_blocking),
+                valid.to(device=device_obj, non_blocking=non_blocking),
+                lengths.to(device=device_obj, non_blocking=non_blocking),
+            )
+
 
 class StreamingPackedBatcher:
     """Pack batches from a :class:`CorpusStreamer` without preloading shards."""

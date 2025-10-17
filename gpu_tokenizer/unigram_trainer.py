@@ -35,7 +35,26 @@ class GPUUnigramTrainer(BaseTrainer):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.id2piece: Dict[int, bytes] = {i: bytes([i]) for i in range(base_vocab)}
         self.piece2id: Dict[bytes, int] = {bytes([i]): i for i in range(base_vocab)}
-        self.logp = torch.full((base_vocab,), -math.log(base_vocab), device=self.device)
+        fill_value = -math.log(max(base_vocab, 1))
+        if hasattr(torch, "full"):
+            self.logp = torch.full(
+                (base_vocab,), fill_value, device=self.device, dtype=torch.float32
+            )
+        else:  # pragma: no cover - exercised by minimal torch stubs in tests
+            try:
+                zeros = getattr(torch, "zeros", None)
+                if zeros is None:
+                    raise AttributeError("zeros")
+                self.logp = zeros((base_vocab,), dtype=torch.float32)
+                if hasattr(self.logp, "to"):
+                    self.logp = self.logp.to(self.device)
+                if base_vocab > 0:
+                    if hasattr(self.logp, "fill_"):
+                        self.logp.fill_(fill_value)
+                    else:
+                        self.logp += fill_value
+            except Exception as exc:  # pragma: no cover - stub path
+                raise RuntimeError("torch tensor constructors unavailable") from exc
         self._rng_template_state: torch.Tensor | None = None
         self._rng_template_device: torch.device | None = None
         self._base_powers: torch.Tensor | None = None
@@ -88,6 +107,63 @@ class GPUUnigramTrainer(BaseTrainer):
             assert self._rng_template_device is not None  # ``_rng_template_state`` guards this path.
             self._rng = torch.Generator(device=self._rng_template_device)
             self._rng.set_state(self._rng_template_state.clone())
+
+    def state_dict(self) -> Dict[str, object]:
+        """Capture the mutable trainer state for checkpointing."""
+
+        return {
+            "base_vocab": self.base_vocab,
+            "target_vocab": self.target_vocab,
+            "max_len": self.max_len,
+            "device": self.device,
+            "id2piece": dict(self.id2piece),
+            "piece2id": dict(self.piece2id),
+            "logp": self.logp.detach().cpu(),
+        }
+
+    def load_state_dict(self, state_dict: Mapping[str, object]) -> dict[str, object]:
+        """Restore the trainer state from ``state_dict``."""
+
+        self.base_vocab = int(state_dict.get("base_vocab", self.base_vocab))
+        self.target_vocab = int(state_dict.get("target_vocab", self.target_vocab))
+        self.max_len = int(state_dict.get("max_len", self.max_len))
+        self.device = str(state_dict.get("device", self.device))
+
+        id2piece = state_dict.get("id2piece")
+        piece2id = state_dict.get("piece2id")
+        if isinstance(id2piece, Mapping):
+            self.id2piece = {int(k): bytes(v) for k, v in id2piece.items()}
+        if isinstance(piece2id, Mapping):
+            self.piece2id = {bytes(k): int(v) for k, v in piece2id.items()}
+
+        logp = state_dict.get("logp")
+        if isinstance(logp, torch.Tensor):
+            self.logp = logp.to(self.device)
+        else:
+            vocab = max(len(self.id2piece), 1)
+            fill_value = -math.log(vocab)
+            if hasattr(torch, "full"):
+                self.logp = torch.full(
+                    (vocab,), fill_value, device=self.device, dtype=torch.float32
+                )
+            else:  # pragma: no cover - exercised by minimal torch stubs in tests
+                try:
+                    zeros = getattr(torch, "zeros", None)
+                    if zeros is None:
+                        raise AttributeError("zeros")
+                    self.logp = zeros((vocab,), dtype=torch.float32)
+                    if hasattr(self.logp, "to"):
+                        self.logp = self.logp.to(self.device)
+                    if vocab > 0:
+                        if hasattr(self.logp, "fill_"):
+                            self.logp.fill_(fill_value)
+                        else:
+                            self.logp += fill_value
+                except Exception as exc:  # pragma: no cover - stub path
+                    raise RuntimeError("torch tensor constructors unavailable") from exc
+
+        self._mark_vocab_dirty()
+        return {"vocab": len(self.id2piece)}
 
     def metrics(self) -> Mapping[str, TrainerMetricsEWMA]:
         """Expose registered metrics trackers for telemetry consumers."""
