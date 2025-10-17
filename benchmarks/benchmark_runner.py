@@ -9,7 +9,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Iterable, Iterator, Sequence
 
 import torch
 
@@ -29,6 +29,35 @@ class CorpusSummary:
     tokens: int
     max_length: int
     sources: list[dict[str, object]]
+
+
+@dataclass
+class BPERunSpec:
+    """Configuration describing a single BPE benchmark invocation."""
+
+    name: str
+    batch_size: int
+    device: str | None = None
+    devices: list[str] | None = None
+    overlap: bool = True
+    scaling_reference: str | None = None
+    device_weights: list[float] | None = None
+    target_efficiency: float = 0.88
+
+    def resolve_device(self) -> str | None:
+        if self.device:
+            return self.device
+        if self.devices:
+            return self.devices[0]
+        return None
+
+    def normalized_weights(self) -> list[float]:
+        if self.device_weights:
+            return [float(w) for w in self.device_weights]
+        count = len(self.devices or [])
+        if count <= 0:
+            return []
+        return [1.0] * count
 
 
 def _ensure_trainers_available() -> None:
@@ -377,6 +406,7 @@ def run_bpe_benchmark(
     seed: int,
     log_every: int,
     overlap: bool = True,
+    devices: Sequence[str] | None = None,
 ) -> dict[str, object]:
     """Benchmark :class:`GPUBPETrainer` on the provided sequences.
 
@@ -448,17 +478,24 @@ def run_bpe_benchmark(
     # batch sizes during benchmarking, preserving deterministic timings.
     autoscaler = AutoScaler(min_bs=batch_size, max_bs=batch_size, device=device)
     batches = _build_bpe_batches(sequences, batch_size=batch_size, seed=seed)
-    trainer = GPUBPETrainer(
-        base_vocab=base_vocab,
-        merges=merges,
-        device=device,
-        autoscaler=autoscaler,
-    )
+    kwargs: dict[str, object] = {
+        "base_vocab": base_vocab,
+        "merges": merges,
+        "device": device,
+        "autoscaler": autoscaler,
+    }
+    if devices:
+        kwargs["devices"] = list(devices)
+    trainer = GPUBPETrainer(**kwargs)
+    total_tokens = sum(len(seq) for seq in sequences)
     # Capture the high-resolution wall-clock before invoking GPU work so the
     # elapsed timing includes the entire training call.
     wall_start = time.perf_counter()
     meta = trainer.fit(batches, log_every=log_every, overlap_transfers=overlap)
     wall_time = time.perf_counter() - wall_start
+    tokens_per_s: float | None = None
+    if wall_time > 0 and total_tokens > 0:
+        tokens_per_s = total_tokens / wall_time
     return {
         "config": {
             "base_vocab": base_vocab,
@@ -466,11 +503,114 @@ def run_bpe_benchmark(
             "batch_size": batch_size,
             "device": device,
             "log_every": log_every,
+            "devices": list(devices) if devices else None,
+            "overlap": overlap,
         },
         "wall_time_s": wall_time,
         "result": meta,
         "overlap_enabled": overlap,
+        "tokens_processed": total_tokens,
+        "tokens_per_s": tokens_per_s,
     }
+
+
+def load_bpe_run_config(path: Path) -> list[BPERunSpec]:
+    """Load a JSON configuration describing multiple BPE benchmark runs."""
+
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    runs_raw = payload.get("runs", [])
+    specs: list[BPERunSpec] = []
+    for entry in runs_raw:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "")
+        if not name:
+            continue
+        batch_size = int(entry.get("batch_size", 0))
+        if batch_size <= 0:
+            continue
+        devices = entry.get("devices")
+        normalized_devices: list[str] | None
+        if isinstance(devices, list):
+            normalized_devices = [str(dev) for dev in devices if isinstance(dev, str)]
+        else:
+            normalized_devices = None
+        spec = BPERunSpec(
+            name=name,
+            batch_size=batch_size,
+            device=str(entry.get("device")) if entry.get("device") else None,
+            devices=normalized_devices,
+            overlap=bool(entry.get("overlap", True)),
+            scaling_reference=(
+                str(entry.get("scaling_reference"))
+                if entry.get("scaling_reference")
+                else None
+            ),
+            device_weights=[
+                float(val)
+                for val in entry.get("device_weights", [])
+                if isinstance(val, (int, float))
+            ]
+            or None,
+            target_efficiency=float(entry.get("target_efficiency", 0.88)),
+        )
+        specs.append(spec)
+    return specs
+
+
+def run_bpe_suite(
+    sequences: Sequence[Sequence[int]],
+    *,
+    base_vocab: int,
+    merges: int,
+    seed: int,
+    log_every: int,
+    run_configs: Sequence[BPERunSpec],
+) -> dict[str, object]:
+    """Execute a suite of BPE benchmarks derived from run specifications."""
+
+    runs: list[dict[str, object]] = []
+    throughputs: dict[str, float] = {}
+    for spec in run_configs:
+        benchmark = run_bpe_benchmark(
+            sequences,
+            base_vocab=base_vocab,
+            merges=merges,
+            batch_size=spec.batch_size,
+            device=spec.resolve_device(),
+            seed=seed,
+            log_every=log_every,
+            overlap=spec.overlap,
+            devices=spec.devices,
+        )
+        run_record = {
+            **benchmark,
+            "name": spec.name,
+        }
+        throughputs[spec.name] = float(benchmark.get("tokens_per_s") or 0.0)
+        runs.append(run_record)
+
+    for spec, run_record in zip(run_configs, runs):
+        scaling_info: dict[str, object] | None = None
+        if spec.scaling_reference:
+            baseline = throughputs.get(spec.scaling_reference, 0.0)
+            weights = spec.normalized_weights()
+            expected = baseline * sum(weights) if baseline > 0 and weights else 0.0
+            observed = float(run_record.get("tokens_per_s") or 0.0)
+            efficiency = observed / expected if expected > 0 else None
+            meets_target = (
+                efficiency is not None and efficiency >= spec.target_efficiency
+            )
+            scaling_info = {
+                "reference": spec.scaling_reference,
+                "device_weights": weights,
+                "expected_tokens_per_s": expected if expected > 0 else None,
+                "efficiency": efficiency,
+                "target_efficiency": spec.target_efficiency,
+                "meets_target": meets_target if efficiency is not None else None,
+            }
+        run_record["scaling"] = scaling_info
+    return {"runs": runs}
 
 
 def run_unigram_benchmark(
@@ -576,37 +716,18 @@ def run_unigram_benchmark(
 
 
 def format_summary_table(rows: Sequence[Sequence[str]], headers: Sequence[str]) -> str:
-    """Create a simple ASCII table summarizing benchmark results.
+    """Create a simple ASCII table summarizing benchmark results."""
 
-    Parameters
-    ----------
-    rows:
-        Sequence of string rows representing table body values.
-    headers:
-        Sequence of column headers.
+    materialized_rows = list(rows)
+    matrix = [headers, *materialized_rows]
+    widths = [max(len(str(cell)) for cell in column) for column in zip(*matrix)]
 
-    Returns
-    -------
-    str
-        ASCII table with column-aligned values.
-
-    Side Effects
-    ------------
-    None.
-
-    Raises
-    ------
-    ValueError
-        Propagated if ``rows`` contain columns mismatching ``headers`` length.
-    """
-    columns = list(zip(*([headers] + list(rows))))
-    widths = [max(len(cell) for cell in column) for column in columns]
     def _fmt(row: Sequence[str]) -> str:
-        return " | ".join(cell.ljust(width) for cell, width in zip(row, widths))
+        return " | ".join(str(cell).ljust(width) for cell, width in zip(row, widths))
 
     line = "-+-".join("-" * width for width in widths)
     parts = [_fmt(headers), line]
-    parts.extend(_fmt(row) for row in rows)
+    parts.extend(_fmt(row) for row in materialized_rows)
     return "\n".join(parts)
 
 
@@ -614,6 +735,7 @@ def emit_benchmark_summary(
     corpus: CorpusSummary,
     bpe_result: dict[str, object],
     unigram_result: dict[str, object],
+    bpe_suite: dict[str, object] | None = None,
 ) -> str:
     """Format a human-readable summary of benchmark runs.
 
@@ -642,26 +764,72 @@ def emit_benchmark_summary(
         If the expected keys are missing from ``bpe_result`` or
         ``unigram_result``.
     """
-    rows = [
+    rows: list[list[str]] = []
+    bpe_tokens = bpe_result.get("tokens_per_s")
+    if bpe_tokens is None and bpe_result.get("wall_time_s", 0.0) > 0:
+        bpe_tokens = corpus.tokens / bpe_result["wall_time_s"]
+    rows.append(
         [
             "GPUBPETrainer",
             f"{bpe_result['wall_time_s']:.2f}",
-            f"{corpus.tokens / bpe_result['wall_time_s']:.2f}" if bpe_result["wall_time_s"] > 0 else "n/a",
+            f"{bpe_tokens:.2f}" if bpe_tokens else "n/a",
             str(bpe_result["result"].get("vocab_size", "")),
-        ],
+        ]
+    )
+    unigram_tokens = None
+    if unigram_result["wall_time_s"] > 0:
+        unigram_tokens = corpus.tokens / unigram_result["wall_time_s"]
+    rows.append(
         [
             "GPUUnigramTrainer",
             f"{unigram_result['wall_time_s']:.2f}",
-            f"{corpus.tokens / unigram_result['wall_time_s']:.2f}" if unigram_result["wall_time_s"] > 0 else "n/a",
-            str(unigram_result["epochs"][-1].get("vocab", "")) if unigram_result["epochs"] else "",
-        ],
-    ]
+            f"{unigram_tokens:.2f}" if unigram_tokens else "n/a",
+            str(unigram_result["epochs"][-1].get("vocab", ""))
+            if unigram_result["epochs"]
+            else "",
+        ]
+    )
     headers = ["Trainer", "Wall time (s)", "Tokens/s", "Final vocab"]
-    summary = [
+    summary_lines = [
         f"Corpus → {corpus.sequences} sequences, {corpus.tokens} tokens (max len {corpus.max_length})",
         format_summary_table(rows, headers),
     ]
-    return "\n".join(summary)
+    if bpe_suite and isinstance(bpe_suite.get("runs"), list):
+        suite_rows: list[list[str]] = []
+        for run in bpe_suite.get("runs", []):
+            if not isinstance(run, dict):
+                continue
+            wall = float(run.get("wall_time_s", 0.0))
+            tokens_per_s = run.get("tokens_per_s")
+            if tokens_per_s is None and wall > 0:
+                tokens_per_s = corpus.tokens / wall
+            scaling = run.get("scaling") if isinstance(run.get("scaling"), dict) else None
+            efficiency = scaling.get("efficiency") if scaling else None
+            meets_target = scaling.get("meets_target") if scaling else None
+            scaling_display = "n/a"
+            if efficiency is not None:
+                scaling_display = f"{efficiency * 100:.1f}%"
+                if meets_target is True:
+                    scaling_display += " ✅"
+                elif meets_target is False:
+                    scaling_display += " ⚠️"
+            suite_rows.append(
+                [
+                    str(run.get("name", "")),
+                    f"{wall:.2f}",
+                    f"{tokens_per_s:.2f}" if tokens_per_s else "n/a",
+                    scaling_display,
+                ]
+            )
+        if suite_rows:
+            summary_lines.append("")
+            summary_lines.append(
+                format_summary_table(
+                    suite_rows,
+                    ["Run", "Wall (s)", "Tokens/s", "Scaling"],
+                )
+            )
+    return "\n".join(summary_lines)
 
 
 def serialize_run(
@@ -671,6 +839,7 @@ def serialize_run(
     config: dict[str, object],
     bpe: dict[str, object],
     unigram: dict[str, object],
+    bpe_runs: dict[str, object] | None = None,
 ) -> Path:
     """Persist benchmark inputs and outputs to JSON for later analysis.
 
@@ -719,6 +888,8 @@ def serialize_run(
         "bpe": bpe,
         "unigram": unigram,
     }
+    if bpe_runs is not None:
+        payload["bpe_runs"] = bpe_runs.get("runs") if isinstance(bpe_runs, dict) else bpe_runs
     path = output_dir / f"benchmark_{timestamp}.json"
     path.write_text(json.dumps(payload, indent=2, default=_json_default), encoding="utf-8")
     return path

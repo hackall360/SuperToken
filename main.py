@@ -211,15 +211,34 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
     # The synthetic/real corpus mixtures above feed both trainers, allowing
     # benchmarking code to compare how each algorithm responds to identical
     # token streams.
-    bpe = benchmark_runner.run_bpe_benchmark(
-        sequences,
-        base_vocab=args.bpe_base_vocab,
-        merges=args.bpe_merges,
-        batch_size=args.bpe_batch_size,
-        device=args.device,
-        seed=args.seed,
-        log_every=args.bpe_log_every,
-    )
+    bpe_suite: dict[str, object] | None = None
+    if getattr(args, "bpe_config", None):
+        config_path = Path(args.bpe_config)
+        run_specs = benchmark_runner.load_bpe_run_config(config_path)
+        if not run_specs:
+            raise SystemExit(f"No runnable BPE entries found in {config_path}")
+        bpe_suite = benchmark_runner.run_bpe_suite(
+            sequences,
+            base_vocab=args.bpe_base_vocab,
+            merges=args.bpe_merges,
+            seed=args.seed,
+            log_every=args.bpe_log_every,
+            run_configs=run_specs,
+        )
+        runs = bpe_suite.get("runs", []) if isinstance(bpe_suite, dict) else []
+        if not runs:
+            raise SystemExit(f"BPE suite {config_path} did not produce any runs")
+        bpe = runs[0]
+    else:
+        bpe = benchmark_runner.run_bpe_benchmark(
+            sequences,
+            base_vocab=args.bpe_base_vocab,
+            merges=args.bpe_merges,
+            batch_size=args.bpe_batch_size,
+            device=args.device,
+            seed=args.seed,
+            log_every=args.bpe_log_every,
+        )
     unigram = benchmark_runner.run_unigram_benchmark(
         sequences,
         base_vocab=args.unigram_base_vocab,
@@ -230,7 +249,7 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
         device=args.device,
         seed=args.seed,
     )
-    print(benchmark_runner.emit_benchmark_summary(corpus, bpe, unigram))
+    print(benchmark_runner.emit_benchmark_summary(corpus, bpe, unigram, bpe_suite))
     # Persist full benchmark metadata so checkpointing infrastructure can re-use
     # the exact same corpora, hyper-parameters, and timing metrics in later
     # automation runs.
@@ -255,6 +274,7 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
         },
         bpe=bpe,
         unigram=unigram,
+        bpe_runs=bpe_suite,
     )
     print(f"Saved benchmark metadata → {output_path}")
 
@@ -706,6 +726,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     benchmark.add_argument(
         "--bpe-log-every", type=int, default=250, help="Logging cadence for BPE trainer"
+    )
+    benchmark.add_argument(
+        "--bpe-config",
+        type=str,
+        default=None,
+        help="Optional JSON config describing heterogeneous BPE benchmark runs",
     )
     benchmark.add_argument(
         "--unigram-base-vocab",

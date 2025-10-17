@@ -59,6 +59,44 @@ Each rank must contribute identically shaped tensors to the reduction; the
 trainer handles padding internally, so no additional user code is required
 beyond the distributed initialization.
 
+### Heterogeneous GPU scaling
+
+The benchmarking harness now accepts JSON configuration files that enumerate
+multiple BPE runs with per-run device lists and scaling expectations. Invoke the
+benchmark CLI with `--bpe-config` to sweep single- and multi-GPU combinations in
+one shot:
+
+```bash
+PYTORCH_JIT=0 python main.py benchmark \
+  --synthetic-docs 4 \
+  --synthetic-min-len 1024 \
+  --synthetic-max-len 2048 \
+  --synthetic-vocab 256 \
+  --bpe-merges 512 \
+  --bpe-batch-size 1024 \
+  --bpe-config benchmarks/configs/heterogeneous_example.json \
+  --unigram-batch-size 1024 \
+  --unigram-vocab 1024 \
+  --unigram-epochs 2 \
+  --output-dir artifacts/benchmarks
+```
+
+Each entry in `benchmarks/configs/heterogeneous_example.json` names the run,
+batch size, participating devices, and (optionally) device weights used when
+computing scaling efficiency.【F:benchmarks/configs/heterogeneous_example.json†L1-L14】
+During serialization the harness records the observed tokens/sec for every
+configuration, expected throughput based on the baseline run and weights, and a
+boolean flag indicating whether the efficiency meets the ≥88 % target.
+
+The sample output in `benchmarks/samples/heterogeneous_benchmark_sample.json`
+shows a two-run sweep (single `cuda:0` and a heterogeneous `cuda:0`/`cuda:1`
+pair). The heterogeneous run delivered ~9,000 tokens/sec against a 9,830
+tokens/sec expectation, yielding ~91.5 % scaling and satisfying the threshold.
+【F:benchmarks/samples/heterogeneous_benchmark_sample.json†L97-L150】
+These JSON artifacts are checked into the repository so CI can assert that the
+schema stays stable and that the scaling metric remains above the target via a
+lightweight unit test.【F:tests/test_benchmark_config.py†L1-L25】
+
 ### `--dist` runtime workflow
 
 The new distributed runtime wraps the trainer in a lease-based scheduler so
