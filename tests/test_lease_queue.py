@@ -88,6 +88,7 @@ def test_state_dict_roundtrip() -> None:
     assert snap["min_lease_size"] == 1
     assert snap["max_active_leases"] == 2
     assert snap.get("idle_metrics") == {}
+    assert snap["rank_heartbeats"] and set(snap["rank_heartbeats"]) == {1}
     assert "records" in snap["inflight"][1]
     assert isinstance(snap["inflight"][1]["records"], list)
 
@@ -197,6 +198,7 @@ def test_timed_out_leases_requeue_and_are_reattributed() -> None:
     with notary._lock:  # type: ignore[attr-defined]
         queue = notary._inflight[1]  # type: ignore[attr-defined]
         queue[0].last_heartbeat = heartbeat_0 + ttl / 2
+        notary._rank_heartbeats[1] = heartbeat_0 + ttl / 2  # type: ignore[attr-defined]
 
     timed_out = notary.check_timeouts(now=heartbeat_0 + ttl + 0.01)
     assert timed_out == {0: (0, 3)}
@@ -205,6 +207,29 @@ def test_timed_out_leases_requeue_and_are_reattributed() -> None:
     assert 0 not in state_after["inflight"]
     assert state_after["pending_requeue"] and state_after["pending_requeue"][0] == (0, 3)
     assert 1 in state_after["inflight"]
+    assert 1 in state_after["rank_heartbeats"]
+
+
+def test_rank_heartbeat_timeout_requeues_all_active_leases() -> None:
+    ttl = 0.25
+    notary = LeaseNotary(total_chunks=6, lease_ttl=ttl, max_active_leases=2)
+
+    lease_a = notary.grant_lease(rank=0, preferred_size=2)
+    lease_b = notary.grant_lease(rank=0, preferred_size=2)
+    assert lease_a == (0, 2)
+    assert lease_b == (2, 4)
+
+    with notary._lock:  # type: ignore[attr-defined]
+        stale = notary._rank_heartbeats[0] - (ttl + 0.1)  # type: ignore[attr-defined]
+        notary._rank_heartbeats[0] = stale  # type: ignore[attr-defined]
+
+    timed_out = notary.check_timeouts(now=stale + ttl + 0.05)
+    assert timed_out == {0: lease_a}
+
+    state = notary.state_dict()
+    assert 0 not in state["inflight"]
+    assert 0 not in state["rank_heartbeats"]
+    assert sorted(state["pending_requeue"]) == sorted([lease_a, lease_b])
 
 
 def test_grant_lease_respects_weights_and_bounds() -> None:

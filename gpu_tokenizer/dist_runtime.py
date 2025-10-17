@@ -1120,6 +1120,8 @@ def _worker_entry(rank: int, config: DistributedLaunchConfig, cli_args: Sequence
     shutdown_state = {"triggered": False}
     rebalance_thread: Optional[threading.Thread] = None
     rebalance_stop: Optional[threading.Event] = None
+    heartbeat_thread: Optional[threading.Thread] = None
+    heartbeat_stop = threading.Event()
 
     def _initiate_shutdown(reason: str) -> None:
         if shutdown_state["triggered"]:
@@ -1129,6 +1131,9 @@ def _worker_entry(rank: int, config: DistributedLaunchConfig, cli_args: Sequence
             rebalance_stop.set()
         if rebalance_thread is not None and rebalance_thread.is_alive():
             rebalance_thread.join(timeout=5.0)
+        heartbeat_stop.set()
+        if heartbeat_thread is not None and heartbeat_thread.is_alive():
+            heartbeat_thread.join(timeout=5.0)
         if lease_client is not None:
             with contextlib.suppress(Exception):
                 lease_client.requeue_outstanding()
@@ -1201,6 +1206,59 @@ def _worker_entry(rank: int, config: DistributedLaunchConfig, cli_args: Sequence
             )
             rebalance_thread.start()
 
+        def _heartbeat_loop() -> None:
+            interval = 2.0
+            tensor: Optional["torch.Tensor"] = None
+            while not heartbeat_stop.is_set():
+                start = time.monotonic()
+                try:
+                    if lease_client is not None:
+                        try:
+                            lease_client.heartbeat()
+                        except KeyError:
+                            pass
+                    if (
+                        dist is not None
+                        and dist.is_available()
+                        and dist.is_initialized()
+                        and config.world_size > 1
+                    ):
+                        if torch is not None:
+                            device_for_ping = device
+                            if tensor is None:
+                                with torch.no_grad():
+                                    tensor = torch.zeros(1, device=device_for_ping, dtype=torch.float32)
+                            with torch.no_grad():
+                                tensor.fill_(float(rank))
+                            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+                except Exception:
+                    worker_logger.debug(
+                        "worker_heartbeat_failed",
+                        extra={"worker_rank": rank},
+                        exc_info=True,
+                    )
+                elapsed = time.monotonic() - start
+                remaining = max(0.0, interval - elapsed)
+                if heartbeat_stop.wait(remaining):
+                    break
+
+        should_start_heartbeat = (
+            lease_client is not None
+            or (
+                dist is not None
+                and dist.is_available()
+                and dist.is_initialized()
+                and config.world_size > 1
+            )
+        )
+        if should_start_heartbeat:
+            heartbeat_thread = threading.Thread(
+                name=f"heartbeat-rank{rank}",
+                target=_heartbeat_loop,
+                daemon=True,
+            )
+            heartbeat_thread.start()
+
         worker_logger.info(
             "worker_ready",
             extra={
@@ -1225,6 +1283,9 @@ def _worker_entry(rank: int, config: DistributedLaunchConfig, cli_args: Sequence
             rebalance_stop.set()
         if rebalance_thread is not None and rebalance_thread.is_alive():
             rebalance_thread.join(timeout=5.0)
+        heartbeat_stop.set()
+        if heartbeat_thread is not None and heartbeat_thread.is_alive():
+            heartbeat_thread.join(timeout=5.0)
         _restore_signal_handlers(worker_previous_handlers)
 
 
