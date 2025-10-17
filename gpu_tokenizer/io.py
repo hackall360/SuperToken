@@ -14,7 +14,7 @@ import time
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, AsyncIterator, Callable, Iterable, Iterator, Optional
+from typing import TYPE_CHECKING, AsyncIterator, Callable, Iterable, Iterator, Mapping, Optional
 
 try:  # pragma: no cover - optional dependency
     import zstandard as _zstd  # type: ignore
@@ -302,6 +302,8 @@ class DecodedShard:
     path: Path
     view: memoryview
     release_fn: Callable[[], None]
+    start_offset: int = 0
+    end_offset: Optional[int] = None
 
     def release(self) -> None:
         self.release_fn()
@@ -384,6 +386,8 @@ class CorpusStreamer(AbstractContextManager["CorpusStreamer"]):
         self._threads: list[threading.Thread] = []
         self._stopped = threading.Event()
         self._autoscaler = autoscaler
+        self._offset_lock = threading.Lock()
+        self._offsets: dict[Path, int] = {path: 0 for path in self.paths}
         if autoscaler is not None and hasattr(autoscaler, "register_feedback_listener"):
             try:
                 autoscaler.register_feedback_listener(self._handle_autoscaler_feedback)
@@ -512,21 +516,38 @@ class CorpusStreamer(AbstractContextManager["CorpusStreamer"]):
             shard = MemoryMappedShard(path)
             shard.__enter__()
             try:
-                view = shard.view()
+                offset = self._current_offset(path)
+                base_view = shard.view()
+                total_length = len(base_view)
+                if offset >= total_length:
+                    self._mark_offset(path, total_length)
+                    shard.close()
+                    continue
                 if self.compression == "none":
+                    view = base_view[offset:] if offset > 0 else base_view
                     release_fn = shard.close
-                    decoded = DecodedShard(path=path, view=view, release_fn=release_fn)
                 elif self.compression == "zstd":
-                    decompressed, release_fn = _decompress_zstd(view, self._buffer_pool)
+                    decompressed, release_fn = _decompress_zstd(base_view, self._buffer_pool)
                     shard.close()
-                    decoded = DecodedShard(path=path, view=decompressed, release_fn=release_fn)
+                    total_length = len(decompressed)
+                    view = decompressed[offset:] if offset > 0 else decompressed
                 elif self.compression == "lz4":
-                    decompressed, release_fn = _decompress_lz4(view, self._buffer_pool)
+                    decompressed, release_fn = _decompress_lz4(base_view, self._buffer_pool)
                     shard.close()
-                    decoded = DecodedShard(path=path, view=decompressed, release_fn=release_fn)
+                    total_length = len(decompressed)
+                    view = decompressed[offset:] if offset > 0 else decompressed
                 else:
                     shard.close()
                     raise ValueError(f"Unsupported compression type: {self.compression}")
+                end_offset = min(total_length, offset + len(view))
+                release = self._wrap_release(path, release_fn, end_offset)
+                decoded = DecodedShard(
+                    path=path,
+                    view=view,
+                    release_fn=release,
+                    start_offset=offset,
+                    end_offset=end_offset,
+                )
                 self._backpressure.wait_for_slot(self._queue)
                 if self._stopped.is_set():
                     decoded.release()
@@ -559,3 +580,58 @@ class CorpusStreamer(AbstractContextManager["CorpusStreamer"]):
 
     def queue_depth(self) -> int:
         return self._queue.qsize()
+
+    def snapshot_offsets(self) -> dict[str, int]:
+        """Return a JSON-friendly snapshot of shard read offsets."""
+
+        with self._offset_lock:
+            return {os.fspath(path): int(offset) for path, offset in self._offsets.items()}
+
+    def restore_offsets(self, offsets: Mapping[str, object]) -> None:
+        """Restore shard offsets from *offsets* mapping."""
+
+        if not offsets:
+            return
+        normalised: dict[str, int] = {}
+        for key, value in offsets.items():
+            try:
+                normalised[str(Path(key))] = max(0, int(value))
+            except (TypeError, ValueError):
+                continue
+        if not normalised:
+            return
+        with self._offset_lock:
+            for path in self.paths:
+                lookup_keys = {str(path)}
+                try:
+                    lookup_keys.add(str(path.resolve()))
+                except Exception:  # pragma: no cover - defensive fallback
+                    pass
+                for candidate in lookup_keys:
+                    if candidate in normalised:
+                        self._offsets[path] = normalised[candidate]
+                        break
+
+    def _current_offset(self, path: Path) -> int:
+        with self._offset_lock:
+            return int(self._offsets.get(path, 0))
+
+    def _mark_offset(self, path: Path, offset: int) -> None:
+        with self._offset_lock:
+            self._offsets[path] = max(0, offset)
+
+    def _wrap_release(
+        self, path: Path, release_fn: Callable[[], None], final_offset: int
+    ) -> Callable[[], None]:
+        def _release() -> None:
+            exc: Optional[BaseException] = None
+            try:
+                release_fn()
+            except BaseException as err:  # pragma: no cover - defensive
+                exc = err
+            finally:
+                self._mark_offset(path, final_offset)
+            if exc is not None:
+                raise exc
+
+        return _release

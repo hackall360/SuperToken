@@ -504,7 +504,9 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
 
         return resume_bs, _SerializedIterable()
 
-    def _build_streamer() -> CorpusStreamer:
+    def _build_streamer(
+        *, restore_offsets: Mapping[str, object] | None = None
+    ) -> CorpusStreamer:
         streamer = CorpusStreamer(
             data_files,
             compression=args.compression,
@@ -513,6 +515,8 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
             autoscaler=autoscaler,
             prefetch_jitter=max(0.0, float(getattr(args, "prefetch_jitter", 0.0))),
         )
+        if restore_offsets:
+            streamer.restore_offsets(restore_offsets)
         streamer.start()
         return streamer
 
@@ -554,6 +558,7 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
 
+        config_errors: list[str] = []
         config_warnings: list[str] = []
         target_merges = model_section.get("target_merges")
         try:
@@ -565,7 +570,7 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
             if isinstance(merges_list, list):
                 target_merges_int = len(merges_list)
         if target_merges_int is not None and target_merges_int != int(args.merges):
-            config_warnings.append(
+            config_errors.append(
                 "CLI --merges does not match checkpoint target_merges"
             )
         base_vocab_val = model_section.get("base_vocab")
@@ -579,8 +584,13 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
             )
         for warning in config_warnings:
             print(f"[checkpoint] Warning: {warning}", file=sys.stderr)
+        if config_errors:
+            for error in config_errors:
+                print(f"[checkpoint] Error: {error}", file=sys.stderr)
+            raise SystemExit("Checkpoint configuration mismatch")
 
         dataset_meta = checkpoint_payload.dataset
+        resume_stream_state: dict[str, object] | None = None
         serialized_batches = dataset_meta.get("batches") if isinstance(dataset_meta, Mapping) else None
         if serialized_batches is None:
             serialized_batches = checkpoint_payload.trainer.get("batches")
@@ -592,17 +602,45 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
             if restored_bs > 0:
                 batch_size = restored_bs
             resume_batches = restored_iter
+        if isinstance(dataset_meta, Mapping):
+            stream_offsets = dataset_meta.get("stream_offsets")
+            if isinstance(stream_offsets, Mapping) and stream_offsets:
+                resume_stream_state = {"stream_offsets": dict(stream_offsets)}
+            stream_batch_size = dataset_meta.get("stream_batch_size")
+            try:
+                stream_bs_val = (
+                    int(stream_batch_size) if stream_batch_size is not None else None
+                )
+            except (TypeError, ValueError):
+                stream_bs_val = None
+            if stream_bs_val and stream_bs_val > 0:
+                if resume_stream_state is None:
+                    resume_stream_state = {}
+                resume_stream_state["batch_size"] = stream_bs_val
 
     streamer: CorpusStreamer | None = None
+    dataset_tracker: StreamingPackedBatcher | None = None
     if resume_batches is None:
-        streamer = _build_streamer()
+        restore_offsets = None
+        if resume_stream_state and isinstance(resume_stream_state.get("stream_offsets"), Mapping):
+            restore_offsets = resume_stream_state.get("stream_offsets")
+        streamer = _build_streamer(restore_offsets=restore_offsets)
         batches: Iterable[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = StreamingPackedBatcher(
             streamer,
             packer.encode_view,
             batch_size=batch_size,
         )
+        dataset_tracker = batches if isinstance(batches, StreamingPackedBatcher) else None
+        if dataset_tracker and resume_stream_state:
+            dataset_tracker.load_stream_state(resume_stream_state)
+            restored_offsets = resume_stream_state.get("stream_offsets")
+            if isinstance(restored_offsets, Mapping) and restored_offsets:
+                print(
+                    f"[checkpoint] Restored dataset cursor for {len(restored_offsets)} shard(s)"
+                )
     else:
         batches = resume_batches
+        dataset_tracker = None
     current_batch_size = batch_size
 
     autoscaler_windows: list[dict[str, object]] = []
@@ -613,7 +651,7 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
             autoscaler_windows.append(dict(window))
 
     def _handle_batch_resize(new_bs: int) -> None:
-        nonlocal batches, current_batch_size, streamer
+        nonlocal batches, current_batch_size, streamer, dataset_tracker
         if new_bs <= 0 or new_bs == current_batch_size:
             return
         current_batch_size = new_bs
@@ -628,6 +666,7 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
             packer.encode_view,
             batch_size=new_bs,
         )
+        dataset_tracker = batches
 
     try:
         if args.checkpoint_dir:
@@ -649,6 +688,7 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
             ),
             checkpoint_dir=args.checkpoint_dir,
             resume_state=resume_state,
+            dataset_state=dataset_tracker,
         )
     finally:
         if streamer is not None:

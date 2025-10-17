@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Iterable, Iterator, List, Sequence, Tuple
+from typing import Callable, Iterable, Iterator, List, Mapping, Sequence, Tuple
 
 import random
 
@@ -121,6 +121,7 @@ class StreamingPackedBatcher:
         self._storage_width = 1
         self._length_dtype = length_storage_dtype(self._storage_width)
         self._buffers = [self._allocate_buffer() for _ in range(2)]
+        self._stream_state: dict[str, object] = {}
 
     def _allocate_buffer(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         tokens = torch.full(
@@ -193,3 +194,34 @@ class StreamingPackedBatcher:
         finally:
             for shard in shards:
                 shard.release()
+
+    # ------------------------------------------------------------------
+    # Streaming state helpers
+    def stream_state_dict(self) -> dict[str, object]:
+        """Return a serialisable snapshot of the streaming cursor."""
+
+        state = {
+            "stream_offsets": self.streamer.snapshot_offsets(),
+            "batch_size": int(self.bs),
+        }
+        self._stream_state = state
+        return dict(state)
+
+    def load_stream_state(self, state: Mapping[str, object]) -> None:
+        """Restore the streaming cursor from *state*."""
+
+        if not isinstance(state, Mapping):
+            return
+        offsets = state.get("stream_offsets")
+        if isinstance(offsets, Mapping):
+            self.streamer.restore_offsets(offsets)
+        batch_size = state.get("batch_size")
+        try:
+            batch_size_int = int(batch_size) if batch_size is not None else None
+        except (TypeError, ValueError):
+            batch_size_int = None
+        if batch_size_int and batch_size_int > 0 and batch_size_int != self.bs:
+            self.bs = batch_size_int
+            self._storage_width = 1
+            self._length_dtype = length_storage_dtype(self._storage_width)
+            self._buffers = [self._allocate_buffer() for _ in range(2)]
