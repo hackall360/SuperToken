@@ -1,0 +1,199 @@
+{
+  "timestamp": "20250101T120000Z",
+  "config": {
+    "seed": 1337,
+    "device": null,
+    "synthetic": {
+      "documents": 4,
+      "min_length": 1024,
+      "max_length": 2048,
+      "vocab_size": 256
+    },
+    "data": [],
+    "max_real_docs": null,
+    "bpe": {
+      "base_vocab": 256,
+      "merges": 512,
+      "batch_size": 1024,
+      "device": "cuda:0",
+      "log_every": 250,
+      "devices": ["cuda:0"],
+      "overlap": true
+    },
+    "unigram": {
+      "base_vocab": 256,
+      "vocab_size": 1024,
+      "max_subword_len": 8,
+      "batch_size": 1024,
+      "epochs": 2,
+      "device": "cuda:0"
+    }
+  },
+  "corpus": {
+    "sequences": 8,
+    "tokens": 16384,
+    "max_length": 2048,
+    "sources": [
+      {
+        "type": "synthetic",
+        "documents": 4,
+        "min_length": 1024,
+        "max_length": 2048,
+        "vocab_size": 256
+      }
+    ]
+  },
+  "bpe": {
+    "config": {
+      "base_vocab": 256,
+      "merges": 512,
+      "batch_size": 1024,
+      "device": "cuda:0",
+      "log_every": 250,
+      "devices": ["cuda:0"],
+      "overlap": true
+    },
+    "wall_time_s": 3.20,
+    "result": {
+      "base_vocab": 256,
+      "vocab_size": 768,
+      "merges": [[65, 66], [66, 67]],
+      "warm_start": null,
+      "transfer_metrics": {
+        "bytes_h2d": 0,
+        "bytes_d2h": 0,
+        "h2d_events": 0,
+        "d2h_events": 0,
+        "merge_stats": [],
+        "sync_intervals": [],
+        "per_device": {},
+        "per_stage": {},
+        "avg_d2h_bytes_per_merge": 0.0,
+        "cpu_fallback": {"batches": 0, "ratio": 0.0}
+      },
+      "telemetry": {
+        "timings": {},
+        "events": [],
+        "host_sync_events": [],
+        "device_snapshots": [],
+        "autoscaler": {},
+        "iteration_metrics": {"ewma": {}, "iterations": []}
+      }
+    },
+    "overlap_enabled": true,
+    "tokens_processed": 16384,
+    "tokens_per_s": 5120.0,
+    "name": "single_cuda0",
+    "scaling": null
+  },
+  "unigram": {
+    "config": {
+      "base_vocab": 256,
+      "vocab_size": 1024,
+      "max_subword_len": 8,
+      "batch_size": 1024,
+      "epochs": 2,
+      "device": "cuda:0"
+    },
+    "wall_time_s": 4.80,
+    "epochs": [
+      {"epoch": 1, "loss": 1.23, "vocab": 768},
+      {"epoch": 2, "loss": 1.11, "vocab": 1024}
+    ]
+  },
+  "bpe_runs": [
+    {
+      "config": {
+        "base_vocab": 256,
+        "merges": 512,
+        "batch_size": 1024,
+        "device": "cuda:0",
+        "log_every": 250,
+        "devices": ["cuda:0"],
+        "overlap": true
+      },
+      "wall_time_s": 3.20,
+      "result": {
+        "base_vocab": 256,
+        "vocab_size": 768,
+        "merges": [[65, 66], [66, 67]],
+        "warm_start": null,
+        "transfer_metrics": {
+          "bytes_h2d": 0,
+          "bytes_d2h": 0,
+          "h2d_events": 0,
+          "d2h_events": 0,
+          "merge_stats": [],
+          "sync_intervals": [],
+          "per_device": {},
+          "per_stage": {},
+          "avg_d2h_bytes_per_merge": 0.0,
+          "cpu_fallback": {"batches": 0, "ratio": 0.0}
+        },
+        "telemetry": {
+          "timings": {},
+          "events": [],
+          "host_sync_events": [],
+          "device_snapshots": [],
+          "autoscaler": {},
+          "iteration_metrics": {"ewma": {}, "iterations": []}
+        }
+      },
+      "overlap_enabled": true,
+      "tokens_processed": 16384,
+      "tokens_per_s": 5120.0,
+      "name": "single_cuda0",
+      "scaling": null
+    },
+    {
+      "config": {
+        "base_vocab": 256,
+        "merges": 512,
+        "batch_size": 2048,
+        "device": "cuda:0",
+        "log_every": 250,
+        "devices": ["cuda:0", "cuda:1"],
+        "overlap": true
+      },
+      "wall_time_s": 1.82,
+      "result": {
+        "base_vocab": 256,
+        "vocab_size": 768,
+        "merges": [[65, 66], [66, 67]],
+        "warm_start": null,
+        "transfer_metrics": {
+          "bytes_h2d": 0,
+          "bytes_d2h": 0,
+          "h2d_events": 0,
+          "d2h_events": 0,
+          "merge_stats": [],
+          "sync_intervals": [],
+          "per_device": {},
+          "per_stage": {},
+          "avg_d2h_bytes_per_merge": 0.0,
+          "cpu_fallback": {"batches": 0, "ratio": 0.0}
+        },
+        "telemetry": {
+          "timings": {},
+          "events": [],
+          "host_sync_events": [],
+          "device_snapshots": [],
+          "autoscaler": {},
+          "iteration_metrics": {"ewma": {}, "iterations": []}
+        }
+      },
+      "overlap_enabled": true,
+      "tokens_processed": 16384,
+      "tokens_per_s": 9000.0,
+      "name": "cuda0_cuda1_hetero",
+      "scaling": {
+        "reference": "single_cuda0",
+        "device_weights": [1.0, 0.92],
+        "expected_tokens_per_s": 9830.08,
+        "efficiency": 0.915,
+        "target_efficiency": 0.88,
+        "meets_target": true
+      }
+    }
+  ]
+}
