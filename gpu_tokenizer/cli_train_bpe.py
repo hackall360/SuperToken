@@ -8,7 +8,7 @@ import os
 import sys
 import types
 from contextlib import ExitStack
-from typing import Iterable, Iterator, List, Sequence, Tuple
+from typing import Iterable, Iterator, List, Mapping, Sequence, Tuple
 
 if __package__:
     from . import dist_runtime  # pragma: no cover - package import path
@@ -36,6 +36,7 @@ else:  # pragma: no cover - support direct module loading in tests
             register_lease_client=lambda **kwargs: None,
             launch_training=lambda *args, **kwargs: None,
             DistributedLaunchConfig=lambda **kwargs: types.SimpleNamespace(**kwargs),
+            RendezvousSettings=lambda **kwargs: types.SimpleNamespace(**kwargs),
         )
 
 try:  # pragma: no cover - optional dependency for distributed launches
@@ -137,21 +138,119 @@ def _sanitize_cli_args(argv: Sequence[str] | None) -> List[str]:
     else:
         raw_args = argv
 
+    dist_flags = {
+        "--dist",
+        "--gpus",
+        "--dist-init-method",
+        "--dist-timeout",
+        "--dist-log-level",
+    }
     cleaned: List[str] = []
     skip_next = False
     for token in raw_args:
         if skip_next:
             skip_next = False
             continue
-        if token == "--dist":
-            continue
-        if token.startswith("--gpus"):
-            if token == "--gpus":
+        if token in dist_flags:
+            if token in {"--gpus", "--dist-init-method", "--dist-timeout", "--dist-log-level"}:
                 skip_next = True
+            continue
+        if any(token.startswith(prefix + "=") for prefix in dist_flags if prefix != "--dist"):
             continue
         cleaned.append(token)
 
     return cleaned
+
+
+def render_rank_metrics_table(snapshots: Sequence[Mapping[str, object]]) -> str:
+    """Return a formatted table summarising per-rank throughput metrics."""
+
+    aggregated: dict[int, tuple[float, float, float]] = {}
+    for snapshot in snapshots:
+        if not isinstance(snapshot, Mapping):
+            continue
+        per_rank = snapshot.get("per_rank")
+        if isinstance(per_rank, Mapping):
+            for rank_key, stats in per_rank.items():
+                try:
+                    rank_idx = int(rank_key)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(stats, Mapping):
+                    continue
+                tokens_val = stats.get("tokens_per_s", 0.0)
+                leases_val = stats.get("lease_per_s", 0.0)
+                samples_val = stats.get("samples", 0.0)
+                try:
+                    tokens = float(tokens_val if tokens_val is not None else 0.0)
+                except (TypeError, ValueError):
+                    tokens = 0.0
+                try:
+                    leases = float(leases_val if leases_val is not None else 0.0)
+                except (TypeError, ValueError):
+                    leases = 0.0
+                try:
+                    samples = float(samples_val if samples_val is not None else 0.0)
+                except (TypeError, ValueError):
+                    samples = 0.0
+                aggregated[rank_idx] = (tokens, leases, samples)
+
+        rank_val = snapshot.get("rank")
+        rank_idx: int | None
+        try:
+            rank_idx = int(rank_val) if rank_val is not None else None
+        except (TypeError, ValueError):
+            rank_idx = None
+        if rank_idx is None:
+            continue
+        tokens_val = snapshot.get("tokens_per_s", 0.0)
+        leases_val = snapshot.get("lease_per_s", 0.0)
+        samples_val = snapshot.get("samples", 0.0)
+        try:
+            tokens = float(tokens_val if tokens_val is not None else 0.0)
+        except (TypeError, ValueError):
+            tokens = 0.0
+        try:
+            leases = float(leases_val if leases_val is not None else 0.0)
+        except (TypeError, ValueError):
+            leases = 0.0
+        try:
+            samples = float(samples_val if samples_val is not None else 0.0)
+        except (TypeError, ValueError):
+            samples = 0.0
+        aggregated.setdefault(rank_idx, (tokens, leases, samples))
+
+    if not aggregated:
+        return ""
+
+    rows: list[list[str]] = []
+    for rank_idx in sorted(aggregated):
+        tokens, leases, samples = aggregated[rank_idx]
+        rows.append(
+            [
+                str(rank_idx),
+                f"{tokens:,.2f}",
+                f"{leases:,.2f}",
+                f"{samples:,.2f}",
+            ]
+        )
+
+    headers = ["Rank", "Tokens/s", "Leases/s", "Samples"]
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for idx, cell in enumerate(row):
+            widths[idx] = max(widths[idx], len(cell))
+
+    def _format_row(cells: Sequence[str]) -> str:
+        pieces = [f" {cell.rjust(widths[idx])} " for idx, cell in enumerate(cells)]
+        return "|" + "|".join(pieces) + "|"
+
+    border = "+" + "+".join("-" * (width + 2) for width in widths) + "+"
+    lines = [border, _format_row(headers), border]
+    for row in rows:
+        lines.append(_format_row(row))
+    lines.append(border)
+    return "\n".join(lines)
 
 
 def _load_sibling_attr(module: str, attr: str):
@@ -237,6 +336,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable the experimental distributed launcher",
     )
     parser.add_argument(
+        "--dist-init-method",
+        type=str,
+        default="env://",
+        help="Initialization method used for torch.distributed rendezvous",
+    )
+    parser.add_argument(
+        "--dist-timeout",
+        type=float,
+        default=300.0,
+        help="Timeout (in seconds) for distributed process group setup; non-positive disables",
+    )
+    parser.add_argument(
+        "--dist-log-level",
+        type=str,
+        default="info",
+        help="Logging level applied to distributed worker processes",
+    )
+    parser.add_argument(
         "--lease-min-inflight",
         dest="min_inflight",
         type=int,
@@ -296,9 +413,18 @@ def main(argv: Sequence[str] | None = None) -> None:
             parser.error(str(exc))
 
         world_size = len(device_ids)
+        timeout_seconds = None
+        if args.dist_timeout is not None and float(args.dist_timeout) > 0:
+            timeout_seconds = float(args.dist_timeout)
+        rendezvous = dist_runtime.RendezvousSettings(
+            init_method=args.dist_init_method,
+            timeout_seconds=timeout_seconds,
+        )
         config = dist_runtime.DistributedLaunchConfig(
             device_ids=tuple(device_ids),
             world_size=world_size,
+            log_level=args.dist_log_level,
+            rendezvous=rendezvous,
         )
         cli_args = _sanitize_cli_args(argv if argv is not None else sys.argv[1:])
         dist_runtime.launch_training(config, cli_args)
@@ -449,6 +575,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.log_stage_timings:
         trainer.metrics.enabled = True
 
+        metrics_tracker = trainer.metrics
+        metrics_rank = rank
+        metrics_world_size = world_size
+
         def _log_iteration(summary: dict[str, object]) -> None:
             if summary.get("kind") != "merge":
                 return
@@ -458,6 +588,46 @@ def main(argv: Sequence[str] | None = None) -> None:
             if (merge_idx - 1) % max(1, log_every) != 0:
                 return
             print(_format_iteration_summary(summary), flush=True)
+
+            if metrics_tracker is None or not getattr(metrics_tracker, "enabled", False):
+                return
+
+            try:
+                snapshot = metrics_tracker.snapshot()
+            except Exception:
+                return
+
+            snapshots: Sequence[Mapping[str, object]]
+            if (
+                dist is not None
+                and hasattr(dist, "gather_object")
+                and dist.is_available()
+                and dist.is_initialized()
+                and metrics_world_size > 1
+            ):
+                gather_list: List[Mapping[str, object] | None] | None
+                gather_list = [None] * metrics_world_size if metrics_rank == 0 else None
+                try:
+                    dist.gather_object(snapshot, gather_list, dst=0)  # type: ignore[arg-type]
+                except Exception:
+                    if metrics_rank != 0:
+                        return
+                    snapshots = [snapshot]
+                else:
+                    if metrics_rank != 0:
+                        return
+                    snapshots = [s for s in gather_list or [] if isinstance(s, Mapping)]
+                    if not snapshots:
+                        snapshots = [snapshot]
+            else:
+                snapshots = [snapshot]
+
+            if metrics_rank != 0:
+                return
+
+            table = render_rank_metrics_table(snapshots)
+            if table:
+                print(table, flush=True)
 
         iteration_callback = _log_iteration
     meta = trainer.fit(
