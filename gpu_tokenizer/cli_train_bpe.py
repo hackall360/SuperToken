@@ -12,6 +12,7 @@ from typing import Iterable, Iterator, List, Mapping, Sequence, Tuple
 
 if __package__:
     from . import dist_runtime  # pragma: no cover - package import path
+    from .dist import launcher as dist_launcher
 else:  # pragma: no cover - support direct module loading in tests
     import importlib.util
     from pathlib import Path
@@ -37,6 +38,47 @@ else:  # pragma: no cover - support direct module loading in tests
             launch_training=lambda *args, **kwargs: None,
             DistributedLaunchConfig=lambda **kwargs: types.SimpleNamespace(**kwargs),
             RendezvousSettings=lambda **kwargs: types.SimpleNamespace(**kwargs),
+        )
+
+    _launcher_spec = importlib.util.spec_from_file_location(
+        "gpu_tokenizer.dist.launcher",
+        Path(__file__).with_name("dist").joinpath("launcher.py"),
+    )
+    dist_launcher = None
+    if _launcher_spec is not None and _launcher_spec.loader is not None:
+        module = importlib.util.module_from_spec(_launcher_spec)
+        sys.modules.setdefault(_launcher_spec.name, module)
+        try:
+            _launcher_spec.loader.exec_module(module)
+            dist_launcher = module
+        except Exception:  # pragma: no cover - fallback when optional deps missing
+            sys.modules.pop(_launcher_spec.name, None)
+    if dist_launcher is None:  # pragma: no cover - exercised in CLI tests
+
+        class _StubLaunchHandle:
+            def __init__(self, factory, config):
+                context = types.SimpleNamespace(
+                    rank=getattr(config, "rank", 0),
+                    world_size=getattr(config, "world_size", 1),
+                    lease_client=None,
+                    device=None,
+                )
+                self.context = context
+                self.trainer = factory(context)
+
+            def __enter__(self):  # pragma: no cover - trivial in tests
+                return self
+
+            def __exit__(self, exc_type, exc, tb):  # pragma: no cover - trivial in tests
+                return False
+
+            def close(self):  # pragma: no cover - trivial in tests
+                return None
+
+        dist_launcher = types.SimpleNamespace(
+            RankLaunchConfig=lambda **kwargs: types.SimpleNamespace(**kwargs),
+            launch_rank=lambda factory, config: _StubLaunchHandle(factory, config),
+            get_histogram_reducer=lambda: lambda keys, counts: (keys, counts),
         )
 
 try:  # pragma: no cover - optional dependency for distributed launches
@@ -493,8 +535,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             f"Rank {rank} (world_size={world_size}) did not receive any input shards."
         )
 
-    lease_client = None
     chunk_slices: List[Tuple[int, int]] | None = None
+    lease_total_chunks = 0
+    job_id: str | None = None
     preferred_lease_size = max(1, int(os.environ.get("SUPERTOKEN_LEASE_SIZE", "1")))
     lease_prefetch_threshold = max(
         0, int(os.environ.get("SUPERTOKEN_LEASE_PREFETCH_THRESHOLD", "0"))
@@ -512,157 +555,192 @@ def main(argv: Sequence[str] | None = None) -> None:
             ewma=None,
         )
         job_id = dist_runtime.compute_lease_job_id(shard_paths)
-        lease_client = dist_runtime.register_lease_client(
-            job_id=job_id,
-            total_chunks=len(chunk_slices),
-            rank=rank,
-            world_size=world_size,
-            max_active_leases=max(2, lease_min_inflight),
-        )
+        lease_total_chunks = len(chunk_slices)
         os.environ.setdefault("SUPERTOKEN_LEASE_JOB", job_id)
         os.environ.setdefault(
-            "SUPERTOKEN_LEASE_TOTAL_CHUNKS", str(lease_client.total_chunks)
+            "SUPERTOKEN_LEASE_TOTAL_CHUNKS", str(max(0, lease_total_chunks))
         )
-
-    trainer_ref: dict[str, object | None] = {"value": None}
-
-    def _iter_sequences() -> Iterator[Iterator[int]]:
-        if lease_client is None or chunk_slices is None:
-            with ExitStack() as stack:
-                for path in shard_paths:
-                    shard = stack.enter_context(MemoryMappedShardType(path))
-                    yield packer.encode_shard(shard)
-            return
-
-        def _on_chunk(info) -> None:
-            trainer_obj = trainer_ref.get("value")
-            handler = getattr(trainer_obj, "handle_chunk_start", None)
-            if handler is None:
-                return
-            try:
-                handler(
-                    getattr(info, "chunk_id", -1),
-                    reprocessed=bool(getattr(info, "reprocessed", False)),
-                    attempts=getattr(info, "attempts", None),
-                )
-            except Exception:
-                pass
-
-        yield from dist_runtime.iterate_leased_shards(
-            shard_paths,
-            chunk_slices,
-            lease_client=lease_client,
-            encode_shard=packer.encode_shard,
-            shard_opener=MemoryMappedShardType,
-            preferred_lease_size=preferred_lease_size,
-            prefetch_threshold=lease_prefetch_threshold,
-            min_inflight=lease_min_inflight,
-            prefetch_slack_ms=lease_prefetch_slack_ms,
-            on_chunk_start=_on_chunk,
-        )
-
-    seqs: Iterable[Iterable[int]] = _iter_sequences()
 
     scaler = AutoScalerType(target_util=0.80)
     init_state, _init_window = scaler.suggest(token_bytes_per_example=8 * 1024)
     bs = min(args.bs, init_state.batch_size)
-    batcher = PackedBatcherType(seqs, batch_size=bs)
 
-    warm_plan = None
-    if args.warm_start_ngrams:
-        warm_plan = GPUBPETrainerType.precompute_warm_start_plan(
-            batcher, args.warm_start_ngrams
-        )
-        if warm_plan["merges"]:
-            print(
-                f"Seeding {len(warm_plan['merges'])} merges from top "
-                f"{warm_plan['requested_top_k']} bigrams"
+    trainer_ref: dict[str, object | None] = {"value": None}
+    trainer_artifacts: dict[str, object | None] = {"batcher": None, "warm_plan": None}
+
+    def _trainer_factory(context) -> object:
+        lease_client = getattr(context, "lease_client", None)
+
+        def _iter_sequences() -> Iterator[Iterator[int]]:
+            if lease_client is None or chunk_slices is None:
+                with ExitStack() as stack:
+                    for path in shard_paths:
+                        shard = stack.enter_context(MemoryMappedShardType(path))
+                        yield packer.encode_shard(shard)
+                return
+
+            def _on_chunk(info) -> None:
+                trainer_obj = trainer_ref.get("value")
+                handler = getattr(trainer_obj, "handle_chunk_start", None)
+                if handler is None:
+                    return
+                try:
+                    handler(
+                        getattr(info, "chunk_id", -1),
+                        reprocessed=bool(getattr(info, "reprocessed", False)),
+                        attempts=getattr(info, "attempts", None),
+                    )
+                except Exception:
+                    pass
+
+            yield from dist_runtime.iterate_leased_shards(
+                shard_paths,
+                chunk_slices,
+                lease_client=lease_client,
+                encode_shard=packer.encode_shard,
+                shard_opener=MemoryMappedShardType,
+                preferred_lease_size=preferred_lease_size,
+                prefetch_threshold=lease_prefetch_threshold,
+                min_inflight=lease_min_inflight,
+                prefetch_slack_ms=lease_prefetch_slack_ms,
+                on_chunk_start=_on_chunk,
             )
 
-    trainer = GPUBPETrainerType(
-        base_vocab=256,
-        merges=args.merges,
-        autoscaler=scaler,
-        warm_start_merges=(warm_plan["merges"] if warm_plan else None),
-        freeze_warm_start=args.freeze_warm_start,
+        seqs: Iterable[Iterable[int]] = _iter_sequences()
+        batcher = PackedBatcherType(seqs, batch_size=bs)
+        trainer_artifacts["batcher"] = batcher
+
+        warm_plan = None
+        if args.warm_start_ngrams:
+            warm_plan = GPUBPETrainerType.precompute_warm_start_plan(
+                batcher, args.warm_start_ngrams
+            )
+            trainer_artifacts["warm_plan"] = warm_plan
+            if warm_plan["merges"]:
+                print(
+                    f"Seeding {len(warm_plan['merges'])} merges from top "
+                    f"{warm_plan['requested_top_k']} bigrams"
+                )
+        else:
+            trainer_artifacts["warm_plan"] = None
+
+        trainer_obj = GPUBPETrainerType(
+            base_vocab=256,
+            merges=args.merges,
+            autoscaler=scaler,
+            warm_start_merges=(
+                warm_plan["merges"] if isinstance(warm_plan, Mapping) else None
+            ),
+            freeze_warm_start=args.freeze_warm_start,
+        )
+        trainer_ref["value"] = trainer_obj
+        return trainer_obj
+
+    rank_config = dist_launcher.RankLaunchConfig(
+        rank=rank,
+        world_size=world_size,
+        init_method=(args.dist_init_method if world_size > 1 else None),
+        timeout_seconds=(
+            float(args.dist_timeout)
+            if world_size > 1 and args.dist_timeout is not None
+            else None
+        ),
+        lease_job_id=job_id,
+        lease_total_chunks=lease_total_chunks,
+        lease_max_active_leases=(
+            max(2, lease_min_inflight) if world_size > 1 else None
+        ),
     )
-    trainer_ref["value"] = trainer
-    iteration_callback = None
-    if args.log_stage_timings:
-        metrics_registry = trainer.metrics()
-        throughput_tracker = None
-        if isinstance(metrics_registry, Mapping):
-            throughput_tracker = metrics_registry.get("throughput")
-            if throughput_tracker is None and metrics_registry:
-                throughput_tracker = next(iter(metrics_registry.values()))
-        if throughput_tracker is not None:
-            throughput_tracker.enabled = True
 
-        metrics_tracker = throughput_tracker
-        metrics_rank = rank
-        metrics_world_size = world_size
+    training_meta: dict[str, object] | None = None
+    with dist_launcher.launch_rank(_trainer_factory, config=rank_config) as launch:
+        trainer = launch.trainer
+        trainer_ref["value"] = trainer
+        batcher_obj = trainer_artifacts.get("batcher")
+        if batcher_obj is None:
+            raise RuntimeError("Failed to initialise training batcher")
+        warm_plan_obj = trainer_artifacts.get("warm_plan")
+        iteration_callback = None
+        if args.log_stage_timings:
+            metrics_registry = trainer.metrics()
+            throughput_tracker = None
+            if isinstance(metrics_registry, Mapping):
+                throughput_tracker = metrics_registry.get("throughput")
+                if throughput_tracker is None and metrics_registry:
+                    throughput_tracker = next(iter(metrics_registry.values()))
+            if throughput_tracker is not None:
+                throughput_tracker.enabled = True
 
-        def _log_iteration(summary: dict[str, object]) -> None:
-            if summary.get("kind") != "merge":
-                return
-            merge_idx = int(summary.get("merge", 0) or 0)
-            if merge_idx <= 0:
-                return
-            if (merge_idx - 1) % max(1, log_every) != 0:
-                return
-            print(_format_iteration_summary(summary), flush=True)
+            metrics_tracker = throughput_tracker
+            metrics_rank = rank
+            metrics_world_size = world_size
 
-            if metrics_tracker is None or not getattr(metrics_tracker, "enabled", False):
-                return
+            def _log_iteration(summary: dict[str, object]) -> None:
+                if summary.get("kind") != "merge":
+                    return
+                merge_idx = int(summary.get("merge", 0) or 0)
+                if merge_idx <= 0:
+                    return
+                if (merge_idx - 1) % max(1, log_every) != 0:
+                    return
+                print(_format_iteration_summary(summary), flush=True)
 
-            try:
-                snapshot = metrics_tracker.snapshot()
-            except Exception:
-                return
+                if metrics_tracker is None or not getattr(metrics_tracker, "enabled", False):
+                    return
 
-            snapshots: Sequence[Mapping[str, object]]
-            if (
-                dist is not None
-                and hasattr(dist, "gather_object")
-                and dist.is_available()
-                and dist.is_initialized()
-                and metrics_world_size > 1
-            ):
-                gather_list: List[Mapping[str, object] | None] | None
-                gather_list = [None] * metrics_world_size if metrics_rank == 0 else None
                 try:
-                    dist.gather_object(snapshot, gather_list, dst=0)  # type: ignore[arg-type]
+                    snapshot = metrics_tracker.snapshot()
                 except Exception:
-                    if metrics_rank != 0:
-                        return
-                    snapshots = [snapshot]
-                else:
-                    if metrics_rank != 0:
-                        return
-                    snapshots = [s for s in gather_list or [] if isinstance(s, Mapping)]
-                    if not snapshots:
+                    return
+
+                snapshots: Sequence[Mapping[str, object]]
+                if (
+                    dist is not None
+                    and hasattr(dist, "gather_object")
+                    and dist.is_available()
+                    and dist.is_initialized()
+                    and metrics_world_size > 1
+                ):
+                    gather_list: List[Mapping[str, object] | None] | None
+                    gather_list = [None] * metrics_world_size if metrics_rank == 0 else None
+                    try:
+                        dist.gather_object(snapshot, gather_list, dst=0)  # type: ignore[arg-type]
+                    except Exception:
+                        if metrics_rank != 0:
+                            return
                         snapshots = [snapshot]
-            else:
-                snapshots = [snapshot]
+                    else:
+                        if metrics_rank != 0:
+                            return
+                        snapshots = [
+                            s for s in gather_list or [] if isinstance(s, Mapping)
+                        ]
+                        if not snapshots:
+                            snapshots = [snapshot]
+                else:
+                    snapshots = [snapshot]
 
-            if metrics_rank != 0:
-                return
+                if metrics_rank != 0:
+                    return
 
-            table = render_rank_metrics_table(snapshots)
-            if table:
-                print(table, flush=True)
+                table = render_rank_metrics_table(snapshots)
+                if table:
+                    print(table, flush=True)
 
-        iteration_callback = _log_iteration
-    meta = trainer.fit(
-        batcher,
-        log_every=log_every,
-        warm_start_plan=warm_plan,
-        freeze_warm_start=args.freeze_warm_start if warm_plan else None,
-        overlap_transfers=not bool(getattr(args, "no_overlap", False)),
-        on_iteration_summary=iteration_callback,
-    )
-    trainer.save(args.out_dir)
-    print(meta)
+            iteration_callback = _log_iteration
+        training_meta = trainer.fit(
+            batcher_obj,
+            log_every=log_every,
+            warm_start_plan=warm_plan_obj,
+            freeze_warm_start=(
+                args.freeze_warm_start if warm_plan_obj else None
+            ),
+            overlap_transfers=not bool(getattr(args, "no_overlap", False)),
+            on_iteration_summary=iteration_callback,
+        )
+        trainer.save(args.out_dir)
+    if training_meta is not None:
+        print(training_meta)
 
 
 if __name__ == "__main__":
