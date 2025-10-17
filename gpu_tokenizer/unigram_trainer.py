@@ -6,7 +6,7 @@ import math
 import time
 from os import PathLike
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Sequence, Tuple, cast
 
 import torch
 
@@ -62,10 +62,14 @@ class GPUUnigramTrainer(BaseTrainer):
         self._vocab_trie_next: torch.Tensor | None = None
         self._vocab_trie_terminal: torch.Tensor | None = None
         self._piece_lens_tensor: torch.Tensor | None = None
+        self._trie_initialized = False
         self._cpu_piece_cache: List[torch.Tensor] | None = None
         self._metrics = TrainerMetricsEWMA(enabled=False)
         self.register_metrics_tracker("throughput", self._metrics)
         self.reset_rng(seed=seed, generator=generator)
+
+        if self.device == "cuda" and torch.cuda.is_available():
+            self._rebuild_vocab_trie()
 
     def _clone_generator(self, generator: torch.Generator) -> torch.Generator:
         cloned = torch.Generator(device=generator.device)
@@ -163,6 +167,8 @@ class GPUUnigramTrainer(BaseTrainer):
                     raise RuntimeError("torch tensor constructors unavailable") from exc
 
         self._mark_vocab_dirty()
+        if self.device == "cuda" and torch.cuda.is_available():
+            self._rebuild_vocab_trie()
         return {"vocab": len(self.id2piece)}
 
     def metrics(self) -> Mapping[str, TrainerMetricsEWMA]:
@@ -187,9 +193,11 @@ class GPUUnigramTrainer(BaseTrainer):
 
     def _mark_vocab_dirty(self) -> None:
         self._trie_dirty = True
-        self._vocab_trie_next = None
-        self._vocab_trie_terminal = None
-        self._piece_lens_tensor = None
+        self._trie_initialized = False
+        if self.device != "cuda":
+            self._vocab_trie_next = None
+            self._vocab_trie_terminal = None
+            self._piece_lens_tensor = None
         self._cpu_piece_cache = None
 
     def _extend_candidates(self, sequences: torch.Tensor) -> None:
@@ -199,6 +207,81 @@ class GPUUnigramTrainer(BaseTrainer):
             self._extend_candidates_gpu(sequences)
             return
         self._extend_candidates_cpu(sequences)
+
+    def _reset_device_trie(self) -> None:
+        if self.device != "cuda":
+            return
+        device = torch.device(self.device)
+        self._vocab_trie_next = torch.full((1, 256), -1, dtype=torch.int32, device=device)
+        self._vocab_trie_terminal = torch.full((1,), -1, dtype=torch.int32, device=device)
+        self._trie_initialized = True
+
+    def _append_piece_to_trie(self, piece: bytes, pid: int) -> None:
+        if self.device != "cuda":
+            return
+        if self._vocab_trie_next is None or self._vocab_trie_terminal is None:
+            self._reset_device_trie()
+        assert self._vocab_trie_next is not None
+        assert self._vocab_trie_terminal is not None
+        state = 0
+        for byte in piece:
+            next_state = int(self._vocab_trie_next[state, byte].item())
+            if next_state < 0:
+                next_state = int(self._vocab_trie_next.size(0))
+                pad_next = torch.full(
+                    (1, 256), -1, dtype=torch.int32, device=self.device
+                )
+                pad_term = torch.full((1,), -1, dtype=torch.int32, device=self.device)
+                self._vocab_trie_next = torch.cat((self._vocab_trie_next, pad_next), dim=0)
+                self._vocab_trie_terminal = torch.cat(
+                    (self._vocab_trie_terminal, pad_term), dim=0
+                )
+            self._vocab_trie_next[state, byte] = next_state
+            state = next_state
+        self._vocab_trie_terminal[state] = pid
+
+    def _rebuild_vocab_trie(self) -> None:
+        if self.device != "cuda":
+            return
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is required for GPU vocab trie construction")
+        self._reset_device_trie()
+        assert self._vocab_trie_next is not None
+        assert self._vocab_trie_terminal is not None
+        piece_lens = torch.empty(
+            (len(self.id2piece),), dtype=torch.int32, device=self.device
+        )
+        for pid in range(len(self.id2piece)):
+            piece = self.id2piece[pid]
+            piece_lens[pid] = len(piece)
+            if piece:
+                self._append_piece_to_trie(piece, pid)
+            else:
+                self._vocab_trie_terminal[0] = pid
+        self._piece_lens_tensor = piece_lens
+        self._trie_dirty = False
+
+    def _update_trie_after_extension(self, new_piece_ids: Sequence[int]) -> None:
+        if self.device != "cuda" or not new_piece_ids:
+            return
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is required for GPU vocab trie updates")
+        rebuilt = False
+        if self._vocab_trie_next is None or self._vocab_trie_terminal is None:
+            self._rebuild_vocab_trie()
+            rebuilt = True
+        if self._piece_lens_tensor is None:
+            self._rebuild_vocab_trie()
+            rebuilt = True
+        if rebuilt:
+            return
+        for pid in new_piece_ids:
+            piece = self.id2piece[pid]
+            self._append_piece_to_trie(piece, pid)
+            lens_val = torch.full((1,), len(piece), dtype=torch.int32, device=self.device)
+            self._piece_lens_tensor = torch.cat((self._piece_lens_tensor, lens_val), dim=0)
+        self._trie_dirty = False
+        self._trie_initialized = True
 
     def _extend_candidates_gpu(self, sequences: torch.Tensor) -> None:
         sequences = sequences.to(self.device)
@@ -294,6 +377,7 @@ class GPUUnigramTrainer(BaseTrainer):
         if counts.numel() == 0:
             return
         order = torch.argsort(counts, descending=True)
+        added_ids: List[int] = []
         for idx in order.tolist():
             cnt = int(counts[idx].item())
             if cnt <= 0:
@@ -304,11 +388,12 @@ class GPUUnigramTrainer(BaseTrainer):
             new_id = len(self.id2piece)
             self.id2piece[new_id] = piece
             self.piece2id[piece] = new_id
+            added_ids.append(new_id)
             if len(self.id2piece) >= self.target_vocab:
                 break
         V = len(self.id2piece)
         self.logp = torch.full((V,), -math.log(V), device=self.device)
-        self._mark_vocab_dirty()
+        self._update_trie_after_extension(added_ids)
 
     def _extend_candidates_cpu(self, sequences: torch.Tensor) -> None:
         sequences = sequences.to(dtype=torch.int64, device=torch.device("cpu"))
@@ -367,40 +452,16 @@ class GPUUnigramTrainer(BaseTrainer):
             return
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for GPU vocab trie construction")
-        if not self._trie_dirty and self._vocab_trie_next is not None:
+        if (
+            not self._trie_dirty
+            and self._vocab_trie_next is not None
+            and self._vocab_trie_terminal is not None
+            and self._piece_lens_tensor is not None
+            and self._trie_initialized
+            and self._piece_lens_tensor.size(0) == len(self.id2piece)
+        ):
             return
-        trie_children: List[dict[int, int]] = [dict()]
-        terminal_ids: List[int] = [-1]
-        for pid in range(len(self.id2piece)):
-            piece = self.id2piece[pid]
-            state = 0
-            for byte in piece:
-                nxt = trie_children[state].get(byte)
-                if nxt is None:
-                    nxt = len(trie_children)
-                    trie_children[state][byte] = nxt
-                    trie_children.append(dict())
-                    terminal_ids.append(-1)
-                state = nxt
-            terminal_ids[state] = pid
-        num_states = len(trie_children)
-        next_state = torch.full((num_states, 256), -1, dtype=torch.int32, device=self.device)
-        for state, mapping in enumerate(trie_children):
-            if not mapping:
-                continue
-            keys = torch.tensor(list(mapping.keys()), dtype=torch.long, device=self.device)
-            values = torch.tensor(list(mapping.values()), dtype=torch.int32, device=self.device)
-            next_state[state, keys] = values
-        terminal_tensor = torch.tensor(terminal_ids, dtype=torch.int32, device=self.device)
-        piece_lens = torch.tensor(
-            [len(self.id2piece[idx]) for idx in range(len(self.id2piece))],
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self._vocab_trie_next = next_state
-        self._vocab_trie_terminal = terminal_tensor
-        self._piece_lens_tensor = piece_lens
-        self._trie_dirty = False
+        self._rebuild_vocab_trie()
 
     def _ensure_cpu_piece_cache(self) -> None:
         if self._cpu_piece_cache is not None:
@@ -574,7 +635,10 @@ class GPUUnigramTrainer(BaseTrainer):
         smoothed = kept_counts + 1e-6
         probs = (smoothed / smoothed.sum()).clamp_min(1e-12)
         self.logp = probs.to(torch.device(self.device)).log()
-        self._mark_vocab_dirty()
+        if self.device == "cuda" and torch.cuda.is_available():
+            self._rebuild_vocab_trie()
+        else:
+            self._mark_vocab_dirty()
 
     def fit(
         self,
@@ -616,9 +680,20 @@ class GPUUnigramTrainer(BaseTrainer):
         sequence_count = 0
         forward_backward_time = 0.0
         accumulation_time = 0.0
+        staging_time = 0.0
         metrics_tracker = self._metrics
         metrics_tracker.reset()
         metrics_enabled = metrics_tracker.enabled
+
+        staged_batches: List[tuple[torch.Tensor, torch.Tensor]] | None = None
+        if self.device == "cuda" and torch.cuda.is_available() and batches:
+            staged_batches = []
+            for batch in batches:
+                t_stage = time.perf_counter()
+                tokens = batch.to(device=self.device, dtype=torch.int32)
+                valid = tokens >= 0
+                staged_batches.append((tokens, valid))
+                staging_time += time.perf_counter() - t_stage
 
         if batches:
             if len(self.id2piece) < self.target_vocab:
@@ -631,10 +706,19 @@ class GPUUnigramTrainer(BaseTrainer):
             V = len(self.id2piece)
             exp_counts = torch.zeros((V,), device=self.device, dtype=torch.float32)
 
-        for x in batches:
+        batch_iterable: Iterable[object]
+        if staged_batches is not None:
+            batch_iterable = staged_batches
+        else:
+            batch_iterable = batches
+
+        for payload in batch_iterable:
             batch_count += 1
-            x = x.to(self.device)
-            valid = x >= 0
+            if staged_batches is not None:
+                x, valid = payload  # type: ignore[assignment]
+            else:
+                x = cast(torch.Tensor, payload).to(self.device)
+                valid = x >= 0
             tokens_this_batch = int(valid.sum().item())
             token_count += tokens_this_batch
             sequence_count += int(x.shape[0])
@@ -669,6 +753,13 @@ class GPUUnigramTrainer(BaseTrainer):
             "sequences": sequence_count,
             "tokens": token_count,
         }
+
+        telemetry["staging_s"] = staging_time
+        if batch_count > 0:
+            telemetry["iteration_latency_pre_ms"] = staging_time / batch_count * 1000.0
+            telemetry["iteration_latency_post_ms"] = (
+                forward_backward_time / batch_count * 1000.0
+            )
 
         metrics_payload: dict[str, object] = {}
         for name, tracker in self.metrics().items():
