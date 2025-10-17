@@ -78,6 +78,7 @@ class LeaseNotary:
         self._max_lease_size = int(max_lease_size) if max_lease_size is not None else None
         self._max_active_leases = int(max_active_leases)
         self._idle_metrics: Dict[int, Dict[str, float]] = {}
+        self._rank_heartbeats: Dict[int, float] = {}
 
     @staticmethod
     def _now() -> float:
@@ -185,8 +186,10 @@ class LeaseNotary:
                 lease = Lease(start, end)
                 self._next_idx = end
 
-            record = _LeaseRecord(lease=lease, last_heartbeat=self._now())
+            now = self._now()
+            record = _LeaseRecord(lease=lease, last_heartbeat=now)
             queue.append(record)
+            self._rank_heartbeats[rank] = now
             return lease.as_tuple()
 
     def complete_lease(self, rank: int, start: int, end: int) -> None:
@@ -203,6 +206,7 @@ class LeaseNotary:
             queue.popleft()
             if not queue:
                 self._inflight.pop(rank, None)
+                self._rank_heartbeats.pop(rank, None)
 
     def requeue_lease(self, rank: int, start: int, end: int) -> None:
         """Return an inflight lease to the queue for reassignment."""
@@ -218,6 +222,7 @@ class LeaseNotary:
             queue.popleft()
             if not queue:
                 self._inflight.pop(rank, None)
+                self._rank_heartbeats.pop(rank, None)
             self._pending_requeue.appendleft(lease)
 
     def heartbeat(self, rank: int) -> float:
@@ -230,6 +235,7 @@ class LeaseNotary:
             new_ts = self._now()
             for record in queue:
                 record.last_heartbeat = new_ts
+            self._rank_heartbeats[rank] = new_ts
             return new_ts
 
     def check_timeouts(self, now: Optional[float] = None) -> Dict[int, Tuple[int, int]]:
@@ -255,12 +261,15 @@ class LeaseNotary:
             for rank, queue in self._inflight.items():
                 if not queue:
                     continue
-                oldest = queue[0]
-                if deadline - oldest.last_heartbeat >= self._lease_ttl:
+                last_seen = self._rank_heartbeats.get(rank)
+                if last_seen is None:
+                    last_seen = queue[0].last_heartbeat
+                if deadline - last_seen >= self._lease_ttl:
                     expired_ranks.append(rank)
 
             for rank in expired_ranks:
                 queue = self._inflight.pop(rank, deque())
+                self._rank_heartbeats.pop(rank, None)
                 if not queue:
                     continue
                 first = queue[0]
@@ -316,6 +325,7 @@ class LeaseNotary:
                 "max_lease_size": self._max_lease_size,
                 "max_active_leases": self._max_active_leases,
                 "idle_metrics": idle_metrics,
+                "rank_heartbeats": dict(self._rank_heartbeats),
             }
 
     def load_state_dict(self, state: Dict[str, object]) -> None:
@@ -342,6 +352,7 @@ class LeaseNotary:
         min_lease_size = int(state.get("min_lease_size", self._min_lease_size))
         raw_max_lease = state.get("max_lease_size", self._max_lease_size)
         max_active_leases = int(state.get("max_active_leases", self._max_active_leases))
+        rank_heartbeats_raw = state.get("rank_heartbeats", {})
 
         if total_chunks < 0:
             raise ValueError("total_chunks must be non-negative")
@@ -454,6 +465,16 @@ class LeaseNotary:
                     "samples": float(max(0, samples)),
                 }
 
+        rank_heartbeats: Dict[int, float] = {}
+        if isinstance(rank_heartbeats_raw, dict):
+            for raw_rank, raw_ts in rank_heartbeats_raw.items():
+                try:
+                    rank = int(raw_rank)
+                    ts = float(raw_ts)
+                except (TypeError, ValueError):
+                    continue
+                rank_heartbeats[rank] = ts
+
         with self._lock:
             self._total_chunks = total_chunks
             self._next_idx = next_idx
@@ -470,6 +491,7 @@ class LeaseNotary:
             self._max_lease_size = max_lease_size
             self._max_active_leases = max_active_leases
             self._idle_metrics = idle_metrics
+            self._rank_heartbeats = rank_heartbeats
 
     def update_rank_weights(self, weights: Dict[int, float]) -> None:
         """Persist normalised per-rank weights for adaptive lease sizing."""
