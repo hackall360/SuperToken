@@ -18,6 +18,7 @@ import gpu_tokenizer.utils as utils
 from gpu_tokenizer.utils import (
     _count_pairs_pytorch,
     aggregate_pair_keys,
+    compact_histogram,
     count_pairs,
     reduce_pair_histograms,
 )
@@ -178,6 +179,22 @@ def test_aggregate_pair_keys_preserves_large_counts():
     assert aggregated_counts.tolist() == [base, 5]
 
 
+def test_compact_histogram_merges_duplicate_pairs():
+    pair_keys = torch.tensor([[3, 7], [3, 7], [5, 9]], dtype=torch.long)
+    counts = torch.tensor([2, 4, 6], dtype=torch.int32)
+
+    packed_keys, packed_counts = compact_histogram(pair_keys, counts)
+
+    assert packed_keys.dtype == torch.long
+    assert packed_counts.dtype == torch.int64
+    assert packed_keys.tolist() == [(3 << 32) | 7, (5 << 32) | 9]
+    assert packed_counts.tolist() == [6, 6]
+
+    repacked_keys, repacked_counts = compact_histogram(packed_keys, packed_counts)
+    assert torch.equal(packed_keys, repacked_keys)
+    assert torch.equal(packed_counts, repacked_counts)
+
+
 def test_reduce_pair_histograms_preserves_large_counts():
     base = (1 << 31) + 7
     keys = torch.tensor([1, 1, 1, 2], dtype=torch.long)
@@ -227,7 +244,8 @@ def _distributed_reduce_worker(
 
     keys = keys_payload[rank].clone()
     counts = counts_payload[rank].clone()
-    reduced_keys, reduced_counts = reduce_pair_histograms(keys, counts)
+    compacted_keys, compacted_counts = compact_histogram(keys, counts)
+    reduced_keys, reduced_counts = reduce_pair_histograms(compacted_keys, compacted_counts)
 
     results[rank] = {
         "keys": reduced_keys.cpu().tolist(),
@@ -336,6 +354,35 @@ def test_reduce_pair_histograms_mixed_backend_topology():
     results = _run_reduce_pair_histograms(
         world_size, keys_payload, counts_payload, env_factory=_env
     )
+
+    expected_keys = reference_keys.tolist()
+    expected_counts = reference_counts.tolist()
+
+    for payload in results.values():
+        assert payload["keys"] == expected_keys
+        assert payload["counts"] == expected_counts
+        assert payload["dtype"] == "torch.int64"
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
+def test_reduce_pair_histograms_chunked_allreduce(monkeypatch):
+    monkeypatch.setenv("SUPERTOKEN_HISTOGRAM_CHUNK_SIZE", "2")
+    monkeypatch.setenv("SUPERTOKEN_HISTOGRAM_ALLREDUCE_CHUNKS", "2")
+
+    keys_payload = [
+        torch.tensor([1, 2, 3, 4], dtype=torch.long),
+        torch.tensor([2, 3, 5, 6], dtype=torch.long),
+        torch.tensor([1, 3, 4, 6], dtype=torch.long),
+    ]
+    counts_payload = [
+        torch.tensor([4, 1, 2, 3], dtype=torch.int64),
+        torch.tensor([3, 5, 2, 1], dtype=torch.int64),
+        torch.tensor([2, 4, 3, 6], dtype=torch.int64),
+    ]
+
+    world_size = len(keys_payload)
+    reference_keys, reference_counts = _reference_histogram(keys_payload, counts_payload)
+    results = _run_reduce_pair_histograms(world_size, keys_payload, counts_payload)
 
     expected_keys = reference_keys.tolist()
     expected_counts = reference_counts.tolist()

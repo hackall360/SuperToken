@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import logging
 import os
@@ -722,6 +722,115 @@ def aggregate_pair_keys(
     return aggregated_keys, aggregated_counts
 
 
+def compact_histogram(
+    keys: torch.Tensor, counts: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return packed pair keys with duplicate entries merged locally.
+
+    ``keys`` may either be a packed one-dimensional tensor containing encoded
+    pair identifiers or a two-dimensional tensor with shape ``(*, 2)`` holding
+    the left/right token ids directly.  ``counts`` must be broadcastable to the
+    shape of ``keys``' leading dimension.  The helper performs an in-rank
+    aggregation and returns packed ``torch.int64`` keys alongside summed
+    ``torch.int64`` counts sorted in ascending order.  The tensors are emitted on
+    the same device as the inputs so callers can forward them directly into
+    :func:`reduce_pair_histograms`.
+    """
+
+    if keys.dim() == 2:
+        if keys.size(1) != 2:
+            raise ValueError("compact_histogram expects keys with shape (*, 2)")
+        lhs = keys[:, 0].to(torch.long)
+        rhs = keys[:, 1].to(torch.long)
+        packed = (lhs << 32) | rhs
+    else:
+        packed = keys.to(torch.long)
+
+    counts64 = _ensure_counts_int64(counts, "compact_histogram input")
+    return aggregate_pair_keys(packed, counts64)
+
+
+def _parse_int(raw: Optional[str], default: int) -> int:
+    try:
+        if raw is None:
+            return default
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _resolve_histogram_chunk_params() -> Tuple[int, int]:
+    chunk_size = _parse_int(os.getenv("SUPERTOKEN_HISTOGRAM_CHUNK_SIZE"), 0)
+    accumulate = _parse_int(os.getenv("SUPERTOKEN_HISTOGRAM_ALLREDUCE_CHUNKS"), 1)
+    if accumulate < 1:
+        accumulate = 1
+    return chunk_size, accumulate
+
+
+def _flush_chunk_group(
+    chunks: Sequence[torch.Tensor],
+    lengths: Sequence[int],
+    offsets: Sequence[int],
+    output: torch.Tensor,
+    group: dist.ProcessGroup,
+) -> None:
+    if not chunks:
+        return
+
+    max_len = max(lengths)
+    if max_len <= 0:
+        return
+
+    padded = output.new_zeros((len(chunks), max_len))
+    for idx, chunk in enumerate(chunks):
+        padded[idx, : lengths[idx]] = chunk
+
+    dist.all_reduce(padded, op=dist.ReduceOp.SUM, group=group)
+
+    for idx, length in enumerate(lengths):
+        start = offsets[idx]
+        output[start : start + length] = padded[idx, :length]
+
+
+def _chunked_all_reduce(
+    counts: torch.Tensor,
+    group: dist.ProcessGroup,
+    chunk_size: int,
+    accumulate: int,
+) -> torch.Tensor:
+    length = counts.numel()
+    if length == 0:
+        return counts
+
+    if chunk_size <= 0 or chunk_size >= length:
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=group)
+        return counts
+
+    chunk_size = max(1, chunk_size)
+    accumulate = max(1, accumulate)
+
+    output = torch.empty_like(counts)
+    buffer: List[torch.Tensor] = []
+    lengths: List[int] = []
+    offsets: List[int] = []
+
+    for start in range(0, length, chunk_size):
+        end = min(start + chunk_size, length)
+        buffer.append(counts.narrow(0, start, end - start))
+        lengths.append(end - start)
+        offsets.append(start)
+        if len(buffer) >= accumulate:
+            _flush_chunk_group(buffer, lengths, offsets, output, group)
+            buffer.clear()
+            lengths.clear()
+            offsets.clear()
+
+    if buffer:
+        _flush_chunk_group(buffer, lengths, offsets, output, group)
+
+    return output
+
+
 def reduce_pair_histograms(
     keys: torch.Tensor, counts: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -737,6 +846,8 @@ def reduce_pair_histograms(
     """
 
     keys, counts = aggregate_pair_keys(keys, counts)
+
+    chunk_size, accumulate = _resolve_histogram_chunk_params()
 
     if not dist.is_available() or not dist.is_initialized():
         return keys, counts
@@ -788,8 +899,10 @@ def reduce_pair_histograms(
                 if keys.numel() > 0:
                     indices = torch.searchsorted(union_keys, keys)
                     local_counts64.index_add_(0, indices, counts.to(torch.int64))
-                dist.all_reduce(local_counts64, op=dist.ReduceOp.SUM, group=local_group)
-                node_keys, node_counts = aggregate_pair_keys(union_keys, local_counts64)
+                reduced_local = _chunked_all_reduce(
+                    local_counts64, local_group, chunk_size, accumulate
+                )
+                node_keys, node_counts = aggregate_pair_keys(union_keys, reduced_local)
     else:
         node_keys, node_counts = keys, counts
 
@@ -812,7 +925,9 @@ def reduce_pair_histograms(
             if node_keys_cpu.numel() > 0:
                 indices = torch.searchsorted(sorted_keys, node_keys_cpu)
                 reduced_counts64.index_add_(0, indices, node_counts_cpu.to(torch.int64))
-            dist.all_reduce(reduced_counts64, op=dist.ReduceOp.SUM, group=leader_group)
+            reduced_counts64 = _chunked_all_reduce(
+                reduced_counts64, leader_group, chunk_size, accumulate
+            )
             final_keys_cpu = sorted_keys
             final_counts_cpu = reduced_counts64
         else:
