@@ -382,6 +382,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             "SUPERTOKEN_LEASE_TOTAL_CHUNKS", str(lease_client.total_chunks)
         )
 
+    trainer_ref: dict[str, object | None] = {"value": None}
+
     def _iter_sequences() -> Iterator[Iterator[int]]:
         if lease_client is None or chunk_slices is None:
             with ExitStack() as stack:
@@ -389,6 +391,20 @@ def main(argv: Sequence[str] | None = None) -> None:
                     shard = stack.enter_context(MemoryMappedShardType(path))
                     yield packer.encode_shard(shard)
             return
+
+        def _on_chunk(info) -> None:
+            trainer_obj = trainer_ref.get("value")
+            handler = getattr(trainer_obj, "handle_chunk_start", None)
+            if handler is None:
+                return
+            try:
+                handler(
+                    getattr(info, "chunk_id", -1),
+                    reprocessed=bool(getattr(info, "reprocessed", False)),
+                    attempts=getattr(info, "attempts", None),
+                )
+            except Exception:
+                pass
 
         yield from dist_runtime.iterate_leased_shards(
             shard_paths,
@@ -400,6 +416,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             prefetch_threshold=lease_prefetch_threshold,
             min_inflight=lease_min_inflight,
             prefetch_slack_ms=lease_prefetch_slack_ms,
+            on_chunk_start=_on_chunk,
         )
 
     seqs: Iterable[Iterable[int]] = _iter_sequences()
@@ -427,6 +444,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         warm_start_merges=(warm_plan["merges"] if warm_plan else None),
         freeze_warm_start=args.freeze_warm_start,
     )
+    trainer_ref["value"] = trainer
     iteration_callback = None
     if args.log_stage_timings:
         trainer.metrics.enabled = True

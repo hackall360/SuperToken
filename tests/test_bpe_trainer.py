@@ -90,6 +90,67 @@ def _make_batch(seqs: list[list[int]]):
     return tokens, valid, lengths
 
 
+def test_handle_chunk_start_resets_cache_state():
+    trainer = GPUBPETrainer(base_vocab=4, merges=2, device="cpu")
+    trainer._enable_histogram_cache = True
+    trainer._hist_cache_valid = True
+    trainer._force_recount = False
+    trainer._cached_pair_keys = torch.tensor([1, 2], dtype=torch.long)
+    trainer._cached_pair_counts = torch.tensor([3, 4], dtype=torch.int64)
+    trainer._cached_pair_keys_per_device[torch.device("cpu")] = torch.tensor([5])
+    trainer._cached_pair_counts_per_device[torch.device("cpu")] = torch.tensor([6])
+
+    trainer.handle_chunk_start(7, reprocessed=False)
+    assert trainer._hist_cache_valid
+    assert not trainer._force_recount
+
+    trainer.handle_chunk_start(7, reprocessed=True, attempts=2)
+    assert trainer._last_chunk_id == 7
+    assert not trainer._hist_cache_valid
+    assert trainer._force_recount
+    assert trainer._cached_pair_keys.numel() == 0
+    assert trainer._cached_pair_counts.numel() == 0
+    assert trainer._cached_pair_keys_per_device == {}
+    assert trainer._cached_pair_counts_per_device == {}
+
+
+def test_reprocessing_chunk_matches_baseline_vocab_and_merges():
+    seqs = [
+        [1, 2, 1, 2, 3],
+        [1, 2, 4, 2, 4],
+        [2, 3, 2, 3, 2],
+    ]
+
+    baseline_batch = _make_batch(seqs)
+    retry_batch = _make_batch(seqs)
+
+    baseline_trainer = GPUBPETrainer(base_vocab=256, merges=4, device="cpu")
+    baseline_result = baseline_trainer.fit([baseline_batch], log_every=100)
+
+    assert baseline_result["merges"], "expected at least one merge to be learned"
+
+    retry_trainer = GPUBPETrainer(base_vocab=256, merges=4, device="cpu")
+    retry_trainer._enable_histogram_cache = True
+    retry_trainer._hist_cache_valid = True
+    retry_trainer._force_recount = False
+    retry_trainer._cached_pair_keys = torch.tensor([123, 456], dtype=torch.long)
+    retry_trainer._cached_pair_counts = torch.tensor([7, 8], dtype=torch.int64)
+    retry_trainer._cached_pair_keys_per_device[torch.device("cpu")] = torch.tensor(
+        [789], dtype=torch.long
+    )
+    retry_trainer._cached_pair_counts_per_device[torch.device("cpu")] = torch.tensor(
+        [10], dtype=torch.int64
+    )
+
+    retry_trainer.handle_chunk_start(5, reprocessed=True, attempts=2)
+
+    retry_result = retry_trainer.fit([retry_batch], log_every=100)
+
+    assert retry_result["vocab_size"] == baseline_result["vocab_size"]
+    assert retry_result["merges"] == baseline_result["merges"]
+    assert len(retry_trainer.merges) == len(set(retry_trainer.merges))
+
+
 def test_cpu_fastpath_pair_count_matches_baseline():
     seqs = [[1, 2, 3, 4], [4, 3, 2, 1]]
     tokens, valid, lengths = _make_batch(seqs)

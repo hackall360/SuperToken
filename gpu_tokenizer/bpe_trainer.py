@@ -1111,6 +1111,29 @@ class GPUBPETrainer:
         self._last_cpu_fallback_ratio: float = 0.0
         self._merge_step: int = 0
         self._overlap_enabled: bool = True
+        self._last_chunk_id: int | None = None
+
+    def handle_chunk_start(
+        self,
+        chunk_id: int,
+        *,
+        reprocessed: bool,
+        attempts: int | None = None,
+    ) -> None:
+        """Notify the trainer that a leased chunk is about to be processed."""
+
+        try:
+            self._last_chunk_id = int(chunk_id)
+        except (TypeError, ValueError):
+            self._last_chunk_id = None
+        if not reprocessed:
+            return
+        self._invalidate_hist_cache()
+        self._force_recount = True
+        self._cached_pair_keys = torch.empty((0,), dtype=torch.long)
+        self._cached_pair_counts = torch.empty((0,), dtype=torch.int64)
+        self._cached_pair_keys_per_device.clear()
+        self._cached_pair_counts_per_device.clear()
 
     # ------------------------------------------------------------------
     # Transfer accounting helpers
