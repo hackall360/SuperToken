@@ -73,9 +73,15 @@ class TrainerMetricsEWMA:
     _stage_windows: dict[str, deque[float]] = field(default_factory=dict)
     _copy_window: deque[float] = field(init=False, repr=False)
     _compute_window: deque[float] = field(init=False, repr=False)
+    _iteration_window: deque[float] = field(init=False, repr=False)
+    _reduction_window: deque[float] = field(init=False, repr=False)
+    _reduction_share: float | None = None
+    _reduction_share_latest: float | None = None
 
     _COPY_STAGES = frozenset({"h2d", "d2h"})
     _COMPUTE_STAGES = frozenset({"kernel", "reduction"})
+    _REDUCTION_GROW_THRESHOLD = 0.15
+    _REDUCTION_SHRINK_THRESHOLD = 0.08
 
     def __post_init__(self) -> None:
         # Clamp configuration to sensible defaults while tolerating bad inputs.
@@ -99,6 +105,10 @@ class TrainerMetricsEWMA:
         self.overlap_enabled = bool(self.overlap_enabled)
         self._copy_window = deque(maxlen=self.window_size)
         self._compute_window = deque(maxlen=self.window_size)
+        self._iteration_window = deque(maxlen=self.window_size)
+        self._reduction_window = deque(maxlen=self.window_size)
+        self._reduction_share = None
+        self._reduction_share_latest = None
 
     def reset(self) -> None:
         """Clear accumulated metrics."""
@@ -108,6 +118,10 @@ class TrainerMetricsEWMA:
         self._stage_windows.clear()
         self._copy_window = deque(maxlen=self.window_size)
         self._compute_window = deque(maxlen=self.window_size)
+        self._iteration_window = deque(maxlen=self.window_size)
+        self._reduction_window = deque(maxlen=self.window_size)
+        self._reduction_share = None
+        self._reduction_share_latest = None
 
     @property
     def tokens_per_s(self) -> float | None:
@@ -116,6 +130,12 @@ class TrainerMetricsEWMA:
     @property
     def lease_per_s(self) -> float | None:
         return self._lease_per_s
+
+    @property
+    def reduction_overhead(self) -> float | None:
+        """Return the EWMA of reduction overhead, if available."""
+
+        return self._reduction_share
 
     def record_stage(self, stage: str, duration_s: float) -> str:
         if not self.enabled or duration_s < 0:
@@ -149,6 +169,64 @@ class TrainerMetricsEWMA:
                     self.alpha * lease_rate
                     + (1.0 - self.alpha) * self._lease_per_s
                 )
+
+    def record_iteration(self, total_duration_s: float, reduction_s: float) -> None:
+        """Track the wall clock time spent on reductions versus the iteration total."""
+
+        if not self.enabled:
+            return
+
+        total = float(total_duration_s)
+        reduction = float(reduction_s)
+        if total <= 0.0:
+            return
+
+        if reduction < 0.0:
+            reduction = 0.0
+        if reduction > total:
+            reduction = total
+
+        share = reduction / total if total > 0.0 else 0.0
+        self._iteration_window.append(total)
+        self._reduction_window.append(reduction)
+        self._reduction_share_latest = share
+
+        if self._reduction_share is None:
+            self._reduction_share = share
+        else:
+            self._reduction_share = (self.alpha * share) + (
+                (1.0 - self.alpha) * self._reduction_share
+            )
+
+    def recommend_reduction_cadence(
+        self,
+        current: int,
+        *,
+        min_cadence: int,
+        max_cadence: int,
+        share_override: float | None = None,
+    ) -> int:
+        """Return an updated cadence based on observed reduction overhead."""
+
+        if not self.enabled:
+            return current
+
+        share = self._reduction_share if share_override is None else float(share_override)
+        if share is None:
+            return max(min_cadence, min(current, max_cadence))
+
+        clamped = max(min_cadence, min(current, max_cadence))
+
+        if len(self._iteration_window) == 0:
+            return clamped
+
+        if share > self._REDUCTION_GROW_THRESHOLD and clamped < max_cadence:
+            return min(max_cadence, clamped + 1)
+
+        if share < self._REDUCTION_SHRINK_THRESHOLD and clamped > min_cadence:
+            return max(min_cadence, clamped - 1)
+
+        return clamped
 
     def summaries(self) -> dict[str, object]:
         stage_summary: dict[str, dict[str, object]] = {}
@@ -185,6 +263,25 @@ class TrainerMetricsEWMA:
             "copy": _window_stats(self._copy_window),
             "compute": _window_stats(self._compute_window),
             "overlap_enabled": self.overlap_enabled,
+            "reduction": {
+                "samples": len(self._iteration_window),
+                "avg_total_s": (
+                    sum(self._iteration_window) / len(self._iteration_window)
+                    if self._iteration_window
+                    else 0.0
+                ),
+                "avg_reduction_s": (
+                    sum(self._reduction_window) / len(self._reduction_window)
+                    if self._reduction_window
+                    else 0.0
+                ),
+                "latest_total_s": self._iteration_window[-1] if self._iteration_window else 0.0,
+                "latest_reduction_s": self._reduction_window[-1]
+                if self._reduction_window
+                else 0.0,
+                "share_ewma": self._reduction_share,
+                "share_latest": self._reduction_share_latest if self._reduction_share_latest is not None else 0.0,
+            },
         }
 
 
@@ -859,6 +956,10 @@ class GPUBPETrainer:
             window_size=metrics_window,
             enabled=metrics_enabled,
         )
+        reduction_min = max(1, _parse_int_env("SUPERTOKEN_REDUCTION_CADENCE_MIN", 8))
+        reduction_max = max(reduction_min, _parse_int_env("SUPERTOKEN_REDUCTION_CADENCE_MAX", 16))
+        self._reduction_cadence_min = reduction_min
+        self._reduction_cadence_max = reduction_max
         self._metrics_iteration_summary: dict[str, float] | None = None
         # Host↔device transfer accounting, populated during ``fit``.
         self.bytes_h2d: int = 0
@@ -2226,6 +2327,52 @@ class GPUBPETrainer:
 
         def _record_iteration_summary(summary: dict[str, object]) -> None:
             snapshot = dict(summary)
+            if metrics_enabled:
+                total_time = float(snapshot.get("token_time_s", 0.0) or 0.0)
+                reduction_time = float(snapshot.get("reduction_s", 0.0) or 0.0)
+                if total_time > 0.0:
+                    metrics_tracker.record_iteration(total_time, reduction_time)
+                    dist_mod = getattr(torch, "distributed", None)
+                    new_cadence = self.sync_every
+                    if (
+                        dist_mod is not None
+                        and dist_mod.is_available()
+                        and dist_mod.is_initialized()
+                    ):
+                        share_value = metrics_tracker.reduction_overhead
+                        backend = str(dist_mod.get_backend()).lower()
+                        if "nccl" in backend and torch.cuda.is_available():
+                            comm_device = torch.device("cuda", torch.cuda.current_device())
+                        else:
+                            comm_device = torch.device("cpu")
+                        share_tensor = torch.tensor(
+                            [share_value if share_value is not None else 0.0],
+                            dtype=torch.float64,
+                            device=comm_device,
+                        )
+                        dist_mod.all_reduce(share_tensor, op=dist_mod.ReduceOp.MAX)
+                        global_share = float(share_tensor.item())
+                        desired = new_cadence
+                        if dist_mod.get_rank() == 0:
+                            desired = metrics_tracker.recommend_reduction_cadence(
+                                new_cadence,
+                                min_cadence=self._reduction_cadence_min,
+                                max_cadence=self._reduction_cadence_max,
+                                share_override=global_share,
+                            )
+                        cadence_tensor = torch.tensor(
+                            [int(desired)], dtype=torch.int64, device=comm_device
+                        )
+                        dist_mod.broadcast(cadence_tensor, src=0)
+                        new_cadence = int(cadence_tensor.item())
+                    else:
+                        new_cadence = metrics_tracker.recommend_reduction_cadence(
+                            new_cadence,
+                            min_cadence=self._reduction_cadence_min,
+                            max_cadence=self._reduction_cadence_max,
+                        )
+                    if new_cadence != self.sync_every:
+                        self.sync_every = new_cadence
             iteration_summaries.append(snapshot)
             if on_iteration_summary is not None:
                 on_iteration_summary(snapshot)
