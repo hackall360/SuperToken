@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import glob
 import sys
 import types
+from dataclasses import asdict
 from pathlib import Path
 from contextlib import ExitStack
 from typing import Iterable, Iterator, Sequence
@@ -23,6 +25,7 @@ from gpu_tokenizer import (
 )
 from gpu_tokenizer.io import CorpusStreamer, MemoryMappedShard
 from gpu_tokenizer.dtypes import length_storage_dtype
+from gpu_tokenizer.trainers.base import BaseTrainer
 from benchmarks import benchmark_runner
 
 __all__ = [
@@ -140,6 +143,93 @@ def _build_unigram_batches(
     """
     packed = PackedBatcher(sequences, batch_size=batch_size, seed=seed)
     return [x for (x, _mask, _lengths) in packed]
+
+
+def _stringify_config_value(value: object) -> object:
+    """Convert config payloads into JSON-serialisable structures."""
+
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _stringify_config_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_stringify_config_value(v) for v in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted(_stringify_config_value(v) for v in value)
+    return value
+
+
+def _log_resolved_config(command: str, config: dict[str, object]) -> None:
+    """Render structured configuration dictionaries prior to training."""
+
+    payload = _stringify_config_value(config)
+    try:
+        rendered = json.dumps(payload, indent=2, sort_keys=True)
+    except TypeError:
+        rendered = json.dumps(payload, indent=2, sort_keys=True, default=str)  # pragma: no cover - defensive fallback
+    print(f"[config][{command}] {rendered}")
+
+
+def _build_bpe_trainer(
+    args: argparse.Namespace,
+) -> tuple[BaseTrainer, AutoScaler, int, dict[str, object]]:
+    """Factory that materialises a :class:`GPUBPETrainer` from CLI args."""
+
+    autoscaler = AutoScaler(
+        target_util=args.target_util,
+        min_bs=args.min_batch,
+        max_bs=args.max_batch,
+    )
+    suggestion_state = autoscaler.suggest(token_bytes_per_example=args.token_bytes)
+    resolved_batch = min(args.max_batch, max(args.min_batch, suggestion_state.batch_size))
+    trainer = GPUBPETrainer(
+        base_vocab=args.base_vocab,
+        merges=args.merges,
+        device=args.device,
+        autoscaler=autoscaler,
+    )
+    suggestion = asdict(suggestion_state)
+    suggestion["requested_batch_size"] = suggestion_state.batch_size
+    suggestion["resolved_batch_size"] = resolved_batch
+    config: dict[str, object] = {
+        "trainer": {
+            "base_vocab": args.base_vocab,
+            "merges": args.merges,
+            "device": args.device,
+        },
+        "autoscaler": {
+            "target_util": args.target_util,
+            "min_batch": args.min_batch,
+            "max_batch": args.max_batch,
+            "token_bytes_per_example": args.token_bytes,
+            "suggestion": suggestion,
+        },
+    }
+    return trainer, autoscaler, resolved_batch, config
+
+
+def _build_unigram_trainer(args: argparse.Namespace) -> tuple[BaseTrainer, dict[str, object]]:
+    """Factory that materialises a :class:`GPUUnigramTrainer` from CLI args."""
+
+    trainer = GPUUnigramTrainer(
+        base_vocab=args.base_vocab,
+        vocab_size=args.vocab_size,
+        max_subword_len=args.max_subword_len,
+        device=args.device,
+    )
+    config: dict[str, object] = {
+        "trainer": {
+            "base_vocab": args.base_vocab,
+            "vocab_size": args.vocab_size,
+            "max_subword_len": args.max_subword_len,
+            "device": args.device,
+        },
+        "runtime": {
+            "batch_size": args.batch_size,
+            "epochs": args.epochs,
+        },
+    }
+    return trainer, config
 
 
 def _cmd_benchmark(args: argparse.Namespace) -> None:
@@ -304,15 +394,32 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
     if not data_patterns:
         raise SystemExit("train-bpe requires at least one --data glob pattern")
     data_files = _expand_data_patterns(data_patterns)
-    autoscaler = AutoScaler(
-        target_util=args.target_util,
-        min_bs=args.min_batch,
-        max_bs=args.max_batch,
+    trainer, autoscaler, batch_size, trainer_config = _build_bpe_trainer(args)
+    config = dict(trainer_config)
+    config.update(
+        {
+            "data": {
+                "patterns": list(data_patterns),
+                "files": [str(path) for path in data_files],
+                "bos": args.bos,
+                "eos": args.eos,
+                "compression": args.compression,
+                "io_workers": args.io_workers,
+                "prefetch_batches": args.prefetch_batches,
+            },
+            "checkpointing": {
+                "checkpoint_dir": args.checkpoint_dir,
+                "checkpoint_every": args.checkpoint_every,
+                "resume_from": str(args.resume_from) if args.resume_from else None,
+                "out_dir": args.out_dir,
+            },
+            "dry_run": bool(getattr(args, "dry_run", False)),
+        }
     )
-    # Seed the autoscaler with an initial utilization target; the suggested
-    # batch size is later adjusted to respect CLI bounds.
-    suggestion = autoscaler.suggest(token_bytes_per_example=args.token_bytes)
-    batch_size = min(args.max_batch, max(args.min_batch, suggestion.batch_size))
+    _log_resolved_config("train-bpe", config)
+    if getattr(args, "dry_run", False):
+        print("[dry-run] train-bpe initialization complete")
+        return
     packer = BytePacker(bos=args.bos, eos=args.eos)
 
     def _build_serialized_batches(
@@ -405,12 +512,6 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
         streamer.start()
         return streamer
 
-    trainer = GPUBPETrainer(
-        base_vocab=args.base_vocab,
-        merges=args.merges,
-        device=args.device,
-        autoscaler=autoscaler,
-    )
     resume_state: dict[str, object] | None = None
     resume_batches: Iterable[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None = None
     # Checkpoint resume flow:
@@ -519,15 +620,28 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
     if not data_patterns:
         raise SystemExit("train-unigram requires at least one --data glob pattern")
     data_files = _expand_data_patterns(data_patterns)
+    trainer, trainer_config = _build_unigram_trainer(args)
+    config = dict(trainer_config)
+    config.update(
+        {
+            "data": {
+                "patterns": list(data_patterns),
+                "files": [str(path) for path in data_files],
+                "bos": args.bos,
+                "eos": args.eos,
+            },
+            "output": args.out_dir,
+            "dry_run": bool(getattr(args, "dry_run", False)),
+        }
+    )
+    _log_resolved_config("train-unigram", config)
+    if getattr(args, "dry_run", False):
+        print("[dry-run] train-unigram initialization complete")
+        return
+
     sequences = _load_sequences(data_files, bos=args.bos, eos=args.eos)
 
     batches = _build_unigram_batches(sequences, batch_size=args.batch_size, seed=args.seed)
-    trainer = GPUUnigramTrainer(
-        base_vocab=args.base_vocab,
-        vocab_size=args.vocab_size,
-        max_subword_len=args.max_subword_len,
-        device=args.device,
-    )
     for epoch in range(args.epochs):
         stats = trainer.fit_epoch(batches)
         print(f"epoch {epoch + 1}: {stats}")
@@ -671,6 +785,11 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to a checkpoint directory created by --checkpoint-dir",
     )
+    train_bpe.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Instantiate the trainer, log resolved configuration, and exit",
+    )
 
     train_unigram = subparsers.add_parser(
         "train-unigram", parents=[common], help="Train a unigram model"
@@ -682,6 +801,11 @@ def _parser() -> argparse.ArgumentParser:
     train_unigram.add_argument("--batch-size", type=int, default=1024)
     train_unigram.add_argument("--epochs", type=int, default=1)
     train_unigram.add_argument("--out-dir", type=str, default="./unigram_out")
+    train_unigram.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Instantiate the trainer, log resolved configuration, and exit",
+    )
 
     benchmark = subparsers.add_parser("benchmark", help="Run tokenizer training benchmarks")
     benchmark.set_defaults(func=_cmd_benchmark)
