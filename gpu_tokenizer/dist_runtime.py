@@ -26,6 +26,7 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    TYPE_CHECKING,
 )
 
 import time
@@ -47,6 +48,9 @@ except Exception:  # pragma: no cover - fallback when torch missing
 from . import utils
 from .io import make_chunker
 from .lease_queue import LeaseNotary
+
+if TYPE_CHECKING:  # pragma: no cover - typing helper
+    from .trainers.metrics import TrainerMetricsEWMA
 
 # Configure a module level logger. Downstream applications can adjust the
 # configuration to taste but this ensures we at least emit something when the

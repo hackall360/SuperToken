@@ -30,7 +30,7 @@ except Exception:  # pragma: no cover - torch optional at runtime
 
 
 if TYPE_CHECKING:  # pragma: no cover - typing helper
-    from .bpe_trainer import TrainerMetricsEWMA
+    from .trainers.metrics import TrainerMetricsEWMA
 
 
 CompressionType = str

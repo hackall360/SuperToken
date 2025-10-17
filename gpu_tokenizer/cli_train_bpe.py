@@ -278,8 +278,24 @@ def _format_iteration_summary(summary: dict[str, object]) -> str:
     merge_idx = int(summary.get("merge", 0) or 0)
     tokens = int(summary.get("tokens", 0) or 0)
     leases = int(summary.get("leases", 0) or 0)
-    tokens_per_s = float(summary.get("tokens_per_s", 0.0) or 0.0)
-    leases_per_s = float(summary.get("lease_per_s", 0.0) or 0.0)
+    metrics_payload = summary.get("metrics")
+
+    def _to_float(value: object) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    tokens_rate_obj = summary.get("tokens_per_s", 0.0)
+    leases_rate_obj = summary.get("lease_per_s", 0.0)
+    if isinstance(metrics_payload, Mapping):
+        throughput = metrics_payload.get("throughput")
+        if isinstance(throughput, Mapping):
+            tokens_rate_obj = throughput.get("tokens_per_s", tokens_rate_obj)
+            leases_rate_obj = throughput.get("lease_per_s", leases_rate_obj)
+
+    tokens_per_s = _to_float(tokens_rate_obj)
+    leases_per_s = _to_float(leases_rate_obj)
     h2d = float(summary.get("h2d_s", 0.0) or 0.0)
     kernel = float(summary.get("kernel_s", 0.0) or 0.0)
     d2h = float(summary.get("d2h_s", 0.0) or 0.0)
@@ -573,9 +589,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     trainer_ref["value"] = trainer
     iteration_callback = None
     if args.log_stage_timings:
-        trainer.metrics.enabled = True
+        metrics_registry = trainer.metrics()
+        throughput_tracker = None
+        if isinstance(metrics_registry, Mapping):
+            throughput_tracker = metrics_registry.get("throughput")
+            if throughput_tracker is None and metrics_registry:
+                throughput_tracker = next(iter(metrics_registry.values()))
+        if throughput_tracker is not None:
+            throughput_tracker.enabled = True
 
-        metrics_tracker = trainer.metrics
+        metrics_tracker = throughput_tracker
         metrics_rank = rank
         metrics_world_size = world_size
 

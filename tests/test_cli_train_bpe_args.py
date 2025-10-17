@@ -156,3 +156,25 @@ def test_render_rank_metrics_table_formats_rows() -> None:
     assert "1" in table
     assert "1,234.57" in table
     assert "111.50" in table
+
+
+def test_format_iteration_summary_reads_nested_metrics() -> None:
+    summary = {
+        "merge": 5,
+        "tokens": 1_000,
+        "leases": 12,
+        "h2d_s": 0.1,
+        "kernel_s": 0.2,
+        "d2h_s": 0.1,
+        "reduction_s": 0.0,
+        "copy_s": 0.2,
+        "compute_s": 0.3,
+        "overlap": True,
+        "metrics": {
+            "throughput": {"tokens_per_s": 4321.0, "lease_per_s": 21.5}
+        },
+    }
+
+    line = cli_train_bpe._format_iteration_summary(summary)
+    assert "4,321" in line
+    assert "22/s" in line

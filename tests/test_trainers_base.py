@@ -2,25 +2,42 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
+import types
 from pathlib import Path
 from typing import Any, Mapping
 
 import pytest
 
-_BASE_TRAINER_PATH = Path(__file__).resolve().parents[1] / "gpu_tokenizer" / "trainers" / "base.py"
-_SPEC = importlib.util.spec_from_file_location("tests._base_trainer", _BASE_TRAINER_PATH)
+_PKG_ROOT = Path(__file__).resolve().parents[1] / "gpu_tokenizer"
+package_stub = sys.modules.setdefault("gpu_tokenizer", types.ModuleType("gpu_tokenizer"))
+package_stub.__path__ = [str(_PKG_ROOT)]
+trainers_stub = sys.modules.setdefault(
+    "gpu_tokenizer.trainers", types.ModuleType("gpu_tokenizer.trainers")
+)
+trainers_stub.__path__ = [str(_PKG_ROOT / "trainers")]
+
+_BASE_TRAINER_PATH = _PKG_ROOT / "trainers" / "base.py"
+_SPEC = importlib.util.spec_from_file_location(
+    "gpu_tokenizer.trainers.base", _BASE_TRAINER_PATH
+)
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 
 BaseTrainer = _MODULE.BaseTrainer
+from gpu_tokenizer.trainers.metrics import TrainerMetricsEWMA
 
 
 class DummyTrainer(BaseTrainer):
     """Minimal concrete trainer used to assert the base contract."""
 
     def __init__(self) -> None:
+        super().__init__()
         self._history: list[dict[str, Any]] = []
+        self._tracker = TrainerMetricsEWMA(enabled=True)
+        self.register_metrics_tracker("dummy", self._tracker)
 
     def fit(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         self._history.append({"args": list(args), "kwargs": dict(kwargs)})
@@ -49,6 +66,9 @@ class DummyTrainer(BaseTrainer):
         artifact.write_text(json.dumps({"history": self._history}))
         return {"dummy": str(artifact)}
 
+    def metrics(self) -> Mapping[str, TrainerMetricsEWMA]:
+        return self._metrics_mapping()
+
 
 def test_base_trainer_enforces_required_methods() -> None:
     class MissingMethodsTrainer(BaseTrainer):
@@ -67,6 +87,9 @@ def test_base_trainer_enforces_required_methods() -> None:
 
 def test_dummy_trainer_satisfies_base_contract(tmp_path: Path) -> None:
     trainer = DummyTrainer()
+    registry = trainer.metrics()
+    assert "dummy" in registry
+    assert registry["dummy"].enabled is True
 
     summary = trainer.fit("payload", answer=42)
     assert summary == {"status": "ok", "invocations": 1}
