@@ -83,6 +83,8 @@ def test_state_dict_roundtrip() -> None:
     snap = notary.state_dict()
     assert "rank_weights" in snap
     assert snap["rank_weights"] == {}
+    assert snap["rank_lease_scale"] == {}
+    assert snap["rank_max_active"] == {}
     assert snap["min_lease_size"] == 1
     assert snap["max_active_leases"] == 2
     assert snap.get("idle_metrics") == {}
@@ -320,6 +322,8 @@ def test_rank_weights_roundtrip() -> None:
 
     snap = notary.state_dict()
     assert snap["rank_weights"] == {0: 0.7, 1: 0.3}
+    assert 0 in snap["rank_lease_scale"]
+    assert 1 in snap["rank_max_active"]
 
     restored = LeaseNotary(total_chunks=0, lease_ttl=1.0)
     restored.load_state_dict(snap)
@@ -339,4 +343,39 @@ def test_record_idle_tracks_metrics() -> None:
     assert entry["samples"] == 2
     assert entry["last_ms"] == pytest.approx(20.0)
     assert entry["ewma_ms"] == pytest.approx((0.2 * 20.0) + (0.8 * 120.0))
+
+
+def test_per_rank_quota_adjusts_smoothly() -> None:
+    notary = LeaseNotary(total_chunks=200, lease_ttl=10.0, max_active_leases=4)
+
+    notary.update_rank_weights({0: 1.0, 1: 1.0})
+    baseline = notary.state_dict()
+    assert baseline["rank_max_active"] == {0: 4, 1: 4}
+    assert baseline["rank_lease_scale"] == {0: 1.0, 1: 1.0}
+
+    slow_limits: List[int] = []
+    fast_scales: List[float] = []
+    target_weights = {0: 0.25, 1: 1.75}
+
+    for expected_limit in (3, 2, 1):
+        notary.update_rank_weights(target_weights)
+        state = notary.state_dict()
+        slow_limits.append(state["rank_max_active"][0])
+        fast_scales.append(state["rank_lease_scale"][1])
+        assert state["rank_max_active"][0] == expected_limit
+        assert state["rank_max_active"][1] == 4
+        assert state["rank_lease_scale"][0] <= baseline["rank_lease_scale"][0]
+        held: List[Tuple[int, int]] = []
+        for _ in range(expected_limit):
+            lease = notary.grant_lease(rank=0, preferred_size=2)
+            assert lease is not None
+            held.append(lease)
+        with pytest.raises(RuntimeError):
+            notary.grant_lease(rank=0, preferred_size=2)
+        for start, end in held:
+            notary.complete_lease(rank=0, start=start, end=end)
+
+    assert slow_limits == [3, 2, 1]
+    assert fast_scales[0] >= 1.0
+    assert fast_scales[-1] >= fast_scales[0]
 

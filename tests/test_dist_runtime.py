@@ -11,6 +11,7 @@ import sys
 import types
 import threading
 from collections import deque
+from typing import Dict
 
 import pytest
 
@@ -641,3 +642,46 @@ def test_rebalance_converges_within_30s(monkeypatch: pytest.MonkeyPatch) -> None
     per_rank = metrics0.snapshot()["per_rank"]
     assert per_rank[1]["tokens_per_s"] == pytest.approx(metrics1.tokens_per_s)
     assert gather_log, "gather should record each rebalance sample"
+
+
+def test_slow_gpu_quota_reduces_smoothly(monkeypatch: pytest.MonkeyPatch) -> None:
+    dist_runtime, _ = _patch_common_runtime(monkeypatch)
+
+    host_state = dist_runtime._LeaseHostState(
+        notary=dist_runtime.LeaseNotary(total_chunks=256, lease_ttl=5.0, max_active_leases=4),
+        lock=threading.Lock(),
+    )
+
+    client0 = dist_runtime.DistributedLeaseClient(
+        job_id="quota", rank=0, world_size=2, host_state=host_state
+    )
+
+    # Seed uniform weights.
+    client0.update_rank_weights({0: 1.0, 1: 1.0})
+    baseline = host_state.notary.state_dict()
+    assert baseline["rank_max_active"] == {0: 4, 1: 4}
+
+    target = {0: 0.05, 1: 1.95}
+    weights: Dict[int, float] = {0: 1.0, 1: 1.0}
+
+    for expected_limit in (3, 2, 1):
+        weights = dist_runtime._blend_rank_weights(
+            weights,
+            target,
+            new_fraction=0.5,
+            world_size=2,
+        )
+        client0.update_rank_weights(weights)
+        snap = host_state.notary.state_dict()
+        assert snap["rank_max_active"][0] == expected_limit
+        assert snap["rank_max_active"][1] == 4
+        assert snap["rank_lease_scale"][0] <= baseline["rank_lease_scale"][0]
+        assert snap["rank_lease_scale"][1] >= baseline["rank_lease_scale"][1]
+        held: list[tuple[int, int]] = []
+        for _ in range(expected_limit):
+            lease = host_state.notary.grant_lease(rank=0, preferred_size=2)
+            held.append(lease)
+        with pytest.raises(RuntimeError):
+            host_state.notary.grant_lease(rank=0, preferred_size=2)
+        for start, end in held:
+            host_state.notary.complete_lease(rank=0, start=start, end=end)

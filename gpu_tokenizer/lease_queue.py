@@ -72,6 +72,8 @@ class LeaseNotary:
         self._pending_requeue: Deque[Lease] = deque()
         self._lease_ttl = float(lease_ttl)
         self._rank_weights: Dict[int, float] = {}
+        self._rank_lease_scale: Dict[int, float] = {}
+        self._rank_max_active: Dict[int, int] = {}
         self._min_lease_size = int(min_lease_size)
         self._max_lease_size = int(max_lease_size) if max_lease_size is not None else None
         self._max_active_leases = int(max_active_leases)
@@ -140,6 +142,9 @@ class LeaseNotary:
         with self._lock:
             if max_active_leases > self._max_active_leases:
                 self._max_active_leases = int(max_active_leases)
+                for rank, limit in list(self._rank_max_active.items()):
+                    if limit > self._max_active_leases:
+                        self._rank_max_active[rank] = self._max_active_leases
 
     def grant_lease(self, rank: int, preferred_size: int) -> Optional[Tuple[int, int]]:
         """Return the next available lease for ``rank``.
@@ -154,7 +159,10 @@ class LeaseNotary:
 
         with self._lock:
             queue = self._inflight.setdefault(rank, deque())
-            if len(queue) >= self._max_active_leases:
+            limit = int(self._rank_max_active.get(rank, self._max_active_leases))
+            if limit <= 0:
+                limit = 1
+            if len(queue) >= limit:
                 raise RuntimeError("rank already holds an active lease")
 
             if self._pending_requeue:
@@ -165,12 +173,11 @@ class LeaseNotary:
                         self._inflight.pop(rank, None)
                     return None
                 start = self._next_idx
-                weight = self._rank_weights.get(rank)
-                if weight is None:
-                    weight = 1.0
-                else:
-                    weight = max(0.0, float(weight))
-                weighted = math.ceil(weight * float(preferred_size))
+                scale = self._rank_lease_scale.get(rank)
+                if scale is None:
+                    scale = self._rank_weights.get(rank, 1.0)
+                scale = max(0.0, float(scale))
+                weighted = math.ceil(scale * float(preferred_size))
                 size = max(self._min_lease_size, int(weighted))
                 if self._max_lease_size is not None:
                     size = min(size, self._max_lease_size)
@@ -303,6 +310,8 @@ class LeaseNotary:
                 "pending_requeue": list(pending),
                 "lease_ttl": self._lease_ttl,
                 "rank_weights": dict(self._rank_weights),
+                "rank_lease_scale": dict(self._rank_lease_scale),
+                "rank_max_active": dict(self._rank_max_active),
                 "min_lease_size": self._min_lease_size,
                 "max_lease_size": self._max_lease_size,
                 "max_active_leases": self._max_active_leases,
@@ -328,6 +337,8 @@ class LeaseNotary:
         pending_raw = state["pending_requeue"]
         lease_ttl = float(state.get("lease_ttl", self._lease_ttl))
         rank_weights_raw = state.get("rank_weights", {})
+        rank_lease_scale_raw = state.get("rank_lease_scale", {})
+        rank_max_active_raw = state.get("rank_max_active", {})
         min_lease_size = int(state.get("min_lease_size", self._min_lease_size))
         raw_max_lease = state.get("max_lease_size", self._max_lease_size)
         max_active_leases = int(state.get("max_active_leases", self._max_active_leases))
@@ -399,6 +410,28 @@ class LeaseNotary:
                 raise ValueError("rank weight must be non-negative")
             rank_weights[rank] = weight
 
+        rank_lease_scale: Dict[int, float] = {}
+        if rank_lease_scale_raw is None:
+            rank_lease_scale_raw = {}
+        if isinstance(rank_lease_scale_raw, dict):
+            for raw_rank, raw_scale in rank_lease_scale_raw.items():
+                rank = int(raw_rank)
+                scale = float(raw_scale)
+                if not math.isfinite(scale) or scale < 0.0:
+                    continue
+                rank_lease_scale[rank] = scale
+
+        rank_max_active: Dict[int, int] = {}
+        if rank_max_active_raw is None:
+            rank_max_active_raw = {}
+        if isinstance(rank_max_active_raw, dict):
+            for raw_rank, raw_limit in rank_max_active_raw.items():
+                rank = int(raw_rank)
+                limit = int(raw_limit)
+                if limit <= 0:
+                    continue
+                rank_max_active[rank] = limit
+
         idle_metrics_raw = state.get("idle_metrics", {})
         idle_metrics: Dict[int, Dict[str, float]] = {}
         if isinstance(idle_metrics_raw, dict):
@@ -428,6 +461,11 @@ class LeaseNotary:
             self._pending_requeue = pending_queue
             self._lease_ttl = lease_ttl
             self._rank_weights = rank_weights
+            self._rank_lease_scale = rank_lease_scale
+            self._rank_max_active = {
+                rank: min(limit, self._max_active_leases)
+                for rank, limit in rank_max_active.items()
+            }
             self._min_lease_size = min_lease_size
             self._max_lease_size = max_lease_size
             self._max_active_leases = max_active_leases
@@ -443,8 +481,76 @@ class LeaseNotary:
                 weight = float(raw_weight)
                 if weight < 0:
                     raise ValueError("rank weight must be non-negative")
+                if not math.isfinite(weight):
+                    continue
                 cleaned[rank] = weight
-            self._rank_weights = cleaned
+
+            existing_keys = (
+                set(self._rank_weights.keys())
+                | set(self._rank_lease_scale.keys())
+                | set(self._rank_max_active.keys())
+            )
+            keys = existing_keys | set(cleaned.keys())
+            if not keys:
+                self._rank_weights = {}
+                self._rank_lease_scale = {}
+                self._rank_max_active = {}
+                return
+
+            if cleaned:
+                total = sum(cleaned.values())
+                count = len(cleaned)
+            else:
+                total = sum(self._rank_weights.values())
+                count = len(self._rank_weights) if self._rank_weights else 0
+            average = float(total) / float(count) if count > 0 else 0.0
+            if average <= 0.0 or not math.isfinite(average):
+                average = 1.0
+
+            min_scale = 0.25
+            max_scale = 4.0
+
+            new_weights: Dict[int, float] = {}
+            new_scales: Dict[int, float] = {}
+            new_limits: Dict[int, int] = {}
+
+            for rank in sorted(keys):
+                if rank in cleaned:
+                    weight = cleaned[rank]
+                else:
+                    weight = float(self._rank_weights.get(rank, average))
+                if weight < 0 or not math.isfinite(weight):
+                    weight = average
+                new_weights[rank] = weight
+
+                target_scale = weight / average if average > 0.0 else 1.0
+                target_scale = max(min_scale, min(max_scale, target_scale))
+
+                prev_scale = self._rank_lease_scale.get(rank)
+                if prev_scale is None or prev_scale <= 0.0 or not math.isfinite(prev_scale):
+                    scale = target_scale
+                else:
+                    lower = max(min_scale, prev_scale * 0.5)
+                    upper = min(max_scale, prev_scale * 1.5)
+                    scale = max(lower, min(target_scale, upper))
+                new_scales[rank] = scale
+
+                target_limit = int(round(scale * float(self._max_active_leases)))
+                target_limit = max(1, min(self._max_active_leases, target_limit))
+                prev_limit = self._rank_max_active.get(rank)
+                if prev_limit is None or prev_limit <= 0:
+                    limit = target_limit
+                elif target_limit > prev_limit:
+                    limit = min(self._max_active_leases, prev_limit + 1)
+                elif target_limit < prev_limit:
+                    limit = max(1, prev_limit - 1)
+                else:
+                    limit = prev_limit
+                new_limits[rank] = limit
+
+            self._rank_weights = new_weights
+            self._rank_lease_scale = new_scales
+            self._rank_max_active = new_limits
 
     def rank_weights(self) -> Dict[int, float]:
         """Return a copy of the stored per-rank weights."""
