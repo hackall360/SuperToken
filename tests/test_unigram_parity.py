@@ -359,3 +359,58 @@ def test_unigram_seed_reproducibility(device: str) -> None:
     assert vocab_a == vocab_b
     assert table_a == table_b
     assert encoded_a == encoded_b
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for GPU parity")
+def test_unigram_checkpoint_parity_between_devices() -> None:
+    """GPU-resident checkpoints should match the CPU fallback when both are available."""
+
+    training_sequences = [
+        b"banana bandana", b"bandana banana", b"ananas banana", bytes(range(32))
+    ]
+    batches = _build_batches(training_sequences)
+
+    _seed_everything(GLOBAL_SEED)
+    cpu_trainer = GPUUnigramTrainer(
+        base_vocab=BASE_VOCAB,
+        vocab_size=BASE_VOCAB + 64,
+        max_subword_len=MAX_SUBWORD_LEN,
+        device="cpu",
+        seed=GLOBAL_SEED,
+    )
+    gpu_trainer = GPUUnigramTrainer(
+        base_vocab=BASE_VOCAB,
+        vocab_size=BASE_VOCAB + 64,
+        max_subword_len=MAX_SUBWORD_LEN,
+        device="cuda",
+        seed=GLOBAL_SEED,
+    )
+
+    cpu_trainer.fit_epoch(batches)
+    gpu_trainer.fit_epoch(batches)
+
+    cpu_state = cpu_trainer.state_dict()
+    gpu_state = gpu_trainer.state_dict()
+
+    assert cpu_state["id2piece"] == gpu_state["id2piece"]
+    assert cpu_state["piece2id"] == gpu_state["piece2id"]
+    cpu_logp = cpu_state["logp"]
+    gpu_logp = gpu_state["logp"]
+    assert isinstance(cpu_logp, torch.Tensor)
+    assert isinstance(gpu_logp, torch.Tensor)
+    assert torch.allclose(cpu_logp, gpu_logp, atol=1e-6, rtol=1e-6)
+
+    restored_gpu = GPUUnigramTrainer(
+        base_vocab=BASE_VOCAB,
+        vocab_size=BASE_VOCAB + 64,
+        max_subword_len=MAX_SUBWORD_LEN,
+        device="cuda",
+        seed=GLOBAL_SEED,
+    )
+    load_meta = restored_gpu.load_state_dict(cpu_state)
+    assert load_meta == {"vocab": len(cpu_state["id2piece"])}
+    restored_state = restored_gpu.state_dict()
+    assert restored_state["id2piece"] == cpu_state["id2piece"]
+    restored_logp = restored_state["logp"]
+    assert isinstance(restored_logp, torch.Tensor)
+    assert torch.allclose(restored_logp, cpu_logp, atol=1e-6, rtol=1e-6)
