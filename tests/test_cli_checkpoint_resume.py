@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
+if getattr(torch, "_SUPERTOKEN_TORCH_STUB", False) or not hasattr(torch, "tensor"):
+    pytest.skip(
+        "PyTorch with tensor support is required for CLI checkpoint resume tests",
+        allow_module_level=True,
+    )
 
 
 def _wait_for_checkpoint(

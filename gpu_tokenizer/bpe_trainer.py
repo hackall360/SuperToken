@@ -66,9 +66,15 @@ class TrainerMetricsEWMA:
     alpha: float = 0.2
     window_size: int = 16
     enabled: bool = False
+    overlap_enabled: bool = True
     _tokens_per_s: float | None = None
     _lease_per_s: float | None = None
     _stage_windows: dict[str, deque[float]] = field(default_factory=dict)
+    _copy_window: deque[float] = field(init=False, repr=False)
+    _compute_window: deque[float] = field(init=False, repr=False)
+
+    _COPY_STAGES = frozenset({"h2d", "d2h"})
+    _COMPUTE_STAGES = frozenset({"kernel", "reduction"})
 
     def __post_init__(self) -> None:
         # Clamp configuration to sensible defaults while tolerating bad inputs.
@@ -89,6 +95,9 @@ class TrainerMetricsEWMA:
             window = 1
         self.window_size = window
         self.enabled = bool(self.enabled)
+        self.overlap_enabled = bool(self.overlap_enabled)
+        self._copy_window = deque(maxlen=self.window_size)
+        self._compute_window = deque(maxlen=self.window_size)
 
     def reset(self) -> None:
         """Clear accumulated metrics."""
@@ -96,6 +105,8 @@ class TrainerMetricsEWMA:
         self._tokens_per_s = None
         self._lease_per_s = None
         self._stage_windows.clear()
+        self._copy_window = deque(maxlen=self.window_size)
+        self._compute_window = deque(maxlen=self.window_size)
 
     @property
     def tokens_per_s(self) -> float | None:
@@ -105,11 +116,20 @@ class TrainerMetricsEWMA:
     def lease_per_s(self) -> float | None:
         return self._lease_per_s
 
-    def record_stage(self, stage: str, duration_s: float) -> None:
+    def record_stage(self, stage: str, duration_s: float) -> str:
         if not self.enabled or duration_s < 0:
-            return
+            return "other"
         window = self._stage_windows.setdefault(stage, deque(maxlen=self.window_size))
         window.append(float(duration_s))
+        stage_key = stage.lower()
+        kind = "other"
+        if stage_key in self._COPY_STAGES:
+            self._copy_window.append(float(duration_s))
+            kind = "copy"
+        elif stage_key in self._COMPUTE_STAGES:
+            self._compute_window.append(float(duration_s))
+            kind = "compute"
+        return kind
 
     def record_tokens(self, tokens: int, duration_s: float, *, leases: int | None = None) -> None:
         if not self.enabled or duration_s <= 0:
@@ -141,6 +161,19 @@ class TrainerMetricsEWMA:
                 "latest_s": samples[-1] if samples else 0.0,
                 "window": samples,
             }
+
+        def _window_stats(window: deque[float]) -> dict[str, object]:
+            values = list(window)
+            count = len(values)
+            avg = sum(values) / count if count else 0.0
+            latest = values[-1] if values else 0.0
+            return {
+                "samples": count,
+                "avg_s": avg,
+                "latest_s": latest,
+                "window": values,
+            }
+
         return {
             "enabled": self.enabled,
             "alpha": self.alpha,
@@ -148,6 +181,9 @@ class TrainerMetricsEWMA:
             "tokens_per_s": self._tokens_per_s,
             "lease_per_s": self._lease_per_s,
             "stages": stage_summary,
+            "copy": _window_stats(self._copy_window),
+            "compute": _window_stats(self._compute_window),
+            "overlap_enabled": self.overlap_enabled,
         }
 
 
@@ -224,6 +260,7 @@ class GPUBatchRecord:
         host_lengths: Optional[torch.Tensor]
         host_length_overflow: Optional[torch.Tensor]
         transfer_event: Optional[torch.cuda.Event] = None
+        overlap_enabled = bool(getattr(ctx, "overlap_enabled", True)) if ctx else True
         if ctx is not None and ctx.device.type == "cuda":
             tokens_host, valid_host, lengths_host = ctx.prepare_staging_buffers(
                 tokens_int.shape, coerced_lengths.dtype
@@ -235,19 +272,33 @@ class GPUBatchRecord:
             if overflow is not None:
                 overflow_host = ctx.prepare_overflow_buffer(tokens_int.shape[0])
                 overflow_host.copy_(overflow)
-            with torch.cuda.device(device), torch.cuda.stream(ctx.h2d_stream):
-                tokens_dev = tokens_host.to(device=device, non_blocking=True)
-                valid_dev = valid_host.to(device=device, non_blocking=True)
-                lengths_dev = lengths_host.to(device=device, non_blocking=True)
+            stream = ctx.h2d_stream if overlap_enabled else ctx.compute_stream
+            with torch.cuda.device(device), torch.cuda.stream(stream):
+                tokens_dev = tokens_host.to(
+                    device=device, non_blocking=overlap_enabled
+                )
+                valid_dev = valid_host.to(device=device, non_blocking=overlap_enabled)
+                lengths_dev = lengths_host.to(device=device, non_blocking=overlap_enabled)
                 if overflow is not None and overflow_host is not None:
-                    overflow_dev = overflow_host.to(device=device, non_blocking=True)
-                transfer_event = torch.cuda.Event(blocking=False)
-                transfer_event.record(ctx.h2d_stream)
+                    overflow_dev = overflow_host.to(
+                        device=device, non_blocking=overlap_enabled
+                    )
+                if overlap_enabled:
+                    transfer_event = torch.cuda.Event(blocking=False)
+                    transfer_event.record(stream)
+                else:
+                    transfer_event = None
             ctx.pending_h2d_event = transfer_event
-            host_tokens = None
-            host_valid = None
-            host_lengths = None
-            host_length_overflow = None
+            if overlap_enabled:
+                host_tokens = None
+                host_valid = None
+                host_lengths = None
+                host_length_overflow = None
+            else:
+                host_tokens = tokens_host
+                host_valid = valid_host
+                host_lengths = lengths_host
+                host_length_overflow = overflow_host if overflow is not None else None
         else:
             tokens_host = tokens_int.pin_memory()
             valid_host = valid_uint.pin_memory()
@@ -370,15 +421,25 @@ class GPUBatchRecord:
             stream.wait_event(self.device_event)
             self.device_event = None
 
-    def schedule_host_sync(self, copy_stream: torch.cuda.Stream) -> None:
-        """Schedule an asynchronous copy of device data back to host."""
+    def schedule_host_sync(
+        self, copy_stream: torch.cuda.Stream, *, overlap: bool = True
+    ) -> None:
+        """Schedule a copy of device data back to host memory."""
 
         self.ensure_host_buffers()
+        assert self.host_tokens is not None
+        assert self.host_valid is not None
+        if not overlap:
+            with torch.cuda.stream(copy_stream):
+                self.wait_for_device(copy_stream)
+                self.host_tokens.copy_(self.tokens, non_blocking=False)
+                self.host_valid.copy_(self.valid, non_blocking=False)
+            self.host_event = None
+            return
+
         event = torch.cuda.Event(blocking=False, enable_timing=True)
         with torch.cuda.stream(copy_stream):
             self.wait_for_device(copy_stream)
-            assert self.host_tokens is not None
-            assert self.host_valid is not None
             self.host_tokens.copy_(self.tokens, non_blocking=True)
             self.host_valid.copy_(self.valid, non_blocking=True)
             event.record(copy_stream)
@@ -433,6 +494,7 @@ class DeviceContext:
     compute_stream: torch.cuda.Stream
     h2d_stream: torch.cuda.Stream
     d2h_stream: torch.cuda.Stream
+    overlap_enabled: bool = True
     bytes_h2d: int = 0
     bytes_d2h: int = 0
     h2d_events: int = 0
@@ -822,6 +884,7 @@ class GPUBPETrainer:
         self._cpu_fallback_batches: int = 0
         self._last_cpu_fallback_ratio: float = 0.0
         self._merge_step: int = 0
+        self._overlap_enabled: bool = True
 
     # ------------------------------------------------------------------
     # Transfer accounting helpers
@@ -877,10 +940,13 @@ class GPUBPETrainer:
                 ctx.log_transfer(stage, "h2d", total)
         if start is not None:
             duration = time.perf_counter() - start
-            metrics.record_stage("h2d", duration)
+            stage_kind = metrics.record_stage("h2d", duration)
             if self._metrics_iteration_summary is not None:
-                self._metrics_iteration_summary["h2d_s"] = (
-                    self._metrics_iteration_summary.get("h2d_s", 0.0) + duration
+                self._accumulate_iteration_stage(
+                    self._metrics_iteration_summary,
+                    "h2d",
+                    duration,
+                    stage_kind,
                 )
 
     def _record_d2h(
@@ -908,12 +974,37 @@ class GPUBPETrainer:
                 ctx.log_transfer(stage, "d2h", total)
         if start is not None:
             duration = time.perf_counter() - start
-            metrics.record_stage("d2h", duration)
+            stage_kind = metrics.record_stage("d2h", duration)
             if self._metrics_iteration_summary is not None:
-                self._metrics_iteration_summary["d2h_s"] = (
-                    self._metrics_iteration_summary.get("d2h_s", 0.0) + duration
+                self._accumulate_iteration_stage(
+                    self._metrics_iteration_summary,
+                    "d2h",
+                    duration,
+                    stage_kind,
                 )
         return total
+
+    def _accumulate_iteration_stage(
+        self,
+        summary: dict[str, object],
+        stage: str,
+        duration_s: float,
+        stage_kind: str,
+    ) -> None:
+        key = f"{stage}_s"
+        summary[key] = float(summary.get(key, 0.0)) + float(duration_s)
+        if stage_kind == "copy":
+            summary["copy_s"] = float(summary.get("copy_s", 0.0)) + float(duration_s)
+        elif stage_kind == "compute":
+            summary["compute_s"] = float(summary.get("compute_s", 0.0)) + float(duration_s)
+        overlap_flag = bool(summary.get("overlap", self._overlap_enabled))
+        compute_total = float(summary.get("compute_s", 0.0))
+        copy_total = float(summary.get("copy_s", 0.0))
+        summary["token_time_s"] = (
+            max(compute_total, copy_total)
+            if overlap_flag
+            else compute_total + copy_total
+        )
 
     # ------------------------------------------------------------------
     # Batch serialization helpers
@@ -2067,6 +2158,7 @@ class GPUBPETrainer:
         on_batch_size_change: Optional[Callable[[int], None]] = None,
         warm_start_merges: Optional[Sequence[tuple[int, int]]] = None,
         freeze_warm_start: Optional[bool] = None,
+        overlap_transfers: bool = True,
         warm_start_plan: Optional[dict[str, object]] = None,
         warm_start_ngrams: Optional[int] = None,
         warm_start_device: Optional[torch.device] = None,
@@ -2083,6 +2175,8 @@ class GPUBPETrainer:
                 checkpoint_interval = None
         if checkpoint_interval is not None and checkpoint_dir is None:
             raise ValueError("checkpoint_dir must be provided when using checkpoint_interval")
+
+        self._overlap_enabled = bool(overlap_transfers)
 
         self._reset_transfer_counters()
         self._reset_histogram_cache()
@@ -2122,6 +2216,7 @@ class GPUBPETrainer:
         host_sync_events: list[dict[str, object]] = []
         device_snapshot_log: list[dict[str, object]] = []
         metrics_tracker = self._metrics
+        metrics_tracker.overlap_enabled = self._overlap_enabled
         metrics_tracker.reset()
         metrics_enabled = metrics_tracker.enabled
         iteration_summary: dict[str, object] | None = None
@@ -2142,6 +2237,9 @@ class GPUBPETrainer:
                 "kernel_s": 0.0,
                 "d2h_s": 0.0,
                 "reduction_s": 0.0,
+                "copy_s": 0.0,
+                "compute_s": 0.0,
+                "overlap": self._overlap_enabled,
                 "tokens": 0,
                 "leases": 0,
                 "token_time_s": 0.0,
@@ -2295,9 +2393,11 @@ class GPUBPETrainer:
                     compute_stream=torch.cuda.Stream(device=dev),
                     h2d_stream=torch.cuda.Stream(device=dev),
                     d2h_stream=torch.cuda.Stream(device=dev),
+                    overlap_enabled=self._overlap_enabled,
                 )
             self._device_contexts = device_contexts
             for ctx in device_contexts.values():
+                ctx.overlap_enabled = self._overlap_enabled
                 ctx.bytes_h2d = 0
                 ctx.bytes_d2h = 0
                 ctx.h2d_events = 0
@@ -2580,11 +2680,15 @@ class GPUBPETrainer:
                 )
                 if reduction_start is not None:
                     reduction_duration = time.perf_counter() - reduction_start
-                    metrics_tracker.record_stage("reduction", reduction_duration)
+                    stage_kind = metrics_tracker.record_stage(
+                        "reduction", reduction_duration
+                    )
                     if self._metrics_iteration_summary is not None:
-                        self._metrics_iteration_summary["reduction_s"] = (
-                            self._metrics_iteration_summary.get("reduction_s", 0.0)
-                            + reduction_duration
+                        self._accumulate_iteration_stage(
+                            self._metrics_iteration_summary,
+                            "reduction",
+                            reduction_duration,
+                            stage_kind,
                         )
             else:
                 reduced_keys = torch.empty((0,), dtype=torch.long)
@@ -2771,7 +2875,9 @@ class GPUBPETrainer:
                                 stage="host_sync",
                             )
                             with torch.cuda.device(dev):
-                                shard.schedule_host_sync(ctx.d2h_stream)
+                                shard.schedule_host_sync(
+                                    ctx.d2h_stream, overlap=ctx.overlap_enabled
+                                )
                             pending_copy = True
                         elif shard.host_event is not None:
                             pending_copy = True
@@ -2789,11 +2895,13 @@ class GPUBPETrainer:
                 if pending_copy:
                     _capture_device_snapshots("host_sync:final:end")
                     if metrics_enabled and elapsed > 0.0:
-                        metrics_tracker.record_stage("d2h", elapsed)
+                        stage_kind = metrics_tracker.record_stage("d2h", elapsed)
                         if self._metrics_iteration_summary is not None:
-                            self._metrics_iteration_summary["d2h_s"] = (
-                                self._metrics_iteration_summary.get("d2h_s", 0.0)
-                                + elapsed
+                            self._accumulate_iteration_stage(
+                                self._metrics_iteration_summary,
+                                "d2h",
+                                elapsed,
+                                stage_kind,
                             )
                 return copied_bytes, elapsed
 
@@ -2981,11 +3089,15 @@ class GPUBPETrainer:
                         )
                         if reduction_start is not None:
                             reduction_duration = time.perf_counter() - reduction_start
-                            metrics_tracker.record_stage("reduction", reduction_duration)
+                            stage_kind = metrics_tracker.record_stage(
+                                "reduction", reduction_duration
+                            )
                             if self._metrics_iteration_summary is not None:
-                                self._metrics_iteration_summary["reduction_s"] = (
-                                    self._metrics_iteration_summary.get("reduction_s", 0.0)
-                                    + reduction_duration
+                                self._accumulate_iteration_stage(
+                                    self._metrics_iteration_summary,
+                                    "reduction",
+                                    reduction_duration,
+                                    stage_kind,
                                 )
                     else:
                         reduced_keys = None
@@ -3167,7 +3279,9 @@ class GPUBPETrainer:
                                         stage="host_sync",
                                     )
                                     with torch.cuda.device(dev):
-                                        shard.schedule_host_sync(ctx.d2h_stream)
+                                        shard.schedule_host_sync(
+                                            ctx.d2h_stream, overlap=ctx.overlap_enabled
+                                        )
                                     pending_copy[dev] = True
                             except RuntimeError as exc:
                                 if "CUDA out of memory" in str(exc):
@@ -3353,11 +3467,13 @@ class GPUBPETrainer:
                         }
                     )
                     if metrics_enabled:
-                        metrics_tracker.record_stage("kernel", merge_duration)
+                        stage_kind = metrics_tracker.record_stage("kernel", merge_duration)
                         if iteration_summary is not None:
-                            iteration_summary["kernel_s"] = (
-                                float(iteration_summary.get("kernel_s", 0.0))
-                                + merge_duration
+                            self._accumulate_iteration_stage(
+                                iteration_summary,
+                                "kernel",
+                                merge_duration,
+                                stage_kind,
                             )
                     if oom_seen:
                         raise RuntimeError(
@@ -3384,11 +3500,13 @@ class GPUBPETrainer:
                             }
                         )
                         if metrics_enabled:
-                            metrics_tracker.record_stage("d2h", sync_duration)
+                            stage_kind = metrics_tracker.record_stage("d2h", sync_duration)
                             if iteration_summary is not None:
-                                iteration_summary["d2h_s"] = (
-                                    float(iteration_summary.get("d2h_s", 0.0))
-                                    + sync_duration
+                                self._accumulate_iteration_stage(
+                                    iteration_summary,
+                                    "d2h",
+                                    sync_duration,
+                                    stage_kind,
                                 )
                     _capture_device_snapshots("apply_merge:warm:end")
                 else:
@@ -3409,11 +3527,13 @@ class GPUBPETrainer:
                         }
                     )
                     if metrics_enabled:
-                        metrics_tracker.record_stage("kernel", merge_duration)
+                        stage_kind = metrics_tracker.record_stage("kernel", merge_duration)
                         if iteration_summary is not None:
-                            iteration_summary["kernel_s"] = (
-                                float(iteration_summary.get("kernel_s", 0.0))
-                                + merge_duration
+                            self._accumulate_iteration_stage(
+                                iteration_summary,
+                                "kernel",
+                                merge_duration,
+                                stage_kind,
                             )
                 self.merges.append((a_id, b_id))
                 self.vocab_size += 1
@@ -3496,13 +3616,14 @@ class GPUBPETrainer:
                         }
                     )
                     if metrics_enabled:
-                        metrics_tracker.record_stage("kernel", count_duration)
+                        stage_kind = metrics_tracker.record_stage("kernel", count_duration)
                         if iteration_summary is not None:
-                            iteration_summary["kernel_s"] = (
-                                float(iteration_summary.get("kernel_s", 0.0))
-                                + count_duration
+                            self._accumulate_iteration_stage(
+                                iteration_summary,
+                                "kernel",
+                                count_duration,
+                                stage_kind,
                             )
-                            iteration_summary["token_time_s"] = count_duration
                     gpu_batches = [
                         batch
                         for batch in consumed_batches
@@ -3529,13 +3650,14 @@ class GPUBPETrainer:
                         }
                     )
                     if metrics_enabled:
-                        metrics_tracker.record_stage("kernel", count_duration)
+                        stage_kind = metrics_tracker.record_stage("kernel", count_duration)
                         if iteration_summary is not None:
-                            iteration_summary["kernel_s"] = (
-                                float(iteration_summary.get("kernel_s", 0.0))
-                                + count_duration
+                            self._accumulate_iteration_stage(
+                                iteration_summary,
+                                "kernel",
+                                count_duration,
+                                stage_kind,
                             )
-                            iteration_summary["token_time_s"] = count_duration
                 if global_keys is None or global_keys.numel() == 0:
                     print("No pairs left to merge.")
                     if metrics_enabled:
@@ -3557,11 +3679,15 @@ class GPUBPETrainer:
                 agg_keys, agg_counts = aggregate_pair_keys(global_keys, global_counts)
                 if reduction_start is not None:
                     reduction_duration = time.perf_counter() - reduction_start
-                    metrics_tracker.record_stage("reduction", reduction_duration)
+                    stage_kind = metrics_tracker.record_stage(
+                        "reduction", reduction_duration
+                    )
                     if self._metrics_iteration_summary is not None:
-                        self._metrics_iteration_summary["reduction_s"] = (
-                            self._metrics_iteration_summary.get("reduction_s", 0.0)
-                            + reduction_duration
+                        self._accumulate_iteration_stage(
+                            self._metrics_iteration_summary,
+                            "reduction",
+                            reduction_duration,
+                            stage_kind,
                         )
                 best_tensor_count = torch.max(agg_counts)
                 candidate_indices = torch.nonzero(
@@ -3619,11 +3745,13 @@ class GPUBPETrainer:
                         }
                     )
                     if metrics_enabled:
-                        metrics_tracker.record_stage("kernel", merge_duration)
+                        stage_kind = metrics_tracker.record_stage("kernel", merge_duration)
                         if iteration_summary is not None:
-                            iteration_summary["kernel_s"] = (
-                                float(iteration_summary.get("kernel_s", 0.0))
-                                + merge_duration
+                            self._accumulate_iteration_stage(
+                                iteration_summary,
+                                "kernel",
+                                merge_duration,
+                                stage_kind,
                             )
                     gpu_batches = [
                         batch
@@ -3646,11 +3774,13 @@ class GPUBPETrainer:
                         }
                     )
                     if metrics_enabled:
-                        metrics_tracker.record_stage("d2h", sync_duration)
+                        stage_kind = metrics_tracker.record_stage("d2h", sync_duration)
                         if iteration_summary is not None:
-                            iteration_summary["d2h_s"] = (
-                                float(iteration_summary.get("d2h_s", 0.0))
-                                + sync_duration
+                            self._accumulate_iteration_stage(
+                                iteration_summary,
+                                "d2h",
+                                sync_duration,
+                                stage_kind,
                             )
                 _capture_device_snapshots("apply_merge:end")
             else:
@@ -3658,23 +3788,25 @@ class GPUBPETrainer:
                 current_batches, oom_seen, _ = _apply_merge_cpu(current_batches, a_id, b_id, new_id)
                 merge_duration = time.perf_counter() - merge_start
                 stage_timings["apply_merge"].record(merge_duration)
-                    stage_event_log.append(
-                        {
-                            "stage": "apply_merge",
-                            "duration_s": merge_duration,
-                            "mode": "cpu",
+                stage_event_log.append(
+                    {
+                        "stage": "apply_merge",
+                        "duration_s": merge_duration,
+                        "mode": "cpu",
                         "merge": step,
                         "type": "merge",
-                            "timestamp": time.time(),
-                        }
-                    )
-                    if metrics_enabled:
-                        metrics_tracker.record_stage("kernel", merge_duration)
-                        if iteration_summary is not None:
-                            iteration_summary["kernel_s"] = (
-                                float(iteration_summary.get("kernel_s", 0.0))
-                                + merge_duration
-                            )
+                        "timestamp": time.time(),
+                    }
+                )
+                if metrics_enabled:
+                    stage_kind = metrics_tracker.record_stage("kernel", merge_duration)
+                    if iteration_summary is not None:
+                        self._accumulate_iteration_stage(
+                            iteration_summary,
+                            "kernel",
+                            merge_duration,
+                            stage_kind,
+                        )
             step += 1
             self._merge_step = step
             if not use_cuda:
@@ -3726,7 +3858,14 @@ class GPUBPETrainer:
                     }
                 )
                 if metrics_enabled:
-                    metrics_tracker.record_stage("d2h", final_duration)
+                    stage_kind = metrics_tracker.record_stage("d2h", final_duration)
+                    if self._metrics_iteration_summary is not None:
+                        self._accumulate_iteration_stage(
+                            self._metrics_iteration_summary,
+                            "d2h",
+                            final_duration,
+                            stage_kind,
+                        )
             if self._interval_merges > 0:
                 self._close_sync_interval(step, final_bytes)
         per_device_metrics = {

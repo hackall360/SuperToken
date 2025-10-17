@@ -3,6 +3,16 @@ from types import MethodType
 import time
 
 torch = pytest.importorskip("torch")
+if getattr(torch, "_SUPERTOKEN_TORCH_STUB", False) or not hasattr(torch, "tensor"):
+    pytest.skip(
+        "PyTorch with tensor factories is required for BPE trainer tests",
+        allow_module_level=True,
+    )
+if not hasattr(torch, "cuda") or not hasattr(torch.cuda, "device_count"):
+    pytest.skip(
+        "PyTorch CUDA support is unavailable in the current test environment",
+        allow_module_level=True,
+    )
 pytest.importorskip("torch.utils")
 
 from gpu_tokenizer import bpe_trainer as bt

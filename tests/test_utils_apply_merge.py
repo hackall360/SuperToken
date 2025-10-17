@@ -4,6 +4,11 @@ import pytest
 
 
 torch = pytest.importorskip("torch")
+if getattr(torch, "_SUPERTOKEN_TORCH_STUB", False) or not hasattr(torch, "tensor"):
+    pytest.skip(
+        "PyTorch with tensor factories is required for apply_merge tests",
+        allow_module_level=True,
+    )
 
 import gpu_tokenizer.cuda_kernels as cuda_kernels
 

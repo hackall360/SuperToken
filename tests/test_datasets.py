@@ -1,6 +1,11 @@
 import pytest
 
 torch = pytest.importorskip("torch")
+if getattr(torch, "_SUPERTOKEN_TORCH_STUB", False) or not hasattr(torch, "full"):
+    pytest.skip(
+        "PyTorch with tensor factories is required for dataset batching tests",
+        allow_module_level=True,
+    )
 
 from gpu_tokenizer.datasets import PackedBatcher
 

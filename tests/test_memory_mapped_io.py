@@ -29,6 +29,7 @@ if "torch" not in sys.modules:  # pragma: no cover - lightweight stub for tests
         zeros=_unavailable,
         as_tensor=_unavailable,
     )
+    torch_stub._SUPERTOKEN_TORCH_STUB = True
     sys.modules["torch"] = torch_stub
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,7 +49,6 @@ pkg.PackedBatcher = object()
 pkg.AutoScaler = object()
 pkg.GPUBPETrainer = object()
 pkg.GPUUnigramTrainer = object()
-pkg.utils = types.SimpleNamespace()
 
 main = importlib.import_module("main")
 

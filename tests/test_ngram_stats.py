@@ -6,6 +6,11 @@ from typing import Dict, Iterable, Tuple
 import pytest
 
 torch = pytest.importorskip("torch")
+if getattr(torch, "_SUPERTOKEN_TORCH_STUB", False) or not hasattr(torch, "tensor"):
+    pytest.skip(
+        "PyTorch with tensor factories is required for n-gram statistics tests",
+        allow_module_level=True,
+    )
 
 from gpu_tokenizer.ngram_stats import compute_ngram_histograms
 

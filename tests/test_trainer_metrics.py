@@ -12,6 +12,8 @@ def test_trainer_metrics_ewma_smoothing_and_window():
     metrics.record_tokens(tokens=200, duration_s=1.0, leases=20)
     metrics.record_tokens(tokens=50, duration_s=1.0, leases=5)
 
+    metrics.record_stage("h2d", 0.25)
+    metrics.record_stage("d2h", 0.5)
     metrics.record_stage("kernel", 0.5)
     metrics.record_stage("kernel", 1.0)
     metrics.record_stage("kernel", 1.5)
@@ -20,6 +22,7 @@ def test_trainer_metrics_ewma_smoothing_and_window():
     summary = metrics.summaries()
 
     assert summary["enabled"] is True
+    assert summary["overlap_enabled"] is True
     assert summary["tokens_per_s"] == pytest.approx(100.0, rel=1e-6)
     assert summary["lease_per_s"] == pytest.approx(10.0, rel=1e-6)
 
@@ -27,11 +30,20 @@ def test_trainer_metrics_ewma_smoothing_and_window():
     assert kernel_summary.get("samples") == 3
     assert kernel_summary.get("window") == [1.0, 1.5, 2.0]
 
+    copy_summary = summary["copy"]
+    compute_summary = summary["compute"]
+    assert copy_summary["samples"] == 2
+    assert copy_summary["latest_s"] == pytest.approx(0.5)
+    assert compute_summary["samples"] == 3
+    assert compute_summary["latest_s"] == pytest.approx(2.0)
+
     metrics.reset()
     reset_summary = metrics.summaries()
     assert reset_summary["tokens_per_s"] is None
     assert reset_summary["lease_per_s"] is None
     assert reset_summary["stages"] == {}
+    assert reset_summary["copy"]["samples"] == 0
+    assert reset_summary["compute"]["samples"] == 0
 
 
 def test_trainer_metrics_handles_disabled_state():
@@ -44,3 +56,31 @@ def test_trainer_metrics_handles_disabled_state():
     assert summary["tokens_per_s"] is None
     assert summary["lease_per_s"] is None
     assert summary["stages"] == {}
+    assert summary["copy"]["samples"] == 0
+    assert summary["compute"]["samples"] == 0
+
+
+def test_overlap_toggle_changes_throughput_breakdown():
+    metrics = TrainerMetricsEWMA(alpha=1.0, window_size=4, enabled=True)
+
+    metrics.record_tokens(tokens=1_000, duration_s=1.0)
+    metrics.record_stage("kernel", 0.4)
+    metrics.record_stage("h2d", 0.2)
+    metrics.record_stage("d2h", 0.2)
+    overlap_summary = metrics.summaries()
+
+    metrics.reset()
+    metrics.overlap_enabled = False
+    metrics.record_tokens(tokens=1_000, duration_s=2.0)
+    metrics.record_stage("kernel", 0.4)
+    metrics.record_stage("h2d", 0.2)
+    metrics.record_stage("d2h", 0.2)
+    no_overlap_summary = metrics.summaries()
+
+    assert overlap_summary["overlap_enabled"] is True
+    assert no_overlap_summary["overlap_enabled"] is False
+    assert no_overlap_summary["tokens_per_s"] < overlap_summary["tokens_per_s"]
+    assert no_overlap_summary["copy"]["avg_s"] >= overlap_summary["copy"]["avg_s"]
+    assert no_overlap_summary["compute"]["avg_s"] == pytest.approx(
+        overlap_summary["compute"]["avg_s"]
+    )
