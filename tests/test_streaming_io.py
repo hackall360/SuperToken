@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import logging
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ if getattr(torch, "_SUPERTOKEN_TORCH_STUB", False) or not hasattr(torch, "full")
         allow_module_level=True,
     )
 
+from gpu_tokenizer.autoscaler import AutoScaler, ScaleState
 from gpu_tokenizer.cpu_packer import BytePacker
 from gpu_tokenizer.datasets import StreamingPackedBatcher
 from gpu_tokenizer.io import CorpusStreamer, GPUUtilizationMonitor
@@ -97,3 +99,76 @@ def test_streaming_batcher_emits_batches(tmp_path: Path) -> None:
     assert tokens.shape[1] >= 6
     assert valid[0, : lengths[0]].sum().item() == lengths[0]
     assert valid[1, : lengths[1]].sum().item() == lengths[1]
+
+
+def _write_shards(tmp_path: Path, count: int = 4, payload: bytes | None = None) -> list[Path]:
+    shards: list[Path] = []
+    payload = payload or b"x" * 32
+    for idx in range(count):
+        shard = tmp_path / f"stress_{idx}.bin"
+        shard.write_bytes(payload)
+        shards.append(shard)
+    return shards
+
+
+def test_streamer_prefetch_reacts_to_oom(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    shards = _write_shards(tmp_path, count=3)
+    autoscaler = AutoScaler(target_util=0.8, device="cpu")
+    autoscaler.state = ScaleState(batch_size=512, cpu_workers=4, h2d_mb=512)
+    streamer = CorpusStreamer(
+        shards,
+        compression="none",
+        num_workers=1,
+        max_prefetch=4,
+        autoscaler=autoscaler,
+        prefetch_jitter=0.0,
+    )
+    streamer.start()
+    try:
+        time.sleep(0.05)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            autoscaler.feedback(oom=True)
+        assert streamer.prefetch_limit() < 4
+        assert any(
+            "stream.prefetch.adjust" in record.message and '"reason": "oom"' in record.message
+            for record in caplog.records
+        )
+    finally:
+        streamer.close()
+
+
+def test_streamer_prefetch_throttles_on_util_spike(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shards = _write_shards(tmp_path, count=4)
+    autoscaler = AutoScaler(target_util=0.7, device="cpu")
+    autoscaler.state = ScaleState(batch_size=512, cpu_workers=4, h2d_mb=512)
+    streamer = CorpusStreamer(
+        shards,
+        compression="none",
+        num_workers=1,
+        max_prefetch=6,
+        autoscaler=autoscaler,
+        prefetch_jitter=0.0,
+    )
+    streamer.start()
+    try:
+        time.sleep(0.05)
+        caplog.clear()
+
+        def _fake_gpu_caps() -> tuple[int, int]:
+            return 5, 100
+
+        monkeypatch.setattr(autoscaler, "_gpu_caps", _fake_gpu_caps)
+        with caplog.at_level(logging.INFO):
+            for _ in range(6):
+                autoscaler.feedback(step_time_s=0.4)
+                time.sleep(0.01)
+        assert streamer.prefetch_limit() < 6
+        assert any(
+            '"reason": "high_utilization"' in record.message
+            for record in caplog.records
+        )
+    finally:
+        streamer.close()

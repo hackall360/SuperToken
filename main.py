@@ -508,6 +508,7 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
             num_workers=args.io_workers,
             max_prefetch=args.prefetch_batches,
             autoscaler=autoscaler,
+            prefetch_jitter=max(0.0, float(getattr(args, "prefetch_jitter", 0.0))),
         )
         streamer.start()
         return streamer
@@ -755,6 +756,12 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         default=4,
         help="Maximum number of prefetched batches before backpressure engages",
+    )
+    common.add_argument(
+        "--prefetch-jitter",
+        type=float,
+        default=0.0,
+        help="Random jitter applied when throttling prefetch depth (0 disables)",
     )
 
     train_bpe = subparsers.add_parser("train-bpe", parents=[common], help="Train a BPE model")
