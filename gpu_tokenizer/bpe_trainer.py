@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import heapq
+import logging
 import json
 import os
 import time
@@ -38,6 +39,8 @@ from .dtypes import (
     promote_length_sum_dtype,
 )
 from .trainers.base import BaseTrainer, CheckpointPayload
+
+logger = logging.getLogger(__name__)
 from .trainers.metrics import TrainerMetricsEWMA
 from .trainers.bpe_gpu import (
     PairHistogramResult,
@@ -1336,6 +1339,7 @@ class GPUBPETrainer(BaseTrainer):
         stage_event_log: Optional[list[dict[str, object]]] = None,
         host_sync_events: Optional[list[dict[str, object]]] = None,
         device_snapshot_log: Optional[list[dict[str, object]]] = None,
+        dataset_state: Optional[Mapping[str, object]] = None,
     ) -> dict[str, object]:
         model_section = {
             "base_vocab": int(self.base_vocab),
@@ -1400,6 +1404,21 @@ class GPUBPETrainer(BaseTrainer):
             dataset_section["active_batch_size"] = int(self._active_batch_size)
         if include_batches and current_batches is not None:
             dataset_section["batches"] = self._serialize_batches(current_batches)
+        if dataset_state:
+            offsets = dataset_state.get("stream_offsets") if isinstance(dataset_state, Mapping) else None
+            if isinstance(offsets, Mapping) and offsets:
+                dataset_section["stream_offsets"] = {
+                    str(path): int(offset)
+                    for path, offset in offsets.items()
+                    if isinstance(path, str)
+                }
+            batch_size = dataset_state.get("batch_size") if isinstance(dataset_state, Mapping) else None
+            try:
+                batch_size_int = int(batch_size) if batch_size is not None else None
+            except (TypeError, ValueError):
+                batch_size_int = None
+            if batch_size_int and batch_size_int > 0:
+                dataset_section["stream_batch_size"] = batch_size_int
 
         autoscaler_section: dict[str, object] = {
             "state": self.autoscaler.state_dict(),
@@ -1557,6 +1576,23 @@ class GPUBPETrainer(BaseTrainer):
         self._last_cpu_fallback_ratio = float(
             dataset_meta.get("last_cpu_fallback_ratio", self._last_cpu_fallback_ratio)
         )
+        dataset_state_payload: dict[str, object] = {}
+        stream_offsets = dataset_meta.get("stream_offsets")
+        if isinstance(stream_offsets, Mapping):
+            dataset_state_payload["stream_offsets"] = {
+                str(path): int(offset)
+                for path, offset in stream_offsets.items()
+                if isinstance(path, str)
+            }
+        stream_batch_size = dataset_meta.get("stream_batch_size")
+        try:
+            batch_size_val = (
+                int(stream_batch_size) if stream_batch_size is not None else None
+            )
+        except (TypeError, ValueError):
+            batch_size_val = None
+        if batch_size_val and batch_size_val > 0:
+            dataset_state_payload["batch_size"] = batch_size_val
 
         autoscaler_meta = payload.autoscaler or {}
         if not isinstance(autoscaler_meta, Mapping):
@@ -1622,6 +1658,7 @@ class GPUBPETrainer(BaseTrainer):
             "stage_event_log": stage_event_log,
             "host_sync_events": host_sync_events,
             "device_snapshot_log": device_snapshot_log,
+            "dataset_state": dataset_state_payload,
         }
 
     def save_checkpoint(
@@ -1650,6 +1687,7 @@ class GPUBPETrainer(BaseTrainer):
         stage_event_log: Optional[list[dict[str, object]]] = None,
         host_sync_events: Optional[list[dict[str, object]]] = None,
         device_snapshot_log: Optional[list[dict[str, object]]] = None,
+        dataset_state: Optional[Mapping[str, object]] = None,
     ) -> dict[str, object]:
         state = self.state_dict(
             current_batches=current_batches,
@@ -1658,6 +1696,7 @@ class GPUBPETrainer(BaseTrainer):
             stage_event_log=stage_event_log,
             host_sync_events=host_sync_events,
             device_snapshot_log=device_snapshot_log,
+            dataset_state=dataset_state,
         )
         os.makedirs(path, exist_ok=True)
         meta_path = os.path.join(path, "state.json")
@@ -2179,6 +2218,7 @@ class GPUBPETrainer(BaseTrainer):
         checkpoint_dir: Optional[str] = None,
         resume_state: Optional[dict[str, object]] = None,
         on_iteration_summary: Optional[Callable[[dict[str, object]], None]] = None,
+        dataset_state: Optional[object] = None,
     ) -> dict[str, object]:
         """Train merges using a pipelined GPU workflow when possible."""
 
@@ -2214,6 +2254,9 @@ class GPUBPETrainer(BaseTrainer):
         ] = batches
         gpu_batches: Optional[list[MultiDeviceBatch]] = None
         scale_state = None
+        dataset_tracker = dataset_state
+        if dataset_tracker is None and hasattr(batches, "stream_state_dict"):
+            dataset_tracker = batches
 
         self._merge_step = len(self.merges)
         checkpoint_dir_path = os.fspath(checkpoint_dir) if checkpoint_dir is not None else None
@@ -2593,6 +2636,14 @@ class GPUBPETrainer(BaseTrainer):
                 device_contexts=device_contexts if use_cuda else None,
                 use_cuda=use_cuda,
             )
+            dataset_payload = resume_payload.get("dataset_state")
+            if dataset_tracker is not None and isinstance(dataset_payload, Mapping):
+                restore_fn = getattr(dataset_tracker, "load_stream_state", None)
+                if callable(restore_fn):
+                    try:
+                        restore_fn(dataset_payload)
+                    except Exception:  # pragma: no cover - defensive logging
+                        logger.exception("failed to restore dataset stream state")
             restored_batches = resume_payload.get("current_batches")
             if restored_batches is not None:
                 current_batches = restored_batches
@@ -4068,6 +4119,14 @@ class GPUBPETrainer(BaseTrainer):
                 and checkpoint_dir_path is not None
                 and step % checkpoint_interval == 0
             ):
+                dataset_snapshot = None
+                if dataset_tracker is not None:
+                    snapshot_fn = getattr(dataset_tracker, "stream_state_dict", None)
+                    if callable(snapshot_fn):
+                        try:
+                            dataset_snapshot = snapshot_fn()
+                        except Exception:  # pragma: no cover - defensive logging
+                            logger.exception("failed to snapshot dataset stream state")
                 self.save_checkpoint(
                     checkpoint_dir_path,
                     include_batches=True,
@@ -4076,6 +4135,7 @@ class GPUBPETrainer(BaseTrainer):
                     stage_event_log=stage_event_log,
                     host_sync_events=host_sync_events,
                     device_snapshot_log=device_snapshot_log,
+                    dataset_state=dataset_snapshot,
                 )
         if use_cuda and gpu_batches is not None:
             final_bytes, final_duration = _finalize_host_sync(gpu_batches)
