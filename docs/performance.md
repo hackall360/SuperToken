@@ -59,6 +59,32 @@ Each rank must contribute identically shaped tensors to the reduction; the
 trainer handles padding internally, so no additional user code is required
 beyond the distributed initialization.
 
+### `--dist` runtime workflow
+
+The new distributed runtime wraps the trainer in a lease-based scheduler so
+heterogeneous GPUs keep pulling work until the corpus is exhausted. Enable it
+with the `--dist` flag and enumerate the participating devices via `--gpus`:
+
+```bash
+torchrun --standalone --nnodes 1 --nproc_per_node 2 \
+  python -m gpu_tokenizer.cli_train_bpe \
+    --dist \
+    --gpus 0,1 \
+    --data "data/**/*.txt" \
+    --merges 50000 \
+    --lease-size 16 \
+    --rebalance-secs 10 \
+    --target-chunk-ms 100
+```
+
+When launched with `torchrun`, rank 0 runs the host notary that doles out leases
+of work to every other rank. Faster GPUs request the next lease as soon as they
+drain the current chunk, while slower devices automatically contribute at their
+own pace. The per-rank table that prints every few iterations reports the GPU
+identifier, recent tokens/sec, lease size, number of inflight leases, and stage
+timings, making it easy to spot stragglers or communication stalls during long
+training jobs.
+
 ## Streaming corpus ingestion
 
 `main.py` now wires the `CorpusStreamer` into the training loop. Shards are
