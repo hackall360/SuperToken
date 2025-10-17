@@ -24,9 +24,34 @@ def _load_dist_runtime(monkeypatch: pytest.MonkeyPatch):
     fake_torch.cuda = types.SimpleNamespace(
         is_available=lambda: True,
         set_device=lambda *_args, **_kwargs: None,
+        device_count=lambda: 2,
+        device_can_access_peer=lambda *_args, **_kwargs: True,
     )
     fake_torch.device = lambda kind, index: f"{kind}:{index}"
+    fake_torch.uint16 = object()
+    fake_torch.int32 = object()
+    fake_torch.int16 = object()
+    fake_torch.int8 = object()
+    fake_torch.uint8 = object()
+    fake_torch.int64 = object()
+
+    def _fake_iinfo(dtype):
+        if dtype is fake_torch.uint16:
+            return types.SimpleNamespace(max=65535)
+        if dtype is fake_torch.int32:
+            return types.SimpleNamespace(max=2_147_483_647)
+        raise TypeError("unsupported dtype")
+
+    fake_torch.iinfo = _fake_iinfo
+    fake_torch_utils = types.ModuleType("torch.utils")
+    fake_cpp = types.ModuleType("torch.utils.cpp_extension")
+    fake_cpp.load_inline = lambda *_args, **_kwargs: None
+    fake_torch_utils.cpp_extension = fake_cpp
+    fake_torch.utils = fake_torch_utils
+    fake_torch.jit = types.SimpleNamespace(script=lambda fn: fn)
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "torch.utils", fake_torch_utils)
+    monkeypatch.setitem(sys.modules, "torch.utils.cpp_extension", fake_cpp)
 
     fake_dist = types.ModuleType("torch.distributed")
     fake_dist.is_available = lambda: True
@@ -141,6 +166,27 @@ def _patch_common_runtime(monkeypatch: pytest.MonkeyPatch):
         "broadcast_log": broadcast_log,
         "gather_log": gather_log,
     }
+
+
+class _FakeLeaseClient:
+    def __init__(self, world_size: int) -> None:
+        self._lock = threading.Lock()
+        uniform = 1.0 / float(world_size)
+        self._weights: dict[int, float] = {rank: uniform for rank in range(world_size)}
+
+    def update_rank_weights(self, weights: dict[int, float]) -> None:
+        cleaned: dict[int, float] = {}
+        for rank, value in weights.items():
+            cleaned[int(rank)] = float(value)
+        total = sum(cleaned.values())
+        if total > 0.0:
+            cleaned = {rank: value / total for rank, value in cleaned.items()}
+        with self._lock:
+            self._weights = cleaned
+
+    def rank_weights(self) -> dict[int, float]:
+        with self._lock:
+            return dict(self._weights)
 
 
 def test_launch_training_surfaces_worker_exception(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
@@ -529,3 +575,69 @@ def test_idle_metrics_drop_with_extra_prefetch(monkeypatch: pytest.MonkeyPatch) 
     idle_entry = metrics[0]
     assert idle_entry["samples"] >= 2
     assert idle_entry["ewma_ms"] < 50.0
+
+
+def test_rebalance_converges_within_30s(monkeypatch: pytest.MonkeyPatch) -> None:
+    dist_runtime, _ = _patch_common_runtime(monkeypatch)
+
+    from gpu_tokenizer.bpe_trainer import TrainerMetricsEWMA
+
+    world_size = 2
+    os.environ["WORLD_SIZE"] = str(world_size)
+    broadcast_state = {"message": None}
+    current_snapshots: dict[str, list[dict[str, object]] | None] = {"value": None}
+
+    gather_log: list[tuple[int, object]] = []
+
+    def _gather(obj: object, gather_list=None, *, dst=0, group=None):
+        rank = int(os.environ.get("RANK", "0"))
+        if gather_list is not None and current_snapshots["value"] is not None:
+            gather_list[:] = list(current_snapshots["value"])
+        gather_log.append((rank, obj))
+
+    def _broadcast(obj_list, *, src=0, group=None):
+        rank = int(os.environ.get("RANK", "0"))
+        if rank == src:
+            broadcast_state["message"] = obj_list[0]
+        else:
+            obj_list[0] = broadcast_state["message"]
+
+    monkeypatch.setattr(dist_runtime.dist, "gather_object", _gather, raising=False)
+    monkeypatch.setattr(dist_runtime.dist, "broadcast_object_list", _broadcast, raising=False)
+
+    metrics0 = TrainerMetricsEWMA(alpha=0.2, window_size=4, enabled=True)
+    metrics0.set_rank(0)
+    metrics1 = TrainerMetricsEWMA(alpha=0.2, window_size=4, enabled=True)
+    metrics1.set_rank(1)
+
+    lease0 = _FakeLeaseClient(world_size)
+    lease1 = _FakeLeaseClient(world_size)
+
+    def _run_iteration(tokens0: int, tokens1: int) -> None:
+        metrics0.record_tokens(tokens=tokens0, duration_s=1.0, leases=tokens0)
+        metrics1.record_tokens(tokens=tokens1, duration_s=1.0, leases=tokens1)
+        current_snapshots["value"] = [metrics0.snapshot(), metrics1.snapshot()]
+        for local_rank, (metrics_obj, lease_obj) in enumerate(
+            ((metrics0, lease0), (metrics1, lease1))
+        ):
+            os.environ["RANK"] = str(local_rank)
+            dist_runtime._rebalance_once(
+                rank=local_rank,
+                world_size=world_size,
+                metrics=metrics_obj,
+                lease_client=lease_obj,
+                blend=0.5,
+            )
+
+    for _ in range(3):
+        _run_iteration(50, 150)
+
+    weights0 = lease0.rank_weights()
+    weights1 = lease1.rank_weights()
+    assert weights0 == pytest.approx(weights1)
+    assert weights0[0] == pytest.approx(0.25, abs=0.05)
+    assert weights0[1] == pytest.approx(0.75, abs=0.05)
+
+    per_rank = metrics0.snapshot()["per_rank"]
+    assert per_rank[1]["tokens_per_s"] == pytest.approx(metrics1.tokens_per_s)
+    assert gather_log, "gather should record each rebalance sample"
