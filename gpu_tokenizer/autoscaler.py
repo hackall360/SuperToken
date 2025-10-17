@@ -8,7 +8,7 @@ import math
 import os
 from collections import deque
 from dataclasses import asdict, dataclass
-from typing import Deque, Optional
+from typing import Callable, Deque, Optional
 
 try:  # pragma: no cover - optional dependency
     import psutil  # type: ignore
@@ -53,6 +53,25 @@ class AutoScaler:
         self._window_size = max(3, window_size)
         self._step_times: Deque[float] = deque(maxlen=self._window_size)
         self._vram_fracs: Deque[float] = deque(maxlen=self._window_size)
+        self._feedback_listeners: list[Callable[[dict[str, object]], None]] = []
+
+    # ------------------------------------------------------------------
+    # Feedback hooks
+    def register_feedback_listener(self, listener: Callable[[dict[str, object]], None]) -> None:
+        """Register a listener that receives structured feedback events."""
+
+        if listener in self._feedback_listeners:
+            return
+        self._feedback_listeners.append(listener)
+
+    def _emit_feedback_event(self, payload: dict[str, object]) -> None:
+        if not self._feedback_listeners:
+            return
+        for listener in list(self._feedback_listeners):
+            try:
+                listener(dict(payload))
+            except Exception:  # pragma: no cover - defensive logging
+                logger.exception("autoscaler listener failed")
 
     # ------------------------------------------------------------------
     # Serialization helpers
@@ -196,6 +215,14 @@ class AutoScaler:
             self._log_adjustment(prev, self.state, event="oom")
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            self._emit_feedback_event(
+                {
+                    "event": "oom",
+                    "prev_state": asdict(prev),
+                    "state": asdict(self.state),
+                    "cpu_fallback_rate": fallback_rate,
+                }
+            )
             return
         free, total = self._gpu_caps()
         if total == 0:
@@ -212,6 +239,25 @@ class AutoScaler:
             self.state = new_state
             self._h2d_mb = self.state.h2d_mb
             self._log_adjustment(prev_state, new_state, mean_vram, var_vram, mean_step)
+            reason: str = "feedback"
+            lower_bound = max(0.75, self.tu - 0.05)
+            upper_bound = min(0.95, self.tu + 0.10)
+            if mean_vram < lower_bound:
+                reason = "low_utilization"
+            elif mean_vram > upper_bound:
+                reason = "high_utilization"
+            self._emit_feedback_event(
+                {
+                    "event": reason,
+                    "prev_state": asdict(prev_state),
+                    "state": asdict(new_state),
+                    "mean_vram": mean_vram,
+                    "var_vram": var_vram,
+                    "mean_step_time": mean_step,
+                    "cpu_fallback_rate": fallback_rate,
+                    "target_util": self.tu,
+                }
+            )
         else:
             self.state = ScaleState(
                 batch_size=self.state.batch_size,

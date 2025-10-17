@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import mmap
 import os
 import queue
+import random
 import threading
 import time
 from contextlib import AbstractContextManager
@@ -36,6 +39,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing helper
 CompressionType = str
 
 _SENTINEL = object()
+
+logger = logging.getLogger(__name__)
+
+AutoscaleCallback = Callable[[dict[str, object], int, int, int], Optional[int]]
 
 
 class DecompressionError(RuntimeError):
@@ -94,6 +101,14 @@ class BackpressureController:
         scale = headroom / max(self.target_util, 1e-6)
         depth = self.min_depth + int(round(scale * (self.max_depth - self.min_depth)))
         return max(self.min_depth, min(self.max_depth, depth))
+
+    def update_limits(
+        self, *, min_depth: Optional[int] = None, max_depth: Optional[int] = None
+    ) -> None:
+        if min_depth is not None:
+            self.min_depth = max(1, min_depth)
+        if max_depth is not None:
+            self.max_depth = max(self.min_depth, max_depth)
 
     def wait_for_slot(self, q: "queue.Queue[object]") -> None:
         while True:
@@ -332,7 +347,9 @@ class CorpusStreamer(AbstractContextManager["CorpusStreamer"]):
         num_workers: int = 2,
         max_prefetch: int = 8,
         autoscaler: Optional[object] = None,
+        autoscaler_callback: Optional[AutoscaleCallback] = None,
         gpu_monitor: Optional[GPUUtilizationMonitor] = None,
+        prefetch_jitter: float = 0.0,
         buffer_pool_size: Optional[int] = None,
         buffer_bytes: int = 1 << 20,
     ) -> None:
@@ -340,13 +357,23 @@ class CorpusStreamer(AbstractContextManager["CorpusStreamer"]):
         self.compression = compression
         self.num_workers = max(1, num_workers)
         target_util = getattr(autoscaler, "tu", 0.8) if autoscaler is not None else 0.8
+        self._prefetch_floor = 1
+        self._prefetch_ceiling = max(1, max_prefetch)
+        self._prefetch_target = self._prefetch_ceiling
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_jitter = max(0.0, min(0.5, float(prefetch_jitter)))
+        self._autoscale_callback: Optional[AutoscaleCallback]
+        if autoscaler_callback is None:
+            self._autoscale_callback = self._default_autoscale_policy
+        else:
+            self._autoscale_callback = autoscaler_callback
         self._backpressure = BackpressureController(
             target_util=target_util,
             min_depth=1,
-            max_depth=max(1, max_prefetch),
+            max_depth=self._prefetch_ceiling,
             monitor=gpu_monitor,
         )
-        self._queue: "queue.Queue[object]" = queue.Queue(maxsize=max(1, max_prefetch))
+        self._queue: "queue.Queue[object]" = queue.Queue(maxsize=self._prefetch_ceiling)
         self._tasks: "queue.Queue[Optional[Path]]" = queue.Queue()
         for path in self.paths:
             self._tasks.put(path)
@@ -356,6 +383,12 @@ class CorpusStreamer(AbstractContextManager["CorpusStreamer"]):
         self._buffer_pool = _ReusableBufferPool(pool_size, buffer_bytes)
         self._threads: list[threading.Thread] = []
         self._stopped = threading.Event()
+        self._autoscaler = autoscaler
+        if autoscaler is not None and hasattr(autoscaler, "register_feedback_listener"):
+            try:
+                autoscaler.register_feedback_listener(self._handle_autoscaler_feedback)
+            except Exception:  # pragma: no cover - defensive logging
+                logger.exception("failed to register autoscaler feedback listener")
 
     def __enter__(self) -> "CorpusStreamer":
         self.start()
@@ -363,6 +396,92 @@ class CorpusStreamer(AbstractContextManager["CorpusStreamer"]):
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+
+    def _default_autoscale_policy(
+        self, payload: dict[str, object], current: int, floor: int, ceiling: int
+    ) -> Optional[int]:
+        event = str(payload.get("event", "")).lower()
+        if event == "oom":
+            return max(floor, max(1, current // 2))
+        if event == "high_utilization":
+            mean_vram = float(payload.get("mean_vram", 0.0) or 0.0)
+            target = float(payload.get("target_util", 0.0) or 0.0)
+            severity = max(0.0, mean_vram - target)
+            scale = 0.75
+            if severity > 0.12:
+                scale = 0.5
+            elif severity > 0.05:
+                scale = 0.65
+            next_limit = max(floor, int(round(current * scale)))
+            return max(floor, min(ceiling, next_limit))
+        if event == "low_utilization" and current < ceiling:
+            step = max(1, int(round(max(1, ceiling) * 0.1)))
+            return min(ceiling, current + step)
+        return None
+
+    def _handle_autoscaler_feedback(self, payload: dict[str, object]) -> None:
+        callback = self._autoscale_callback
+        if callback is None:
+            return
+        current_limit = self.prefetch_limit()
+        try:
+            suggestion = callback(payload, current_limit, self._prefetch_floor, self._prefetch_ceiling)
+        except TypeError:
+            try:
+                suggestion = callback(payload)  # type: ignore[arg-type]
+            except Exception:  # pragma: no cover - defensive logging
+                logger.exception("autoscale callback failed")
+                return
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception("autoscale callback failed")
+            return
+        if suggestion is None:
+            return
+        limit = int(suggestion)
+        limit = max(self._prefetch_floor, min(self._prefetch_ceiling, limit))
+        if limit < current_limit and self._prefetch_jitter > 0:
+            jitter = random.uniform(0.0, self._prefetch_jitter)
+            limit = max(self._prefetch_floor, int(round(limit * (1.0 - jitter))))
+        self._apply_prefetch_limit(limit, reason=str(payload.get("event", "autoscale")), metadata=payload)
+
+    def _apply_prefetch_limit(
+        self, limit: int, *, reason: str, metadata: Optional[dict[str, object]] = None
+    ) -> None:
+        with self._prefetch_lock:
+            prev = self._prefetch_target
+            bounded = max(self._prefetch_floor, min(self._prefetch_ceiling, int(limit)))
+            if bounded == prev:
+                return
+            self._prefetch_target = bounded
+            self._backpressure.update_limits(max_depth=bounded)
+        if bounded < prev:
+            payload: dict[str, object] = {
+                "reason": reason,
+                "prev_limit": prev,
+                "new_limit": bounded,
+                "queue_depth": self.queue_depth(),
+            }
+            if metadata:
+                filtered: dict[str, object] = {}
+                for key in (
+                    "event",
+                    "mean_vram",
+                    "var_vram",
+                    "mean_step_time",
+                    "cpu_fallback_rate",
+                    "target_util",
+                    "state",
+                    "prev_state",
+                ):
+                    if key in metadata:
+                        filtered[key] = metadata[key]
+                if filtered:
+                    payload["autoscaler"] = filtered
+            logger.info("stream.prefetch.adjust %s", json.dumps(payload, sort_keys=True))
+
+    def prefetch_limit(self) -> int:
+        with self._prefetch_lock:
+            return self._prefetch_target
 
     def start(self) -> None:
         if self._threads:
