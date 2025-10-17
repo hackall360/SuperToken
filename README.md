@@ -30,6 +30,7 @@ SuperToken is a GPU-accelerated tokenizer toolkit that offers high-throughput by
 
 ## Features
 - **GPU-native trainers** for both Byte Pair Encoding (BPE) and unigram vocabularies via `GPUBPETrainer` and `GPUUnigramTrainer`.
+- **CPU parity mode** for the unigram trainer, reusing the same candidate extension, forward/backward scoring, and pruning logic when CUDA is unavailable.
 - **Adaptive autoscaling** batch suggestion system to maintain target GPU utilization using the `AutoScaler` utility.
 - **Streaming corpus ingestion** with optional compression, memory-mapped shards, and background worker prefetch.
 - **Packed sequence helpers** that minimize host-device transfers and keep kernels fed with contiguous bytes.

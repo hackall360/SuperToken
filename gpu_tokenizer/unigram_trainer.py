@@ -43,6 +43,7 @@ class GPUUnigramTrainer(BaseTrainer):
         self._vocab_trie_next: torch.Tensor | None = None
         self._vocab_trie_terminal: torch.Tensor | None = None
         self._piece_lens_tensor: torch.Tensor | None = None
+        self._cpu_piece_cache: List[torch.Tensor] | None = None
         self._metrics = TrainerMetricsEWMA(enabled=False)
         self.register_metrics_tracker("throughput", self._metrics)
         self.reset_rng(seed=seed, generator=generator)
@@ -113,10 +114,17 @@ class GPUUnigramTrainer(BaseTrainer):
         self._vocab_trie_next = None
         self._vocab_trie_terminal = None
         self._piece_lens_tensor = None
+        self._cpu_piece_cache = None
 
     def _extend_candidates(self, sequences: torch.Tensor) -> None:
-        if self.device != "cuda" or not torch.cuda.is_available():
-            raise RuntimeError("GPU candidate extension requires CUDA availability")
+        if self.device == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError("GPU candidate extension requires CUDA availability")
+            self._extend_candidates_gpu(sequences)
+            return
+        self._extend_candidates_cpu(sequences)
+
+    def _extend_candidates_gpu(self, sequences: torch.Tensor) -> None:
         sequences = sequences.to(self.device)
         B, L = sequences.shape
         valid = sequences >= 0
@@ -226,6 +234,58 @@ class GPUUnigramTrainer(BaseTrainer):
         self.logp = torch.full((V,), -math.log(V), device=self.device)
         self._mark_vocab_dirty()
 
+    def _extend_candidates_cpu(self, sequences: torch.Tensor) -> None:
+        sequences = sequences.to(dtype=torch.int64, device=torch.device("cpu"))
+        B, L = sequences.shape
+        if B == 0 or L == 0:
+            return
+        valid = sequences >= 0
+        self._ensure_base_powers()
+        assert self._base_powers is not None
+        base_powers = self._base_powers.to("cpu")
+        candidate_counts: Dict[bytes, int] = {}
+        candidate_keys: Dict[bytes, int] = {}
+        max_len = self.max_len
+        for n in range(2, max_len + 1):
+            if L < n:
+                break
+            span_len = L - n + 1
+            for row in range(B):
+                row_tokens = sequences[row]
+                row_valid = valid[row]
+                for start in range(span_len):
+                    if not bool(row_valid[start : start + n].all()):
+                        continue
+                    window = row_tokens[start : start + n]
+                    piece = bytes(int(x) for x in window.tolist())
+                    if piece in self.piece2id:
+                        continue
+                    candidate_counts[piece] = candidate_counts.get(piece, 0) + 1
+                    if piece not in candidate_keys:
+                        encoded = 0
+                        window_list = window.tolist()
+                        for pos, value in enumerate(window_list):
+                            encoded += int(value) * int(base_powers[pos].item())
+                        candidate_keys[piece] = encoded * (max_len + 1) + n
+        if not candidate_counts:
+            return
+        ordered = sorted(
+            candidate_counts.items(),
+            key=lambda item: (-item[1], candidate_keys[item[0]]),
+        )
+        for piece, _ in ordered:
+            if piece in self.piece2id:
+                continue
+            new_id = len(self.id2piece)
+            self.id2piece[new_id] = piece
+            self.piece2id[piece] = new_id
+            if len(self.id2piece) >= self.target_vocab:
+                break
+        V = len(self.id2piece)
+        device = torch.device(self.device)
+        self.logp = torch.full((V,), -math.log(V), device=device)
+        self._mark_vocab_dirty()
+
     def _ensure_vocab_trie(self) -> None:
         if self.device != "cuda":
             return
@@ -266,14 +326,26 @@ class GPUUnigramTrainer(BaseTrainer):
         self._piece_lens_tensor = piece_lens
         self._trie_dirty = False
 
+    def _ensure_cpu_piece_cache(self) -> None:
+        if self._cpu_piece_cache is not None:
+            return
+        cache: List[torch.Tensor] = []
+        for idx in range(len(self.id2piece)):
+            piece = self.id2piece[idx]
+            cache.append(torch.tensor(list(piece), dtype=torch.long))
+        self._cpu_piece_cache = cache
+
     def _forward_backward_cpu(self, seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        self._ensure_cpu_piece_cache()
+        assert self._cpu_piece_cache is not None
         L = seq.size(0)
+        seq = seq.to(torch.long)
         starts: list[list[int]] = [[] for _ in range(L)]
         for pid, piece in self.id2piece.items():
             plen = len(piece)
             if plen == 0 or plen > self.max_len or plen > L:
                 continue
-            piece_tensor = torch.tensor(list(piece), dtype=torch.long, device=self.device)
+            piece_tensor = self._cpu_piece_cache[pid]
             for i in range(0, L - plen + 1):
                 if torch.all(seq[i : i + plen] == piece_tensor):
                     starts[i].append(pid)
@@ -399,6 +471,35 @@ class GPUUnigramTrainer(BaseTrainer):
         logZ, exp = self._forward_backward_batch(batch_seq, valid)
         return logZ[0], exp[0]
 
+    def _prune_vocab(self, expected_counts: torch.Tensor) -> None:
+        V = len(self.id2piece)
+        target = max(self.target_vocab, self.base_vocab)
+        if V <= target:
+            return
+        counts_cpu = expected_counts.detach().to("cpu")
+        candidate_indices = list(range(self.base_vocab, V))
+        remove = V - target
+        if remove <= 0 or not candidate_indices:
+            return
+        sorted_candidates = sorted(
+            candidate_indices,
+            key=lambda idx: (float(counts_cpu[idx].item()), idx),
+        )
+        drop_set = set(sorted_candidates[:remove])
+        keep_indices = [idx for idx in range(V) if idx not in drop_set]
+        if len(keep_indices) == V:
+            return
+        new_id2piece: Dict[int, bytes] = {}
+        for new_id, old_id in enumerate(keep_indices):
+            new_id2piece[new_id] = self.id2piece[old_id]
+        self.id2piece = new_id2piece
+        self.piece2id = {piece: idx for idx, piece in self.id2piece.items()}
+        kept_counts = counts_cpu[keep_indices].to(torch.float32)
+        smoothed = kept_counts + 1e-6
+        probs = (smoothed / smoothed.sum()).clamp_min(1e-12)
+        self.logp = probs.to(torch.device(self.device)).log()
+        self._mark_vocab_dirty()
+
     def fit(
         self,
         batches: Iterable[torch.Tensor] | Sequence[torch.Tensor],
@@ -478,6 +579,7 @@ class GPUUnigramTrainer(BaseTrainer):
         smoothed = exp_counts + 1e-6
         logp = (smoothed / smoothed.sum()).clamp_min(1e-12).log()
         self.logp = logp
+        self._prune_vocab(exp_counts)
         update_time = time.perf_counter() - t_update_start
 
         total_time = time.perf_counter() - epoch_start

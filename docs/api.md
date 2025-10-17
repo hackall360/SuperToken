@@ -30,6 +30,7 @@ Located in [`gpu_tokenizer/bpe_trainer.py`](../gpu_tokenizer/bpe_trainer.py) and
   - `train(progress_logger)` – Coordinates EM updates, pruning, and autoscaler feedback.
   - `save(out_dir)` – Persists vocabulary and probability tables.
 - **Extension points**: Swap out scoring heuristics, customize smoothing, or integrate additional pruning stages.
+- **Device support**: Executes the candidate search, forward/backward scoring, and pruning loops on either CUDA or CPU based on the configured `device`.
 
 Both trainers rely on the dataset and autoscaler layers described below. Reusing them is the fastest way to implement new algorithms; see the [architecture overview](architecture.md#trainer-pipeline) for lifecycle context.
 

@@ -18,14 +18,16 @@ from __future__ import annotations
 import io
 import random
 from dataclasses import dataclass
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Sequence, cast
 
 import pytest
 
 sentencepiece = pytest.importorskip("sentencepiece")
 torch = pytest.importorskip("torch")
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for GPU parity tests")
+DEVICES = ["cpu"]
+if torch.cuda.is_available():
+    DEVICES.append("cuda")
 
 try:  # NumPy is optional, but we seed it when available for completeness.
     import numpy as _np
@@ -73,7 +75,7 @@ def _latin1_strings(byte_sequences: Sequence[bytes]) -> List[str]:
     return [seq.decode("latin-1") for seq in byte_sequences]
 
 
-def _build_gpu_batches(byte_sequences: Sequence[bytes]) -> List[torch.Tensor]:
+def _build_batches(byte_sequences: Sequence[bytes]) -> List[torch.Tensor]:
     if not byte_sequences:
         return []
 
@@ -152,7 +154,7 @@ def _train_sentencepiece(
     return _SentencePieceArtifacts(vocab=vocab, log_probs=scores, encoded=encoded)
 
 
-def _gpu_vocab_and_log_probs(trainer: GPUUnigramTrainer) -> tuple[List[bytes], List[float]]:
+def _trainer_vocab_and_log_probs(trainer: GPUUnigramTrainer) -> tuple[List[bytes], List[float]]:
     vocab = [trainer.id2piece[idx] for idx in range(len(trainer.id2piece))]
     log_probs = trainer.logp.detach().cpu().tolist()
     return vocab, log_probs
@@ -203,7 +205,7 @@ def _viterbi_decode(trainer: GPUUnigramTrainer, sequence: Sequence[int]) -> List
     return ids
 
 
-def _train_gpu_unigram(
+def _train_unigram_trainer(
     training_sequences: Sequence[bytes],
     eval_sequences: Sequence[bytes],
     *,
@@ -211,20 +213,22 @@ def _train_gpu_unigram(
     target_vocab: int,
     max_subword_len: int,
     seed: int,
+    device: str,
 ) -> tuple[GPUUnigramTrainer, List[bytes], List[float], List[List[int]]]:
     _seed_everything(seed)
     trainer = GPUUnigramTrainer(
         base_vocab=base_vocab,
         vocab_size=target_vocab,
         max_subword_len=max_subword_len,
-        device="cuda",
+        device=device,
+        seed=seed,
     )
 
-    batches = _build_gpu_batches(training_sequences)
+    batches = _build_batches(training_sequences)
     if batches:
         trainer.fit_epoch(batches)
 
-    vocab, log_probs = _gpu_vocab_and_log_probs(trainer)
+    vocab, log_probs = _trainer_vocab_and_log_probs(trainer)
     encoded = [_viterbi_decode(trainer, list(seq)) for seq in eval_sequences]
     return trainer, vocab, log_probs, encoded
 
@@ -234,8 +238,8 @@ def _train_gpu_unigram(
     get_adversarial_corpora(),
     ids=lambda corpus: corpus.name,
 )
-def test_gpu_unigram_matches_sentencepiece(corpus: AdversarialCorpus) -> None:
-    """Ensure the GPU unigram trainer mirrors SentencePiece for adversarial corpora."""
+def test_unigram_matches_sentencepiece(corpus: AdversarialCorpus) -> None:
+    """Ensure both CPU and GPU unigram trainers mirror SentencePiece."""
 
     corpus_bytes = _as_byte_sequences(corpus.corpus)
     sentinel_bytes = bytes(range(BASE_VOCAB))
@@ -252,58 +256,62 @@ def test_gpu_unigram_matches_sentencepiece(corpus: AdversarialCorpus) -> None:
         seed=GLOBAL_SEED,
     )
 
-    gpu_trainer, vocab_a, logp_a, encoded_a = _train_gpu_unigram(
-        training_bytes,
-        corpus_bytes,
-        base_vocab=BASE_VOCAB,
-        target_vocab=TARGET_VOCAB,
-        max_subword_len=MAX_SUBWORD_LEN,
-        seed=GLOBAL_SEED,
-    )
+    results: dict[str, dict[str, object]] = {}
+    for device in DEVICES:
+        trainer_a, vocab_a, logp_a, encoded_a = _train_unigram_trainer(
+            training_bytes,
+            corpus_bytes,
+            base_vocab=BASE_VOCAB,
+            target_vocab=TARGET_VOCAB,
+            max_subword_len=MAX_SUBWORD_LEN,
+            seed=GLOBAL_SEED,
+            device=device,
+        )
+        trainer_b, vocab_b, logp_b, _ = _train_unigram_trainer(
+            training_bytes,
+            corpus_bytes,
+            base_vocab=BASE_VOCAB,
+            target_vocab=TARGET_VOCAB,
+            max_subword_len=MAX_SUBWORD_LEN,
+            seed=GLOBAL_SEED,
+            device=device,
+        )
+        assert vocab_a == vocab_b
+        assert logp_a == pytest.approx(logp_b, abs=1e-7, rel=1e-7)
+        results[device] = {
+            "trainer": trainer_a,
+            "vocab": vocab_a,
+            "logp": logp_a,
+            "encoded": encoded_a,
+        }
 
-    gpu_trainer_b, vocab_b, logp_b, _ = _train_gpu_unigram(
-        training_bytes,
-        corpus_bytes,
-        base_vocab=BASE_VOCAB,
-        target_vocab=TARGET_VOCAB,
-        max_subword_len=MAX_SUBWORD_LEN,
-        seed=GLOBAL_SEED,
-    )
+    if "cuda" in results and "cpu" in results:
+        cpu_res = results["cpu"]
+        gpu_res = results["cuda"]
+        assert cpu_res["vocab"] == gpu_res["vocab"]
+        assert cpu_res["logp"] == pytest.approx(gpu_res["logp"], abs=1e-6, rel=1e-6)
+        assert cpu_res["encoded"] == gpu_res["encoded"]
+        eval_batch = _build_batches(corpus_bytes)[0]
+        mask = eval_batch >= 0
+        cpu_trainer = cast(GPUUnigramTrainer, cpu_res["trainer"])
+        gpu_trainer = cast(GPUUnigramTrainer, gpu_res["trainer"])
+        cpu_logZ, _ = cpu_trainer._forward_backward_batch(eval_batch, mask)
+        gpu_batch = eval_batch.to(gpu_trainer.device)
+        gpu_mask = mask.to(gpu_trainer.device)
+        gpu_logZ, _ = gpu_trainer._forward_backward_batch(gpu_batch, gpu_mask)
+        assert torch.allclose(gpu_logZ.cpu(), cpu_logZ, atol=1e-5, rtol=1e-5)
 
-    assert vocab_a == vocab_b
-    assert logp_a == pytest.approx(logp_b, abs=1e-7, rel=1e-7)
-
-    cpu_trainer = GPUUnigramTrainer(
-        base_vocab=BASE_VOCAB,
-        vocab_size=TARGET_VOCAB,
-        max_subword_len=MAX_SUBWORD_LEN,
-        device="cpu",
-    )
-    cpu_trainer.id2piece = dict(gpu_trainer.id2piece)
-    cpu_trainer.piece2id = dict(gpu_trainer.piece2id)
-    cpu_trainer.logp = gpu_trainer.logp.detach().cpu()
-    cpu_trainer._trie_dirty = True
-
-    encoded_cpu = [_viterbi_decode(cpu_trainer, list(seq)) for seq in corpus_bytes]
-
-    eval_batch = _build_gpu_batches(corpus_bytes)[0]
-    gpu_batch = eval_batch.to(gpu_trainer.device)
-    gpu_valid = (eval_batch >= 0).to(gpu_trainer.device)
-    cpu_valid = eval_batch >= 0
-    gpu_logZ, _ = gpu_trainer._forward_backward_batch(gpu_batch, gpu_valid)
-    cpu_logZ, _ = cpu_trainer._forward_backward_batch(eval_batch, cpu_valid)
-
-    assert torch.allclose(gpu_logZ.cpu(), cpu_logZ, atol=1e-5, rtol=1e-5)
-    assert vocab_a == [cpu_trainer.id2piece[idx] for idx in range(len(cpu_trainer.id2piece))]
-    assert logp_a == pytest.approx(cpu_trainer.logp.tolist(), abs=1e-5, rel=1e-5)
-    assert encoded_a == encoded_cpu
-
-    assert vocab_a == reference.vocab
-    assert logp_a == pytest.approx(reference.log_probs, abs=1e-5, rel=1e-5)
-    assert encoded_a == reference.encoded
+    for payload in results.values():
+        vocab = payload["vocab"]
+        logp = payload["logp"]
+        encoded = payload["encoded"]
+        assert vocab == reference.vocab
+        assert logp == pytest.approx(reference.log_probs, abs=1e-5, rel=1e-5)
+        assert encoded == reference.encoded
 
 
-def test_gpu_unigram_seed_reproducibility() -> None:
+@pytest.mark.parametrize("device", DEVICES)
+def test_unigram_seed_reproducibility(device: str) -> None:
     """Multiple runs with the same seed should stay in lock-step across epochs."""
 
     seed = GLOBAL_SEED
@@ -314,14 +322,15 @@ def test_gpu_unigram_seed_reproducibility() -> None:
         bytes(range(32)),
     ]
     eval_sequences = training_sequences[:-1]
-    batches = _build_gpu_batches(training_sequences)
+    batches = _build_batches(training_sequences)
 
     def _run() -> tuple[list[list[bytes]], list[bytes], dict[bytes, int], list[list[int]]]:
+        _seed_everything(seed)
         trainer = GPUUnigramTrainer(
             base_vocab=BASE_VOCAB,
             vocab_size=BASE_VOCAB + 128,
             max_subword_len=MAX_SUBWORD_LEN,
-            device="cuda",
+            device=device,
             seed=seed,
         )
 
