@@ -76,13 +76,14 @@
         "events": [],
         "host_sync_events": [],
         "device_snapshots": [],
-        "autoscaler": {},
+        "autoscaler": {"window": []},
         "iteration_metrics": {"ewma": {}, "iterations": []}
       }
     },
     "overlap_enabled": true,
     "tokens_processed": 16384,
     "tokens_per_s": 5120.0,
+    "autoscaler_window": [],
     "name": "single_cuda0",
     "scaling": null
   },
@@ -135,16 +136,17 @@
           "events": [],
           "host_sync_events": [],
           "device_snapshots": [],
-          "autoscaler": {},
-          "iteration_metrics": {"ewma": {}, "iterations": []}
-        }
-      },
-      "overlap_enabled": true,
-      "tokens_processed": 16384,
-      "tokens_per_s": 5120.0,
-      "name": "single_cuda0",
-      "scaling": null
+        "autoscaler": {"window": []},
+        "iteration_metrics": {"ewma": {}, "iterations": []}
+      }
     },
+    "overlap_enabled": true,
+    "tokens_processed": 16384,
+    "tokens_per_s": 5120.0,
+    "autoscaler_window": [],
+    "name": "single_cuda0",
+    "scaling": null
+  },
     {
       "config": {
         "base_vocab": 256,
@@ -178,14 +180,15 @@
           "events": [],
           "host_sync_events": [],
           "device_snapshots": [],
-          "autoscaler": {},
-          "iteration_metrics": {"ewma": {}, "iterations": []}
-        }
-      },
-      "overlap_enabled": true,
-      "tokens_processed": 16384,
-      "tokens_per_s": 9000.0,
-      "name": "cuda0_cuda1_hetero",
+        "autoscaler": {"window": []},
+        "iteration_metrics": {"ewma": {}, "iterations": []}
+      }
+    },
+    "overlap_enabled": true,
+    "tokens_processed": 16384,
+    "tokens_per_s": 9000.0,
+    "autoscaler_window": [],
+    "name": "cuda0_cuda1_hetero",
       "scaling": {
         "reference": "single_cuda0",
         "device_weights": [1.0, 0.92],

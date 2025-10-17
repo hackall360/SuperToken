@@ -496,6 +496,14 @@ def run_bpe_benchmark(
     tokens_per_s: float | None = None
     if wall_time > 0 and total_tokens > 0:
         tokens_per_s = total_tokens / wall_time
+    autoscaler_window: list[dict[str, object]] = []
+    telemetry = meta.get("telemetry") if isinstance(meta, dict) else None
+    if isinstance(telemetry, dict):
+        autoscaler_meta = telemetry.get("autoscaler")
+        if isinstance(autoscaler_meta, dict):
+            window = autoscaler_meta.get("window")
+            if isinstance(window, list):
+                autoscaler_window = window
     return {
         "config": {
             "base_vocab": base_vocab,
@@ -511,6 +519,7 @@ def run_bpe_benchmark(
         "overlap_enabled": overlap,
         "tokens_processed": total_tokens,
         "tokens_per_s": tokens_per_s,
+        "autoscaler_window": autoscaler_window,
     }
 
 

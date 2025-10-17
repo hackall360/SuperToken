@@ -587,12 +587,15 @@ def test_autoscaler_reduces_batch_after_oom(monkeypatch):
         def __init__(self) -> None:
             self.state = ScaleState(batch_size=4, cpu_workers=2, h2d_mb=512)
 
-        def suggest(self, token_bytes_per_example: int = 0) -> ScaleState:  # pragma: no cover - simple stub
-            return self.state
+        def suggest(self, token_bytes_per_example: int = 0) -> tuple[ScaleState, dict[str, object]]:  # pragma: no cover - simple stub
+            return self.state, {}
 
-        def feedback(self, step_time_s: float | None = None, oom: bool = False) -> None:
+        def feedback(
+            self, step_time_s: float | None = None, oom: bool = False
+        ) -> tuple[ScaleState, dict[str, object]]:
             if oom:
                 self.state = ScaleState(batch_size=2, cpu_workers=2, h2d_mb=512)
+            return self.state, {}
 
     seqs = [
         [1, 2, 3, 4],
@@ -628,12 +631,15 @@ def test_gpu_count_pairs_retries_after_oom(monkeypatch):
         def __init__(self) -> None:
             self.state = ScaleState(batch_size=4, cpu_workers=2, h2d_mb=512)
 
-        def suggest(self, token_bytes_per_example: int = 0) -> ScaleState:  # pragma: no cover - simple stub
-            return self.state
+        def suggest(self, token_bytes_per_example: int = 0) -> tuple[ScaleState, dict[str, object]]:  # pragma: no cover - simple stub
+            return self.state, {}
 
-        def feedback(self, step_time_s: float | None = None, oom: bool = False) -> None:
+        def feedback(
+            self, step_time_s: float | None = None, oom: bool = False
+        ) -> tuple[ScaleState, dict[str, object]]:
             if oom:
                 self.state = ScaleState(batch_size=2, cpu_workers=2, h2d_mb=512)
+            return self.state, {}
 
     seqs = [
         [1, 2, 1, 2, 3, 4],
@@ -671,12 +677,15 @@ def test_gpu_apply_merge_retries_after_oom(monkeypatch):
         def __init__(self) -> None:
             self.state = ScaleState(batch_size=4, cpu_workers=2, h2d_mb=512)
 
-        def suggest(self, token_bytes_per_example: int = 0) -> ScaleState:  # pragma: no cover - simple stub
-            return self.state
+        def suggest(self, token_bytes_per_example: int = 0) -> tuple[ScaleState, dict[str, object]]:  # pragma: no cover - simple stub
+            return self.state, {}
 
-        def feedback(self, step_time_s: float | None = None, oom: bool = False) -> None:
+        def feedback(
+            self, step_time_s: float | None = None, oom: bool = False
+        ) -> tuple[ScaleState, dict[str, object]]:
             if oom:
                 self.state = ScaleState(batch_size=2, cpu_workers=2, h2d_mb=512)
+            return self.state, {}
 
     seqs = [
         [1, 2, 1, 2, 3, 4],
@@ -744,12 +753,15 @@ def test_multi_gpu_autoscaler_updates_contexts(monkeypatch):
         def __init__(self) -> None:
             self.state = ScaleState(batch_size=4, cpu_workers=2, h2d_mb=512)
 
-        def suggest(self, token_bytes_per_example: int = 0) -> ScaleState:  # pragma: no cover - simple stub
-            return self.state
+        def suggest(self, token_bytes_per_example: int = 0) -> tuple[ScaleState, dict[str, object]]:  # pragma: no cover - simple stub
+            return self.state, {}
 
-        def feedback(self, step_time_s: float | None = None, oom: bool = False) -> None:
+        def feedback(
+            self, step_time_s: float | None = None, oom: bool = False
+        ) -> tuple[ScaleState, dict[str, object]]:
             if oom:
                 self.state = ScaleState(batch_size=2, cpu_workers=2, h2d_mb=512)
+            return self.state, {}
 
     seqs = [
         [1, 2, 3, 4, 5],

@@ -170,7 +170,21 @@ class AutoScaler:
             cpu_util = 0.0
         return cores, mem_free, mem_total, cpu_util
 
-    def suggest(self, token_bytes_per_example: int = 2048) -> ScaleState:
+    def _window_snapshot(self) -> dict[str, object]:
+        mean_step, var_step = self._stats(self._step_times)
+        mean_vram, var_vram = self._stats(self._vram_fracs)
+        return {
+            "window_size": int(self._window_size),
+            "step_times": list(self._step_times),
+            "step_stats": {"mean": mean_step, "variance": var_step},
+            "vram_utilization": list(self._vram_fracs),
+            "vram_stats": {"mean": mean_vram, "variance": var_vram},
+            "state": asdict(self.state) if self.state is not None else None,
+            "target_util": float(self.tu),
+            "device": self.device,
+        }
+
+    def suggest(self, token_bytes_per_example: int = 2048) -> tuple[ScaleState, dict[str, object]]:
         free, total = self._gpu_caps()
         cores, mem_free, _mem_total, _cpu_util = self._cpu_caps()
         gpu_budget = int(total * self.tu)
@@ -191,16 +205,17 @@ class AutoScaler:
             h2d_mb=h2d_mb,
             cpu_fallback_rate=fallback_rate,
         )
-        return self.state
+        snapshot = self._window_snapshot()
+        return self.state, snapshot
 
     def feedback(
         self,
         step_time_s: float | None = None,
         oom: bool = False,
         cpu_fallback_rate: float | None = None,
-    ) -> None:
+    ) -> tuple[ScaleState | None, dict[str, object]]:
         if self.state is None:
-            return
+            return None, self._window_snapshot()
         fallback_rate = self.state.cpu_fallback_rate
         if cpu_fallback_rate is not None:
             fallback_rate = max(0.0, min(1.0, float(cpu_fallback_rate)))
@@ -223,14 +238,15 @@ class AutoScaler:
                     "cpu_fallback_rate": fallback_rate,
                 }
             )
-            return
+            snapshot = self._window_snapshot()
+            return self.state, snapshot
         free, total = self._gpu_caps()
         if total == 0:
-            return
+            return self.state, self._window_snapshot()
         used = max(0, total - free)
         self._record_metrics(step_time_s, used, total)
         if len(self._vram_fracs) < max(3, self._window_size // 2):
-            return
+            return self.state, self._window_snapshot()
         mean_vram, var_vram = self._stats(self._vram_fracs)
         mean_step, _ = self._stats(self._step_times)
         prev_state = self.state
@@ -265,6 +281,8 @@ class AutoScaler:
                 h2d_mb=self.state.h2d_mb,
                 cpu_fallback_rate=fallback_rate,
             )
+        snapshot = self._window_snapshot()
+        return self.state, snapshot
 
     def _record_metrics(self, step_time_s: float | None, used_bytes: int, total_bytes: int) -> None:
         if step_time_s is not None and math.isfinite(step_time_s):
