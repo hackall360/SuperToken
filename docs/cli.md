@@ -47,6 +47,34 @@ Key arguments:
 
 Behind the scenes the [`GPUBPETrainer`](../gpu_tokenizer/bpe_trainer.py) collaborates with the autoscaler, dataset readers, and checkpoint writers described in the [architecture overview](architecture.md#trainer-pipeline).
 
+### Distributed execution flags
+
+Enable the heterogeneous multi-GPU workflow by invoking the dedicated launcher module with `--dist`:
+
+```bash
+torchrun --standalone --nnodes 1 --nproc_per_node 2 \
+  python -m gpu_tokenizer.cli_train_bpe \
+    --dist \
+    --gpus 0,1 \
+    --data "data/**/*.txt" \
+    --merges 50000 \
+    --lease-size 16 \
+    --rebalance-secs 10 \
+    --target-chunk-ms 100
+```
+
+The additional flags configure the distributed runtime:
+
+| Flag | Description |
+| --- | --- |
+| `--dist` | Switch the trainer into distributed mode with a lease-based work queue. |
+| `--gpus` | Comma-separated list of CUDA device indices claimed by the job. |
+| `--lease-size` | Number of chunks granted per lease (per rank) before requesting more work. |
+| `--rebalance-secs` | Interval between EWMA-based throughput rebalancing passes. |
+| `--target-chunk-ms` | Desired processing time per chunk used to size leases dynamically. |
+
+Every few iterations the CLI prints a per-rank status table that surfaces GPU IDs, the most recent tokens/sec readings, current lease sizes, inflight work count, and stage-level timings. Monitoring the table helps operators confirm that faster GPUs keep receiving new leases, slower cards remain productive, and no rank stalls on communication or reduction phases.
+
 ## `train-unigram`
 Train a unigram tokenizer with GPU-accelerated expectation-maximization loops:
 
