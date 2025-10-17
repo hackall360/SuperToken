@@ -6,9 +6,21 @@ import heapq
 import json
 import os
 import time
+import math
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import torch
 
@@ -71,12 +83,14 @@ class TrainerMetricsEWMA:
     _tokens_per_s: float | None = None
     _lease_per_s: float | None = None
     _stage_windows: dict[str, deque[float]] = field(default_factory=dict)
+    rank: int | None = None
     _copy_window: deque[float] = field(init=False, repr=False)
     _compute_window: deque[float] = field(init=False, repr=False)
     _iteration_window: deque[float] = field(init=False, repr=False)
     _reduction_window: deque[float] = field(init=False, repr=False)
     _reduction_share: float | None = None
     _reduction_share_latest: float | None = None
+    _rank_stats: dict[int, dict[str, float]] = field(init=False, repr=False)
 
     _COPY_STAGES = frozenset({"h2d", "d2h"})
     _COMPUTE_STAGES = frozenset({"kernel", "reduction"})
@@ -109,6 +123,7 @@ class TrainerMetricsEWMA:
         self._reduction_window = deque(maxlen=self.window_size)
         self._reduction_share = None
         self._reduction_share_latest = None
+        self._rank_stats = {}
 
     def reset(self) -> None:
         """Clear accumulated metrics."""
@@ -122,6 +137,7 @@ class TrainerMetricsEWMA:
         self._reduction_window = deque(maxlen=self.window_size)
         self._reduction_share = None
         self._reduction_share_latest = None
+        self._rank_stats = {}
 
     @property
     def tokens_per_s(self) -> float | None:
@@ -152,7 +168,70 @@ class TrainerMetricsEWMA:
             kind = "compute"
         return kind
 
-    def record_tokens(self, tokens: int, duration_s: float, *, leases: int | None = None) -> None:
+    def set_rank(self, rank: int | None) -> None:
+        """Declare the distributed rank associated with this metrics tracker."""
+
+        if rank is None:
+            self.rank = None
+        else:
+            self.rank = int(rank)
+
+    def _update_rank_entry(
+        self,
+        rank: int,
+        *,
+        tokens_per_s: float | None,
+        lease_per_s: float | None,
+        samples: float = 0.0,
+    ) -> None:
+        entry = self._rank_stats.setdefault(
+            int(rank),
+            {"tokens_per_s": None, "lease_per_s": None, "samples": 0.0},
+        )
+        if tokens_per_s is not None and math.isfinite(tokens_per_s):
+            entry["tokens_per_s"] = float(tokens_per_s)
+        if lease_per_s is not None and math.isfinite(lease_per_s):
+            entry["lease_per_s"] = float(lease_per_s)
+        if samples > 0.0 and math.isfinite(samples):
+            entry["samples"] = float(entry.get("samples", 0.0)) + float(samples)
+
+    def update_rank_snapshot(self, snapshot: Mapping[str, object]) -> None:
+        """Merge a per-rank snapshot gathered from a peer."""
+
+        try:
+            rank = int(snapshot.get("rank"))  # type: ignore[arg-type]
+        except Exception:
+            return
+        tokens_obj = snapshot.get("tokens_per_s")
+        leases_obj = snapshot.get("lease_per_s")
+        samples_obj = snapshot.get("samples", 0.0)
+        try:
+            tokens_val = float(tokens_obj) if tokens_obj is not None else None
+        except (TypeError, ValueError):
+            tokens_val = None
+        try:
+            leases_val = float(leases_obj) if leases_obj is not None else None
+        except (TypeError, ValueError):
+            leases_val = None
+        try:
+            samples_val = float(samples_obj) if samples_obj is not None else 0.0
+        except (TypeError, ValueError):
+            samples_val = 0.0
+        self._update_rank_entry(
+            rank,
+            tokens_per_s=tokens_val,
+            lease_per_s=leases_val,
+            samples=samples_val,
+        )
+
+    def record_tokens(
+        self,
+        tokens: int,
+        duration_s: float,
+        *,
+        leases: int | None = None,
+        rank: int | None = None,
+    ) -> None:
         if not self.enabled or duration_s <= 0:
             return
         rate = float(tokens) / float(duration_s) if tokens > 0 else 0.0
@@ -169,6 +248,14 @@ class TrainerMetricsEWMA:
                     self.alpha * lease_rate
                     + (1.0 - self.alpha) * self._lease_per_s
                 )
+        rank_id = self.rank if self.rank is not None else rank
+        if rank_id is not None:
+            self._update_rank_entry(
+                int(rank_id),
+                tokens_per_s=self._tokens_per_s,
+                lease_per_s=self._lease_per_s,
+                samples=1.0,
+            )
 
     def record_iteration(self, total_duration_s: float, reduction_s: float) -> None:
         """Track the wall clock time spent on reductions versus the iteration total."""
@@ -253,6 +340,15 @@ class TrainerMetricsEWMA:
                 "window": values,
             }
 
+        per_rank = {
+            int(rank): {
+                "tokens_per_s": stats.get("tokens_per_s"),
+                "lease_per_s": stats.get("lease_per_s"),
+                "samples": stats.get("samples", 0.0),
+            }
+            for rank, stats in self._rank_stats.items()
+        }
+
         return {
             "enabled": self.enabled,
             "alpha": self.alpha,
@@ -263,6 +359,7 @@ class TrainerMetricsEWMA:
             "copy": _window_stats(self._copy_window),
             "compute": _window_stats(self._compute_window),
             "overlap_enabled": self.overlap_enabled,
+            "per_rank": per_rank,
             "reduction": {
                 "samples": len(self._iteration_window),
                 "avg_total_s": (
@@ -281,6 +378,33 @@ class TrainerMetricsEWMA:
                 else 0.0,
                 "share_ewma": self._reduction_share,
                 "share_latest": self._reduction_share_latest if self._reduction_share_latest is not None else 0.0,
+            },
+        }
+
+    def snapshot(self) -> dict[str, object]:
+        """Return a lightweight per-rank throughput snapshot."""
+
+        local_rank = self.rank
+        local_samples = 0.0
+        if local_rank is not None:
+            entry = self._rank_stats.get(int(local_rank))
+            if entry is not None:
+                try:
+                    local_samples = float(entry.get("samples", 0.0))
+                except (TypeError, ValueError):
+                    local_samples = 0.0
+        return {
+            "rank": local_rank,
+            "tokens_per_s": self._tokens_per_s,
+            "lease_per_s": self._lease_per_s,
+            "samples": local_samples,
+            "per_rank": {
+                int(rank): {
+                    "tokens_per_s": stats.get("tokens_per_s"),
+                    "lease_per_s": stats.get("lease_per_s"),
+                    "samples": stats.get("samples", 0.0),
+                }
+                for rank, stats in self._rank_stats.items()
             },
         }
 

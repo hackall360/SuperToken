@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from types import FrameType
 from collections import deque
-from typing import Callable, Deque, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Callable, Deque, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import time
 
@@ -67,6 +67,7 @@ _LEASE_REGISTRY_LOCK = threading.Lock()
 _LEASE_REGISTRY: Dict[str, _LeaseHostState] = {}
 
 _STARTUP_SAMPLE_LEASES = 2
+_REBALANCE_BLEND = 0.5
 
 
 def _normalize_job_id(job_id: str | None) -> str:
@@ -341,6 +342,178 @@ def _normalise_throughput_samples(samples: Sequence[Optional[float]]) -> Dict[in
         return {idx: uniform for idx in range(world_size)}
 
     return {idx: (value / total) for idx, value in enumerate(cleaned)}
+
+
+def _compute_rebalance_weights(
+    snapshots: Sequence[object],
+    *,
+    metrics: "TrainerMetricsEWMA | None",
+    world_size: int,
+) -> Dict[int, float]:
+    """Derive normalised rank weights from gathered EWMA snapshots."""
+
+    values: List[Optional[float]] = []
+    for idx in range(world_size):
+        entry: object | None = snapshots[idx] if idx < len(snapshots) else None
+        snapshot: Mapping[str, object] | None = entry if isinstance(entry, Mapping) else None
+        if snapshot is not None and metrics is not None and hasattr(metrics, "update_rank_snapshot"):
+            try:
+                metrics.update_rank_snapshot(snapshot)
+            except Exception:
+                logger.debug("rebalance_snapshot_merge_failed", exc_info=True)
+        sample_val: Optional[float]
+        if snapshot is not None:
+            token_obj = snapshot.get("tokens_per_s")
+            try:
+                sample_val = float(token_obj) if token_obj is not None else 0.0
+            except (TypeError, ValueError):
+                sample_val = 0.0
+        else:
+            sample_val = 0.0
+        values.append(sample_val)
+    return _normalise_throughput_samples(values)
+
+
+def _blend_rank_weights(
+    existing: Mapping[int, float],
+    updated: Mapping[int, float],
+    *,
+    new_fraction: float,
+    world_size: int,
+) -> Dict[int, float]:
+    """Blend previous rank weights with freshly computed updates."""
+
+    fraction = max(0.0, min(1.0, float(new_fraction)))
+    keys = {int(key) for key in existing.keys()} | {int(key) for key in updated.keys()}
+    keys |= {int(idx) for idx in range(world_size)}
+    blended: Dict[int, float] = {}
+    for key in sorted(keys):
+        new_val = float(updated.get(key, 0.0))
+        if not existing:
+            old_val = new_val
+        else:
+            old_val = float(existing.get(key, new_val))
+        blended_val = ((1.0 - fraction) * old_val) + (fraction * new_val)
+        blended[key] = blended_val
+    total = sum(blended.values())
+    if total > 0.0:
+        return {key: value / total for key, value in blended.items()}
+    if world_size <= 0:
+        return dict(blended)
+    uniform = 1.0 / float(world_size)
+    return {key: uniform for key in blended.keys()}
+
+
+def _rebalance_once(
+    *,
+    rank: int,
+    world_size: int,
+    metrics: "TrainerMetricsEWMA | None",
+    lease_client: Optional[DistributedLeaseClient],
+    blend: float = _REBALANCE_BLEND,
+) -> None:
+    """Execute a single rebalance round collecting EWMA throughput samples."""
+
+    if (
+        dist is None
+        or not hasattr(dist, "gather_object")
+        or not hasattr(dist, "broadcast_object_list")
+        or not dist.is_available()
+        or not dist.is_initialized()
+        or world_size <= 1
+    ):
+        return
+
+    sample: object
+    if metrics is not None and hasattr(metrics, "snapshot"):
+        try:
+            sample = metrics.snapshot()
+        except Exception:
+            logger.debug("rebalance_snapshot_failed", exc_info=True)
+            sample = {"rank": rank}
+    else:
+        sample = {"rank": rank}
+
+    gather_list: List[object] | None = [None] * world_size if rank == 0 else None
+    try:
+        dist.gather_object(sample, gather_list, dst=0)  # type: ignore[arg-type]
+    except Exception:
+        logger.debug("rebalance_gather_failed", exc_info=True)
+        gather_list = None
+
+    weights: Dict[int, float] | None = None
+    if rank == 0 and gather_list is not None:
+        weights = _compute_rebalance_weights(
+            gather_list,
+            metrics=metrics,
+            world_size=world_size,
+        )
+        if weights and lease_client is not None:
+            try:
+                existing = lease_client.rank_weights()
+            except Exception:
+                logger.debug("rebalance_weight_fetch_failed", exc_info=True)
+                existing = {}
+            blended = _blend_rank_weights(
+                existing,
+                weights,
+                new_fraction=blend,
+                world_size=world_size,
+            )
+            try:
+                lease_client.update_rank_weights(blended)
+            except Exception:
+                logger.debug("rebalance_weight_update_failed", exc_info=True)
+    payload: List[object] = [weights]
+    try:
+        dist.broadcast_object_list(payload, src=0)  # type: ignore[arg-type]
+    except Exception:
+        logger.debug("rebalance_broadcast_failed", exc_info=True)
+        return
+
+    broadcast_weights = payload[0]
+    if (
+        lease_client is not None
+        and isinstance(broadcast_weights, dict)
+    ):
+        try:
+            lease_client.update_rank_weights({int(k): float(v) for k, v in broadcast_weights.items()})
+        except Exception:
+            logger.debug("rebalance_weight_apply_failed", exc_info=True)
+
+
+def _rebalance_loop(
+    rank: int,
+    world_size: int,
+    metrics: "TrainerMetricsEWMA | None",
+    lease_client: Optional[DistributedLeaseClient],
+    rebalance_secs: float,
+    stop_event: threading.Event,
+    *,
+    blend: float = _REBALANCE_BLEND,
+) -> None:
+    """Background loop that periodically rebalances lease weights."""
+
+    if rebalance_secs <= 0.0:
+        return
+
+    interval = float(rebalance_secs)
+    while not stop_event.is_set():
+        start = time.monotonic()
+        try:
+            _rebalance_once(
+                rank=rank,
+                world_size=world_size,
+                metrics=metrics,
+                lease_client=lease_client,
+                blend=blend,
+            )
+        except Exception:
+            logger.debug("rebalance_iteration_failed", exc_info=True)
+        elapsed = time.monotonic() - start
+        remaining = max(0.0, interval - elapsed)
+        if stop_event.wait(remaining):
+            break
 
 
 def _collect_startup_throughput_samples(
@@ -945,11 +1118,17 @@ def _worker_entry(rank: int, config: DistributedLaunchConfig, cli_args: Sequence
                 lease_client.requeue_lease(*initial)
 
     shutdown_state = {"triggered": False}
+    rebalance_thread: Optional[threading.Thread] = None
+    rebalance_stop: Optional[threading.Event] = None
 
     def _initiate_shutdown(reason: str) -> None:
         if shutdown_state["triggered"]:
             return
         shutdown_state["triggered"] = True
+        if rebalance_stop is not None:
+            rebalance_stop.set()
+        if rebalance_thread is not None and rebalance_thread.is_alive():
+            rebalance_thread.join(timeout=5.0)
         if lease_client is not None:
             with contextlib.suppress(Exception):
                 lease_client.requeue_outstanding()
@@ -981,6 +1160,46 @@ def _worker_entry(rank: int, config: DistributedLaunchConfig, cli_args: Sequence
 
         autoscaler = AutoScaler(device=str(device))
         trainer = GPUBPETrainer(devices=[str(device)], autoscaler=autoscaler)
+        metrics_tracker = getattr(trainer, "metrics", None)
+        if metrics_tracker is not None and hasattr(metrics_tracker, "set_rank"):
+            try:
+                metrics_tracker.set_rank(rank)
+            except Exception:
+                logger.debug("metrics_rank_assignment_failed", exc_info=True)
+
+        rebalance_secs_raw = os.getenv("SUPERTOKEN_REBALANCE_SECS", "10")
+        try:
+            rebalance_secs = float(rebalance_secs_raw)
+        except ValueError:
+            rebalance_secs = 0.0
+        if rebalance_secs < 0.0:
+            rebalance_secs = 0.0
+        if (
+            rebalance_secs > 0.0
+            and metrics_tracker is not None
+            and getattr(metrics_tracker, "enabled", False)
+            and lease_client is not None
+            and dist is not None
+            and dist.is_available()
+            and dist.is_initialized()
+            and config.world_size > 1
+        ):
+            rebalance_stop = threading.Event()
+            rebalance_thread = threading.Thread(
+                name=f"rebalance-rank{rank}",
+                target=_rebalance_loop,
+                args=(
+                    rank,
+                    config.world_size,
+                    metrics_tracker,
+                    lease_client,
+                    float(rebalance_secs),
+                    rebalance_stop,
+                ),
+                kwargs={"blend": _REBALANCE_BLEND},
+                daemon=True,
+            )
+            rebalance_thread.start()
 
         worker_logger.info(
             "worker_ready",
@@ -1002,6 +1221,10 @@ def _worker_entry(rank: int, config: DistributedLaunchConfig, cli_args: Sequence
             metrics=getattr(trainer, "metrics", None),
         )
     finally:
+        if rebalance_stop is not None:
+            rebalance_stop.set()
+        if rebalance_thread is not None and rebalance_thread.is_alive():
+            rebalance_thread.join(timeout=5.0)
         _restore_signal_handlers(worker_previous_handlers)
 
 

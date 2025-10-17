@@ -129,3 +129,29 @@ def test_reduction_cadence_adjustment_limits():
         9, min_cadence=8, max_cadence=9
     )
     assert cadence == 8
+
+
+def test_snapshot_tracks_per_rank_metrics():
+    metrics = TrainerMetricsEWMA(alpha=0.5, window_size=4, enabled=True)
+    metrics.set_rank(0)
+
+    metrics.record_tokens(tokens=200, duration_s=2.0, leases=4)
+    metrics.record_tokens(tokens=100, duration_s=1.0, leases=2)
+
+    peer_snapshot = {
+        "rank": 1,
+        "tokens_per_s": 150.0,
+        "lease_per_s": 3.0,
+        "samples": 6.0,
+    }
+    metrics.update_rank_snapshot(peer_snapshot)
+
+    snapshot = metrics.snapshot()
+
+    assert snapshot["rank"] == 0
+    assert snapshot["tokens_per_s"] == pytest.approx(metrics.tokens_per_s)
+    per_rank = snapshot["per_rank"]
+    assert 0 in per_rank and 1 in per_rank
+    assert per_rank[0]["tokens_per_s"] == pytest.approx(metrics.tokens_per_s)
+    assert per_rank[1]["tokens_per_s"] == pytest.approx(150.0)
+    assert per_rank[1]["samples"] == pytest.approx(6.0)
