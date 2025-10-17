@@ -8,7 +8,7 @@ import os
 import time
 import math
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import (
     Callable,
     Dict,
@@ -785,6 +785,7 @@ class GPUBPETrainer(BaseTrainer):
         self._merge_step: int = 0
         self._overlap_enabled: bool = True
         self._last_chunk_id: int | None = None
+        self._autoscaler_window_log: list[dict[str, object]] = []
 
     def handle_chunk_start(
         self,
@@ -1381,6 +1382,7 @@ class GPUBPETrainer(BaseTrainer):
             ),
             "autoscaler": self.autoscaler.state_dict(),
             "autoscaler_metrics": self.autoscaler.snapshot_metrics(),
+            "autoscaler_window": [dict(entry) for entry in self._autoscaler_window_log],
         }
         if include_batches and current_batches is not None:
             serialized_batches = self._serialize_batches(current_batches)
@@ -1516,6 +1518,11 @@ class GPUBPETrainer(BaseTrainer):
                     self.autoscaler.state = scale_state
                 else:
                     self.autoscaler.state = None
+        window_log = metadata.get("autoscaler_window")
+        if isinstance(window_log, list):
+            self._autoscaler_window_log = [dict(entry) for entry in window_log]
+        else:
+            self._autoscaler_window_log = []
         batches_payload = metadata.get("batches")
         current_batches, gpu_batches = self._deserialize_batches(
             batches_payload,
@@ -2149,6 +2156,7 @@ class GPUBPETrainer(BaseTrainer):
         iteration_summary: dict[str, object] | None = None
         iteration_summaries: list[dict[str, object]] = []
         self._metrics_iteration_summary = None
+        self._autoscaler_window_log.clear()
 
         def _record_iteration_summary(summary: dict[str, object]) -> None:
             snapshot = dict(summary)
@@ -3696,7 +3704,9 @@ class GPUBPETrainer(BaseTrainer):
         self._seed_warm_start_merges = warm_merges_to_apply
 
         while step < self.target_merges:
-            scale_state = self.autoscaler.suggest(token_bytes_per_example=int(8 * 1024))
+            scale_state, suggest_window = self.autoscaler.suggest(
+                token_bytes_per_example=int(8 * 1024)
+            )
             if self._active_batch_size is None:
                 self._active_batch_size = scale_state.batch_size
             elif scale_state.batch_size != self._active_batch_size:
@@ -3944,11 +3954,23 @@ class GPUBPETrainer(BaseTrainer):
             if not use_cuda:
                 self._interval_merges = 0
             self._record_merge_snapshot(step)
-            self.autoscaler.feedback(
+            feedback_state, feedback_window = self.autoscaler.feedback(
                 step_time_s=time.time() - t0,
                 oom=oom_seen,
                 cpu_fallback_rate=self._last_cpu_fallback_ratio,
             )
+            window_entry = {
+                "merge": step,
+                "kind": iteration_summary.get("kind") if iteration_summary else "merge",
+                "timestamp": time.time(),
+                "oom": bool(oom_seen),
+                "suggest": suggest_window,
+                "feedback": feedback_window,
+                "state": asdict(feedback_state) if feedback_state is not None else None,
+            }
+            self._autoscaler_window_log.append(window_entry)
+            if iteration_summary is not None:
+                iteration_summary["autoscaler"] = dict(window_entry)
             if metrics_enabled:
                 if merge_applied and iteration_summary is not None:
                     token_time = float(iteration_summary.get("token_time_s", 0.0))
@@ -4015,6 +4037,7 @@ class GPUBPETrainer(BaseTrainer):
         for ctx in self._device_contexts.values():
             ctx.reset_activity()
         autoscaler_metrics = self.autoscaler.snapshot_metrics()
+        autoscaler_metrics["window"] = [dict(entry) for entry in self._autoscaler_window_log]
         timings_summary = {
             name: timing.summary() for name, timing in stage_timings.items()
         }

@@ -180,7 +180,9 @@ def _build_bpe_trainer(
         min_bs=args.min_batch,
         max_bs=args.max_batch,
     )
-    suggestion_state = autoscaler.suggest(token_bytes_per_example=args.token_bytes)
+    suggestion_state, suggestion_window = autoscaler.suggest(
+        token_bytes_per_example=args.token_bytes
+    )
     resolved_batch = min(args.max_batch, max(args.min_batch, suggestion_state.batch_size))
     trainer = GPUBPETrainer(
         base_vocab=args.base_vocab,
@@ -191,6 +193,7 @@ def _build_bpe_trainer(
     suggestion = asdict(suggestion_state)
     suggestion["requested_batch_size"] = suggestion_state.batch_size
     suggestion["resolved_batch_size"] = resolved_batch
+    suggestion["window_snapshot"] = suggestion_window
     config: dict[str, object] = {
         "trainer": {
             "base_vocab": args.base_vocab,
@@ -552,6 +555,13 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
         batches = resume_batches
     current_batch_size = batch_size
 
+    autoscaler_windows: list[dict[str, object]] = []
+
+    def _capture_autoscaler_window(summary: dict[str, object]) -> None:
+        window = summary.get("autoscaler") if isinstance(summary, dict) else None
+        if isinstance(window, dict):
+            autoscaler_windows.append(dict(window))
+
     def _handle_batch_resize(new_bs: int) -> None:
         nonlocal batches, current_batch_size, streamer
         if new_bs <= 0 or new_bs == current_batch_size:
@@ -583,6 +593,7 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
             batches,
             log_every=args.log_every,
             on_batch_size_change=_handle_batch_resize,
+            on_iteration_summary=_capture_autoscaler_window,
             checkpoint_interval=(
                 args.checkpoint_every if args.checkpoint_every and args.checkpoint_every > 0 else None
             ),
@@ -594,6 +605,10 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
             streamer.close()
     if args.out_dir:
         trainer.save(args.out_dir)
+    if autoscaler_windows:
+        telemetry = meta.setdefault("telemetry", {})
+        autoscaler_meta = telemetry.setdefault("autoscaler", {})
+        autoscaler_meta.setdefault("window", autoscaler_windows)
     print(meta)
 
 

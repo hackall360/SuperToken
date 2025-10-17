@@ -113,7 +113,7 @@ def drain_feedback(scaler: StubAutoScaler, samples: int, free: int, total: int, 
 def test_autoscaler_increases_batch_size_with_low_utilization(caplog: pytest.LogCaptureFixture) -> None:
     scaler = StubAutoScaler(window_size=4, min_bs=64, max_bs=2048, init_h2d_mb=512, target_util=0.85)
     scaler.set_gpu(900_000_000, 1_000_000_000)
-    initial_state = scaler.suggest(token_bytes_per_example=5_000_000)
+    initial_state, _ = scaler.suggest(token_bytes_per_example=5_000_000)
     caplog.set_level(logging.INFO)
     drain_feedback(scaler, samples=4, free=900_000_000, total=1_000_000_000, step_time=0.5)
     assert scaler.state.batch_size > initial_state.batch_size
@@ -125,7 +125,7 @@ def test_autoscaler_increases_batch_size_with_low_utilization(caplog: pytest.Log
 def test_autoscaler_reduces_batch_size_with_high_utilization(caplog: pytest.LogCaptureFixture) -> None:
     scaler = StubAutoScaler(window_size=4, min_bs=64, max_bs=2048, init_h2d_mb=1024, target_util=0.82)
     scaler.set_gpu(800_000_000, 1_000_000_000)
-    initial_state = scaler.suggest(token_bytes_per_example=5_000_000)
+    initial_state, _ = scaler.suggest(token_bytes_per_example=5_000_000)
     caplog.set_level(logging.INFO)
     for _ in range(4):
         scaler.set_gpu(40_000_000, 1_000_000_000)
@@ -138,13 +138,13 @@ def test_autoscaler_reduces_batch_size_with_high_utilization(caplog: pytest.LogC
 def test_autoscaler_dampens_growth_when_vram_variance_high() -> None:
     scaler_low_var = StubAutoScaler(window_size=6, min_bs=64, max_bs=2048, init_h2d_mb=512, target_util=0.8)
     scaler_low_var.set_gpu(900_000_000, 1_000_000_000)
-    base_state_low = scaler_low_var.suggest(token_bytes_per_example=5_000_000)
+    base_state_low, _ = scaler_low_var.suggest(token_bytes_per_example=5_000_000)
     drain_feedback(scaler_low_var, samples=6, free=900_000_000, total=1_000_000_000, step_time=0.4)
     growth_low = scaler_low_var.state.batch_size - base_state_low.batch_size
 
     scaler_var = StubAutoScaler(window_size=6, min_bs=64, max_bs=2048, init_h2d_mb=512, target_util=0.8)
     scaler_var.set_gpu(900_000_000, 1_000_000_000)
-    base_state_var = scaler_var.suggest(token_bytes_per_example=5_000_000)
+    base_state_var, _ = scaler_var.suggest(token_bytes_per_example=5_000_000)
     for free in (950_000_000, 50_000_000, 950_000_000, 50_000_000, 950_000_000, 50_000_000):
         scaler_var.set_gpu(free, 1_000_000_000)
         scaler_var.feedback(step_time_s=0.4)
@@ -158,7 +158,7 @@ def test_autoscaler_dampens_growth_when_vram_variance_high() -> None:
 def test_autoscaler_state_roundtrip_preserves_feedback_loop() -> None:
     scaler = StubAutoScaler(window_size=5, min_bs=128, max_bs=4096, init_h2d_mb=768, target_util=0.83)
     scaler.set_gpu(850_000_000, 1_000_000_000)
-    initial_state = scaler.suggest(token_bytes_per_example=4_000_000)
+    initial_state, _ = scaler.suggest(token_bytes_per_example=4_000_000)
     drain_feedback(
         scaler,
         samples=5,
@@ -188,13 +188,15 @@ def test_autoscaler_state_roundtrip_preserves_feedback_loop() -> None:
     # Subsequent suggestions/feedback should produce identical results.
     scaler.set_gpu(750_000_000, 1_000_000_000)
     restored.set_gpu(750_000_000, 1_000_000_000)
-    next_state_original = scaler.suggest(token_bytes_per_example=4_000_000)
-    next_state_restored = restored.suggest(token_bytes_per_example=4_000_000)
+    next_state_original, _ = scaler.suggest(token_bytes_per_example=4_000_000)
+    next_state_restored, _ = restored.suggest(token_bytes_per_example=4_000_000)
     assert asdict(next_state_original) == asdict(next_state_restored)
 
-    scaler.feedback(step_time_s=0.5, cpu_fallback_rate=0.15)
-    restored.feedback(step_time_s=0.5, cpu_fallback_rate=0.15)
+    _, snapshot_original = scaler.feedback(step_time_s=0.5, cpu_fallback_rate=0.15)
+    _, snapshot_restored = restored.feedback(step_time_s=0.5, cpu_fallback_rate=0.15)
     assert restored.state is not None and scaler.state is not None
     assert asdict(restored.state) == asdict(scaler.state)
     assert list(restored._step_times) == list(scaler._step_times)
     assert list(restored._vram_fracs) == list(scaler._vram_fracs)
+    assert snapshot_original["step_times"] == snapshot_restored["step_times"]
+    assert snapshot_original["vram_utilization"] == snapshot_restored["vram_utilization"]

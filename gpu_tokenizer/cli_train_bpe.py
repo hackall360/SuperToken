@@ -564,8 +564,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     seqs: Iterable[Iterable[int]] = _iter_sequences()
 
     scaler = AutoScalerType(target_util=0.80)
-    init = scaler.suggest(token_bytes_per_example=8 * 1024)
-    bs = min(args.bs, init.batch_size)
+    init_state, _init_window = scaler.suggest(token_bytes_per_example=8 * 1024)
+    bs = min(args.bs, init_state.batch_size)
     batcher = PackedBatcherType(seqs, batch_size=bs)
 
     warm_plan = None

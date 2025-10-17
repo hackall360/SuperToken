@@ -31,3 +31,16 @@ def test_sample_benchmark_scaling_meets_threshold() -> None:
     efficiency = float(scaling.get("efficiency"))
     threshold = float(scaling.get("target_efficiency"))
     assert efficiency >= threshold >= 0.88
+    bpe_meta = payload.get("bpe", {})
+    assert "autoscaler_window" in bpe_meta
+    assert isinstance(bpe_meta.get("autoscaler_window"), list)
+    autoscaler_meta = (
+        bpe_meta.get("result", {})
+        .get("telemetry", {})
+        .get("autoscaler", {})
+    )
+    assert "window" in autoscaler_meta
+    assert isinstance(autoscaler_meta.get("window"), list)
+    hetero_window = hetero.get("autoscaler_window")
+    assert hetero_window is not None
+    assert isinstance(hetero_window, list)
