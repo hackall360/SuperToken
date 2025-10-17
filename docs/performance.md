@@ -19,6 +19,10 @@ The previous implementation materialized a `(num_pairs, 2)` tensor in the active
 
 Although no CUDA device was available in this environment, the reduction in intermediate tensor size directly translates to lower VRAM pressure during GPU execution because no additional host-only allocations are introduced.
 
+## CPU fallback scheduling
+
+`GPUBPETrainer` now evaluates every in-flight batch ahead of each merge iteration and reroutes shards that satisfy `should_route_to_cpu` to the CPU fast path. The heuristic currently prefers the host implementation when a shard holds at most two sequences, exposes a merge width ≤ 4, or yields ≤ 512 packed pair slots. Offloading these slivers to the CPU avoids the launch overhead of tiny CUDA kernels while preserving the packed-key histogram ordering shared with the GPU path. Throughput for those shards matches the host implementation (and is therefore slower than sustained GPU throughput), but the trainer records the fallback ratio in the telemetry block so operators can quantify the impact on end-to-end performance.
+
 ## Multi-GPU execution
 
 The `GPUBPETrainer` can aggregate pair histograms across multiple NCCL-backed
