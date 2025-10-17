@@ -4,6 +4,11 @@ import socket
 import pytest
 
 torch = pytest.importorskip("torch")
+if not hasattr(torch, "tensor") or not hasattr(torch, "Tensor"):
+    pytest.skip(
+        "PyTorch tensor APIs are unavailable in the current test environment",
+        allow_module_level=True,
+    )
 
 import torch.distributed as dist
 import torch.multiprocessing as mp

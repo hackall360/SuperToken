@@ -22,6 +22,7 @@ def _install_torch_stub() -> None:
         sys.modules.pop(name, None)
 
     torch_stub = types.ModuleType("torch")
+    torch_stub._SUPERTOKEN_TORCH_STUB = True
 
     class _Device:
         def __init__(self, type_name: str, index: int | None = None) -> None:
@@ -85,6 +86,23 @@ def _install_torch_stub() -> None:
     dist_stub.is_available = lambda: False
     dist_stub.is_initialized = lambda: False
 
+    torch_stub.uint16 = object()
+    torch_stub.int32 = object()
+
+    def _iinfo(dtype):
+        if dtype is torch_stub.uint16:
+            return types.SimpleNamespace(max=(1 << 16) - 1)
+        return types.SimpleNamespace(max=(1 << 31) - 1)
+
+    torch_stub.iinfo = _iinfo
+    torch_stub.jit = types.SimpleNamespace(script=lambda fn: fn)
+
+    utils_stub = types.ModuleType("torch.utils")
+    cpp_stub = types.ModuleType("torch.utils.cpp_extension")
+    cpp_stub.load_inline = lambda *args, **kwargs: None
+    utils_stub.cpp_extension = cpp_stub
+    torch_stub.utils = utils_stub
+
     mp_stub = types.ModuleType("torch.multiprocessing")
     mp_stub.start_processes = lambda *args, **kwargs: None
     spawn_stub = types.ModuleType("torch.multiprocessing.spawn")
@@ -96,12 +114,15 @@ def _install_torch_stub() -> None:
 
     sys.modules["torch"] = torch_stub
     sys.modules["torch.distributed"] = dist_stub
+    sys.modules["torch.utils"] = utils_stub
+    sys.modules["torch.utils.cpp_extension"] = cpp_stub
     sys.modules["torch.multiprocessing"] = mp_stub
     sys.modules["torch.multiprocessing.spawn"] = spawn_stub
 
 
 def _reload_dist_runtime():
     sys.modules.pop("gpu_tokenizer.dist_runtime", None)
+    sys.modules.pop("gpu_tokenizer.utils", None)
     return importlib.import_module("gpu_tokenizer.dist_runtime")
 
 

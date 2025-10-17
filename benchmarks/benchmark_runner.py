@@ -376,6 +376,7 @@ def run_bpe_benchmark(
     device: str | None,
     seed: int,
     log_every: int,
+    overlap: bool = True,
 ) -> dict[str, object]:
     """Benchmark :class:`GPUBPETrainer` on the provided sequences.
 
@@ -456,7 +457,7 @@ def run_bpe_benchmark(
     # Capture the high-resolution wall-clock before invoking GPU work so the
     # elapsed timing includes the entire training call.
     wall_start = time.perf_counter()
-    meta = trainer.fit(batches, log_every=log_every)
+    meta = trainer.fit(batches, log_every=log_every, overlap_transfers=overlap)
     wall_time = time.perf_counter() - wall_start
     return {
         "config": {
@@ -468,6 +469,7 @@ def run_bpe_benchmark(
         },
         "wall_time_s": wall_time,
         "result": meta,
+        "overlap_enabled": overlap,
     }
 
 

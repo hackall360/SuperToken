@@ -185,11 +185,15 @@ def _format_iteration_summary(summary: dict[str, object]) -> str:
     kernel = float(summary.get("kernel_s", 0.0) or 0.0)
     d2h = float(summary.get("d2h_s", 0.0) or 0.0)
     reduction = float(summary.get("reduction_s", 0.0) or 0.0)
+    copy_time = float(summary.get("copy_s", 0.0) or 0.0)
+    compute_time = float(summary.get("compute_s", 0.0) or 0.0)
+    overlap = "on" if bool(summary.get("overlap", True)) else "off"
     return (
         f"[timings] merge {merge_idx:6d} | "
         f"tokens={tokens:,} ({tokens_per_s:,.0f}/s) | "
         f"leases={leases:,} ({leases_per_s:,.0f}/s) | "
-        f"h2d={h2d:.3f}s kernel={kernel:.3f}s d2h={d2h:.3f}s reduce={reduction:.3f}s"
+        f"h2d={h2d:.3f}s kernel={kernel:.3f}s d2h={d2h:.3f}s reduce={reduction:.3f}s | "
+        f"copy={copy_time:.3f}s compute={compute_time:.3f}s overlap={overlap}"
     )
 
 
@@ -264,6 +268,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--log-stage-timings",
         action="store_true",
         help="Print EWMA timing summaries alongside merge progress logs",
+    )
+    parser.add_argument(
+        "--no-overlap",
+        action="store_true",
+        help="Disable copy/compute overlap to compare throughput against the pipelined path",
     )
     return parser
 
@@ -438,6 +447,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         log_every=log_every,
         warm_start_plan=warm_plan,
         freeze_warm_start=args.freeze_warm_start if warm_plan else None,
+        overlap_transfers=not bool(getattr(args, "no_overlap", False)),
         on_iteration_summary=iteration_callback,
     )
     trainer.save(args.out_dir)

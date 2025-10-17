@@ -5,6 +5,13 @@ from pathlib import Path
 
 import pytest
 
+torch = pytest.importorskip("torch")
+if getattr(torch, "_SUPERTOKEN_TORCH_STUB", False) or not hasattr(torch, "full"):
+    pytest.skip(
+        "PyTorch with tensor factories is required for streaming IO tests",
+        allow_module_level=True,
+    )
+
 from gpu_tokenizer.cpu_packer import BytePacker
 from gpu_tokenizer.datasets import StreamingPackedBatcher
 from gpu_tokenizer.io import CorpusStreamer, GPUUtilizationMonitor

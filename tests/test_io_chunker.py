@@ -34,10 +34,12 @@ def _install_bpe_trainer_stub() -> None:
             alpha: float = 0.2,
             window_size: int = 16,
             enabled: bool = False,
+            overlap_enabled: bool = True,
         ) -> None:
             self.alpha = float(alpha)
             self.window_size = int(window_size)
             self.enabled = bool(enabled)
+            self.overlap_enabled = bool(overlap_enabled)
             self._tokens_per_s: float | None = None
             self._lease_per_s: float | None = None
 
@@ -48,6 +50,17 @@ def _install_bpe_trainer_stub() -> None:
         @property
         def lease_per_s(self) -> float | None:
             return self._lease_per_s
+
+        def reset(self) -> None:
+            self._tokens_per_s = None
+            self._lease_per_s = None
+
+        def record_stage(self, stage: str, duration_s: float) -> str:
+            if stage in {"h2d", "d2h"}:
+                return "copy"
+            if stage == "kernel":
+                return "compute"
+            return "other"
 
         def record_tokens(
             self,
@@ -80,10 +93,16 @@ def _install_bpe_trainer_stub() -> None:
 
 
 def _install_torch_stub() -> None:
-    if "torch" in sys.modules:
-        return
+    for name in [
+        "torch",
+        "torch.distributed",
+        "torch.utils",
+        "torch.utils.cpp_extension",
+    ]:
+        sys.modules.pop(name, None)
 
     torch_stub = types.ModuleType("torch")
+    torch_stub._SUPERTOKEN_TORCH_STUB = True
 
     class _CudaStub:
         def __init__(self) -> None:

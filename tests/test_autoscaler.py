@@ -11,12 +11,38 @@ from dataclasses import asdict
 import pytest
 
 if "torch" not in sys.modules:  # pragma: no cover - testing convenience
-    cuda_stub = types.SimpleNamespace(
-        is_available=lambda: False,
-        mem_get_info=lambda: (0, 0),
-        empty_cache=lambda: None,
-        max_memory_allocated=lambda *args, **kwargs: 0,
-    )
+    class _CudaStub:
+        def __init__(self) -> None:
+            self._available = False
+            self._count = 0
+            self.enabled_pairs: list[tuple[int, int]] = []
+            self.peer_calls: list[tuple[int, int]] = []
+
+        def is_available(self) -> bool:
+            return self._available
+
+        def device_count(self) -> int:
+            return self._count
+
+        def mem_get_info(self) -> tuple[int, int]:
+            return (0, 0)
+
+        def empty_cache(self) -> None:
+            return None
+
+        def max_memory_allocated(self, *_args, **_kwargs) -> int:
+            return 0
+
+        def device_enable_peer_access(self, peer: int) -> None:
+            self.enabled_pairs.append((0, int(peer)))
+
+        def Stream(self, *_args, **_kwargs):  # pragma: no cover - unused stub helper
+            return types.SimpleNamespace()
+
+        def stream(self, stream_obj):  # pragma: no cover - unused stub helper
+            return types.SimpleNamespace(__enter__=lambda *a, **k: stream_obj, __exit__=lambda *a, **k: False)
+
+    cuda_stub = _CudaStub()
     jit_stub = types.SimpleNamespace(script=lambda fn: fn)
     uint16 = object()
     int32 = object()
@@ -33,6 +59,7 @@ if "torch" not in sys.modules:  # pragma: no cover - testing convenience
         return types.SimpleNamespace(max=max_map.get(dtype, (1 << 63) - 1))
 
     torch_stub = types.ModuleType("torch")
+    torch_stub._SUPERTOKEN_TORCH_STUB = True
     torch_stub.cuda = cuda_stub
     torch_stub.jit = jit_stub
     torch_stub.uint16 = uint16
