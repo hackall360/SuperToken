@@ -19,6 +19,7 @@ from gpu_tokenizer import (
     BytePacker,
     GPUBPETrainer,
     GPUUnigramTrainer,
+    HybridTrainer,
     PackedBatcher,
     StreamingPackedBatcher,
     utils,
@@ -33,6 +34,7 @@ __all__ = [
     "BytePacker",
     "GPUBPETrainer",
     "GPUUnigramTrainer",
+    "HybridTrainer",
     "PackedBatcher",
     "utils",
     "main",
@@ -95,6 +97,51 @@ def _expand_data_patterns(patterns: Sequence[str]) -> list[Path]:
     if not files:
         raise SystemExit("No input files matched the provided --data globs")
     return files
+
+
+def _load_warm_start_merges(source: str | None) -> list[tuple[int, int]] | None:
+    """Load warm-start merges from a JSON manifest when provided."""
+
+    if not source:
+        return None
+
+    path = Path(source)
+    if not path.exists():
+        raise SystemExit(f"Warm-start plan not found at {path}")
+
+    if path.suffix.lower() not in {".json", ".jsonl"}:
+        raise SystemExit("Warm-start plans must be JSON manifests containing a 'merges' list")
+
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    merges_raw: object | None = None
+    if isinstance(payload, Mapping):
+        merges_raw = payload.get("merges")
+        if merges_raw is None:
+            trainer_section = payload.get("trainer")
+            if isinstance(trainer_section, Mapping):
+                merges_raw = trainer_section.get("merges")
+    elif isinstance(payload, Sequence):
+        merges_raw = payload
+
+    if not isinstance(merges_raw, Sequence):
+        raise SystemExit(
+            f"Warm-start manifest {path} does not contain a 'merges' sequence"
+        )
+
+    merges: list[tuple[int, int]] = []
+    for entry in merges_raw:
+        if not isinstance(entry, Sequence) or len(entry) != 2:
+            raise SystemExit(
+                "Warm-start merges must be sequences of two integer token ids"
+            )
+        left, right = entry
+        try:
+            merges.append((int(left), int(right)))
+        except (TypeError, ValueError) as exc:
+            raise SystemExit("Warm-start merge entries must be coercible to integers") from exc
+    return merges
 
 
 def _iter_packed_batches(
@@ -755,6 +802,85 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
         trainer.save(args.out_dir)
 
 
+def _cmd_train_hybrid(args: argparse.Namespace) -> None:
+    """Train alternating BPE and unigram phases with shared batches."""
+
+    data_patterns = getattr(args, "data", None)
+    if not data_patterns:
+        raise SystemExit("train-hybrid requires at least one --data glob pattern")
+    data_files = _expand_data_patterns(data_patterns)
+    warm_start_merges = _load_warm_start_merges(getattr(args, "warm_start", None))
+
+    config = {
+        "trainer": {
+            "base_vocab": args.base_vocab,
+            "merges": args.merges,
+            "cycles": args.cycles,
+            "unigram_epochs": args.unigram_epochs,
+            "max_unigram_len": args.max_unigram_len,
+        },
+        "data": {
+            "patterns": list(data_patterns),
+            "files": [str(path) for path in data_files],
+            "bos": args.bos,
+            "eos": args.eos,
+        },
+        "runtime": {
+            "batch_size": args.batch_size,
+            "seed": args.seed,
+            "bpe_log_every": args.bpe_log_every,
+        },
+        "warm_start": {
+            "source": getattr(args, "warm_start", None),
+            "merges": [list(map(int, pair)) for pair in warm_start_merges]
+            if warm_start_merges
+            else None,
+        },
+        "checkpointing": {
+            "checkpoint_dir": args.checkpoint_dir,
+        },
+        "output": args.out_dir,
+        "dry_run": bool(getattr(args, "dry_run", False)),
+    }
+
+    _log_resolved_config("train-hybrid", config)
+    if getattr(args, "dry_run", False):
+        print("[dry-run] train-hybrid initialization complete")
+        return
+
+    sequences = _load_sequences(data_files, bos=args.bos, eos=args.eos)
+    batches = list(
+        _iter_packed_batches(sequences, batch_size=args.batch_size, seed=args.seed)
+    )
+
+    if HybridTrainer is None:  # pragma: no cover - optional torch dependency
+        raise SystemExit("HybridTrainer is unavailable; install torch for train-hybrid")
+
+    trainer = HybridTrainer(
+        base_vocab=args.base_vocab,
+        merges=args.merges,
+        cycles=args.cycles,
+        unigram_epochs=args.unigram_epochs,
+        max_unigram_len=args.max_unigram_len,
+        warm_start_merges=warm_start_merges,
+        bpe_init_kwargs={"device": args.device},
+    )
+
+    bpe_fit_kwargs = {"log_every": args.bpe_log_every}
+    summary = trainer.fit(
+        batches,
+        cycles=args.cycles,
+        unigram_epochs=args.unigram_epochs,
+        warm_start_merges=warm_start_merges,
+        checkpoint_dir=args.checkpoint_dir,
+        bpe_fit_kwargs=bpe_fit_kwargs,
+    )
+    print(summary)
+
+    if args.out_dir:
+        trainer.save(args.out_dir)
+
+
 def _cmd_stream_batches(args: argparse.Namespace) -> None:
     """Stream packed batches and report their tensor dimensions.
 
@@ -898,6 +1024,36 @@ def _parser() -> argparse.ArgumentParser:
         help="Path to a checkpoint directory created by --checkpoint-dir",
     )
     train_bpe.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Instantiate the trainer, log resolved configuration, and exit",
+    )
+
+    train_hybrid = subparsers.add_parser(
+        "train-hybrid", parents=[common], help="Train alternating BPE→unigram cycles"
+    )
+    train_hybrid.set_defaults(func=_cmd_train_hybrid)
+    train_hybrid.add_argument("--merges", type=int, default=50_000)
+    train_hybrid.add_argument("--base-vocab", type=int, default=256)
+    train_hybrid.add_argument("--batch-size", type=int, default=1024)
+    train_hybrid.add_argument("--cycles", type=int, default=1)
+    train_hybrid.add_argument("--unigram-epochs", type=int, default=1)
+    train_hybrid.add_argument("--max-unigram-len", type=int, default=8)
+    train_hybrid.add_argument("--bpe-log-every", type=int, default=100)
+    train_hybrid.add_argument(
+        "--warm-start",
+        type=str,
+        default=None,
+        help="Optional JSON manifest containing seed merges",
+    )
+    train_hybrid.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default=None,
+        help="Directory where per-cycle checkpoints are written",
+    )
+    train_hybrid.add_argument("--out-dir", type=str, default="./hybrid_out")
+    train_hybrid.add_argument(
         "--dry-run",
         action="store_true",
         help="Instantiate the trainer, log resolved configuration, and exit",

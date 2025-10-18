@@ -112,3 +112,55 @@ def test_train_unigram_dry_run_logs_config(
     assert '"vocab_size": 128' in captured.out
     assert '"batch_size": 16' in captured.out
     assert "[dry-run] train-unigram initialization complete" in captured.out
+
+
+def test_train_hybrid_dry_run_logs_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class DummyTrainer:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        def fit(self, *args, **kwargs):  # pragma: no cover - defensive
+            raise AssertionError("fit should not run during dry-run")
+
+        def save(self, *args, **kwargs):  # pragma: no cover - defensive
+            raise AssertionError("save should not run during dry-run")
+
+    def _fail_load_sequences(*args, **kwargs):  # pragma: no cover - defensive
+        raise AssertionError("_load_sequences should not run during dry-run")
+
+    def _fail_iter_batches(*args, **kwargs):  # pragma: no cover - defensive
+        raise AssertionError("_iter_packed_batches should not run during dry-run")
+
+    monkeypatch.setattr(main, "HybridTrainer", DummyTrainer)
+    monkeypatch.setattr(main, "_load_sequences", _fail_load_sequences)
+    monkeypatch.setattr(main, "_iter_packed_batches", _fail_iter_batches)
+
+    shard = tmp_path / "shard.txt"
+    shard.write_text("hello world\n", encoding="utf-8")
+
+    main.main(
+        [
+            "train-hybrid",
+            "--data",
+            str(shard),
+            "--merges",
+            "12",
+            "--batch-size",
+            "8",
+            "--cycles",
+            "2",
+            "--unigram-epochs",
+            "3",
+            "--dry-run",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert "[config][train-hybrid]" in captured.out
+    assert '"merges": 12' in captured.out
+    assert '"cycles": 2' in captured.out
+    assert '"batch_size": 8' in captured.out
+    assert "[dry-run] train-hybrid initialization complete" in captured.out

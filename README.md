@@ -91,6 +91,19 @@ python main.py train-unigram \
 
 Both commands will automatically adapt the batch size in response to your GPU throughput and persist the resulting vocabulary files.
 
+Alternate between BPE warm starts and unigram refinement in a single run:
+
+```bash
+python main.py train-hybrid \
+  --data "data/**/*.txt" \
+  --merges 50000 \
+  --cycles 2 \
+  --unigram-epochs 2 \
+  --out-dir ./artifacts/hybrid
+```
+
+The hybrid workflow exports Hugging Face-ready BPE files alongside SentencePiece probabilities and a manifest describing each cycle.
+
 ## Command Reference
 The CLI is organized into subcommands that share a common set of arguments.
 
@@ -98,6 +111,7 @@ The CLI is organized into subcommands that share a common set of arguments.
 | --- | --- | --- |
 | `train-bpe` | Trains a GPU-accelerated BPE tokenizer. | Autoscaled batch sizing, streaming ingestion, optional on-the-fly merges export. |
 | `train-unigram` | Trains a GPU-accelerated unigram tokenizer. | Epoch-based training with configurable vocab size and subword length. |
+| `train-hybrid` | Alternates BPE warm starts with unigram refinement. | Shared batches across phases, hybrid artifact bundle (`merges.txt`, `unigram.prob`, manifest). |
 | `benchmark` | Runs both trainers against synthetic and/or real corpora. | Emits comparative tables and JSON telemetry snapshots. |
 
 ## Benchmarking
@@ -145,7 +159,7 @@ SuperToken is organized into modular layers that can be reused independently or 
 - **Unigram training (`gpu_tokenizer.unigram_trainer`)** – Offers `GPUUnigramTrainer` plus scoring utilities for probabilistic vocabularies. Docstrings in [`gpu_tokenizer/unigram_trainer.py`](gpu_tokenizer/unigram_trainer.py) describe how to plug in custom smoothing or constraint logic.
 - **Datasets & packing (`gpu_tokenizer.datasets`)** – Houses streaming dataset abstractions, packing helpers, and synthetic corpus generators used by both trainers. See [`gpu_tokenizer/datasets/__init__.py`](gpu_tokenizer/datasets/__init__.py) and the submodules it re-exports.
 - **I/O pipeline (`gpu_tokenizer.io`)** – Encapsulates shard decoding, compression handling, and background workers. Start with [`gpu_tokenizer/io/__init__.py`](gpu_tokenizer/io/__init__.py) and follow the module-level docs for extension points.
-- **CLI composition (`main.py`)** – Declares the `train-bpe`, `train-unigram`, and `benchmark` subcommands. You can register new commands by extending the `build_parser` function and wiring your trainers to the shared autoscaler utilities.
+- **CLI composition (`main.py`)** – Declares the `train-bpe`, `train-unigram`, `train-hybrid`, and `benchmark` subcommands. You can register new commands by extending the `build_parser` function and wiring your trainers to the shared autoscaler utilities.
 - **Benchmark utilities (`benchmarks/`)** – Contains reusable benchmarking harnesses and report formatters. Module docstrings point to upcoming narrative guides under `docs/benchmarks/` for more complex scenarios.
 
 Future deep dives will land in the `docs/` directory (see [`docs/architecture.md`](docs/architecture.md)) and will mirror the high-level flow described here.
