@@ -1,5 +1,26 @@
 # `count_pairs` Performance Notes
 
+## Embedding pruning accuracy benchmark
+
+The `benchmarks/embedding_pruning_benchmark.py` script trains a lightweight
+embedding classifier on CPU and repeats the run after removing tokens whose
+relative frequency falls below the default 1 % pruning threshold.【F:benchmarks/embedding_pruning_benchmark.py†L36-L53】【F:benchmarks/embedding_pruning_benchmark.py†L318-L365】
+Invoke it directly with:
+
+```bash
+python benchmarks/embedding_pruning_benchmark.py --output-dir artifacts
+```
+
+The benchmark records both the pre- and post-pruning telemetry in a JSON
+snapshot that mirrors the existing tokenizer benchmark schema. The checked-in
+sample run shows that pruning 16 of the 64 synthetic tokens (retaining a
+48-token vocabulary) preserved 100 % evaluation accuracy while slightly
+improving throughput to ~6,087 samples/sec thanks to the smaller embedding
+matrix.【F:benchmarks/samples/embedding_pruning_sample.json†L1-L94】【F:benchmarks/samples/embedding_pruning_sample.json†L95-L154】
+Because the harness is entirely CPU-driven it can run in CI environments that
+lack CUDA or PyTorch wheels, providing fast regression coverage for embedding
+export and pruning behaviour.
+
 ## Measurement setup
 - **Environment:** PyTorch 2.2.0+cpu, NumPy 1.26.4, Python 3.12.10.
 - **Hardware:** Single CPU worker provided by the evaluation container (no CUDA device available).
