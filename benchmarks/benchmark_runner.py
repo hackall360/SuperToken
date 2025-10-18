@@ -22,6 +22,8 @@ from gpu_tokenizer import (
 )
 from gpu_tokenizer.io import MemoryMappedShard
 
+from .schema import validate_benchmark_output
+
 if TYPE_CHECKING:  # pragma: no cover - typing helper
     from gpu_tokenizer.morphology import MorphologyPlugin
 
@@ -60,6 +62,182 @@ class BPERunSpec:
         if count <= 0:
             return []
         return [1.0] * count
+
+
+def generate_streaming_compression_runs(
+    *,
+    batch_size: int,
+    device: str,
+    target_efficiency: float = 0.9,
+    baseline_name: str = "streaming_baseline",
+    overlap_name: str = "streaming_overlap",
+) -> list[BPERunSpec]:
+    """Create run specifications highlighting streaming compression modes.
+
+    The generated scenarios capture a baseline single-device run where host to
+    device transfers occur sequentially and a second run that enables overlapped
+    transfers. The latter references the baseline so downstream scaling
+    reporting can quantify the win from overlapping compression/decompression
+    work with GPU execution.
+
+    Parameters
+    ----------
+    batch_size:
+        Number of sequences per packed batch for both scenarios.
+    device:
+        CUDA device string to target (for example ``"cuda:0"``).
+    target_efficiency:
+        Minimum acceptable efficiency relative to the baseline when overlap is
+        enabled. The default ``0.9`` requires at least a 90% throughput match.
+    baseline_name, overlap_name:
+        Identifiers used in the emitted :class:`BPERunSpec` objects. They are
+        exposed as keyword-only arguments so callers can align them with
+        existing reporting conventions.
+
+    Returns
+    -------
+    list[BPERunSpec]
+        Two BPE run specifications: a sequential-transfer baseline and an
+        overlapped streaming configuration that references the baseline for
+        scaling analysis.
+    """
+
+    baseline = BPERunSpec(
+        name=baseline_name,
+        batch_size=batch_size,
+        device=device,
+        overlap=False,
+    )
+    streaming = BPERunSpec(
+        name=overlap_name,
+        batch_size=batch_size,
+        device=device,
+        overlap=True,
+        scaling_reference=baseline.name,
+        target_efficiency=target_efficiency,
+    )
+    return [baseline, streaming]
+
+
+def generate_multi_gpu_runs(
+    *,
+    batch_size: int,
+    baseline_device: str,
+    data_parallel_devices: Sequence[str],
+    target_efficiency: float = 0.88,
+    baseline_name: str = "single_gpu",
+    multi_name: str = "multi_gpu",
+) -> list[BPERunSpec]:
+    """Build run specifications for evaluating multi-GPU throughput scaling.
+
+    A single-GPU baseline is paired with a multi-GPU configuration that lists
+    all participating devices. The ``scaling_reference`` field is wired up so
+    :func:`run_bpe_suite` can compute efficiency relative to the baseline using
+    :class:`BPERunSpec.normalized_weights`.
+
+    Parameters
+    ----------
+    batch_size:
+        Batch size shared by all generated runs.
+    baseline_device:
+        CUDA device used for the baseline measurement.
+    data_parallel_devices:
+        Iterable of CUDA devices to use for the multi-GPU run.
+    target_efficiency:
+        Minimum acceptable efficiency relative to the baseline. Defaults to the
+        standard 88%% efficiency threshold used in our scaling reports.
+    baseline_name, multi_name:
+        Identifiers used in the generated :class:`BPERunSpec` objects.
+
+    Returns
+    -------
+    list[BPERunSpec]
+        Two run specifications: the baseline and a multi-GPU configuration
+        referencing that baseline.
+    """
+
+    devices = [str(device) for device in data_parallel_devices]
+    if not devices:
+        raise ValueError("data_parallel_devices must contain at least one device")
+    baseline = BPERunSpec(
+        name=baseline_name,
+        batch_size=batch_size,
+        device=baseline_device,
+        overlap=True,
+    )
+    multi = BPERunSpec(
+        name=multi_name,
+        batch_size=batch_size,
+        devices=devices,
+        overlap=True,
+        scaling_reference=baseline.name,
+        device_weights=[1.0] * len(devices),
+        target_efficiency=target_efficiency,
+    )
+    return [baseline, multi]
+
+
+def generate_hybrid_runs(
+    *,
+    batch_size: int,
+    fast_device: str,
+    helper_devices: Sequence[str],
+    helper_weight: float = 0.75,
+    target_efficiency: float = 0.85,
+    baseline_name: str = "hybrid_baseline",
+    hybrid_name: str = "hybrid_pipeline",
+) -> list[BPERunSpec]:
+    """Generate run specifications blending single- and multi-GPU execution.
+
+    Hybrid scenarios model setups where a primary GPU performs most of the
+    compute while one or more helper devices focus on auxiliary tasks (for
+    example, host staging or decompression). The generated configuration assigns
+    custom ``device_weights`` so scaling comparisons factor in that asymmetric
+    contribution.
+
+    Parameters
+    ----------
+    batch_size:
+        Batch size to reuse for both runs.
+    fast_device:
+        Device capturing the single-GPU baseline and leading the hybrid run.
+    helper_devices:
+        Sequence of helper GPU identifiers that augment the baseline device.
+    helper_weight:
+        Relative contribution of each helper GPU when projecting expected
+        throughput. ``0.75`` means each helper is expected to deliver 75%% of the
+        throughput of the fast device.
+    target_efficiency:
+        Required efficiency relative to the expected aggregate throughput.
+    baseline_name, hybrid_name:
+        Identifiers used for the generated :class:`BPERunSpec` objects.
+
+    Returns
+    -------
+    list[BPERunSpec]
+        Baseline and hybrid run specifications with scaling metadata.
+    """
+
+    helpers = [str(device) for device in helper_devices]
+    if not helpers:
+        raise ValueError("helper_devices must contain at least one device")
+    baseline = BPERunSpec(
+        name=baseline_name,
+        batch_size=batch_size,
+        device=fast_device,
+        overlap=True,
+    )
+    weights = [1.0] + [helper_weight for _ in helpers]
+    hybrid = BPERunSpec(
+        name=hybrid_name,
+        batch_size=batch_size,
+        devices=[fast_device, *helpers],
+        overlap=True,
+        scaling_reference=baseline.name,
+        device_weights=weights,
+        target_efficiency=target_efficiency,
+    )
+    return [baseline, hybrid]
 
 
 def _ensure_trainers_available() -> None:
@@ -902,6 +1080,7 @@ def serialize_run(
     }
     if bpe_runs is not None:
         payload["bpe_runs"] = bpe_runs.get("runs") if isinstance(bpe_runs, dict) else bpe_runs
+    validate_benchmark_output(payload)
     path = output_dir / f"benchmark_{timestamp}.json"
     path.write_text(json.dumps(payload, indent=2, default=_json_default), encoding="utf-8")
     return path
