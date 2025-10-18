@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,24 @@ from tests._stubs import install_torch_stub
 
 install_torch_stub()
 main = importlib.import_module("main")
+
+
+def _extract_config_block(output: str, command: str) -> dict[str, object]:
+    prefix = f"[config][{command}] "
+    lines = output.splitlines()
+    for index, line in enumerate(lines):
+        if not line.startswith(prefix):
+            continue
+        payload_lines = [line[len(prefix) :]]
+        balance = payload_lines[0].count("{") - payload_lines[0].count("}")
+        follow = index + 1
+        while balance > 0 and follow < len(lines):
+            payload_lines.append(lines[follow])
+            balance += lines[follow].count("{") - lines[follow].count("}")
+            follow += 1
+        payload = "\n".join(payload_lines)
+        return json.loads(payload)
+    raise AssertionError(f"No config block found for {command!r}:\n{output}")
 
 
 def test_train_bpe_dry_run_logs_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -62,6 +81,8 @@ def test_train_bpe_dry_run_logs_config(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert "[config][train-bpe]" in captured.out
     assert '"merges": 12' in captured.out
     assert '"resolved_batch_size"' in captured.out
+    config = _extract_config_block(captured.out, "train-bpe")
+    assert config.get("morphology") == {"enabled": False}
     assert "[dry-run] train-bpe initialization complete" in captured.out
 
 
@@ -111,6 +132,8 @@ def test_train_unigram_dry_run_logs_config(
     assert "[config][train-unigram]" in captured.out
     assert '"vocab_size": 128' in captured.out
     assert '"batch_size": 16' in captured.out
+    config = _extract_config_block(captured.out, "train-unigram")
+    assert config.get("morphology") == {"enabled": False}
     assert "[dry-run] train-unigram initialization complete" in captured.out
 
 
@@ -163,4 +186,6 @@ def test_train_hybrid_dry_run_logs_config(
     assert '"merges": 12' in captured.out
     assert '"cycles": 2' in captured.out
     assert '"batch_size": 8' in captured.out
+    config = _extract_config_block(captured.out, "train-hybrid")
+    assert config.get("morphology") == {"enabled": False}
     assert "[dry-run] train-hybrid initialization complete" in captured.out

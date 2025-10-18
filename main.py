@@ -1373,7 +1373,10 @@ def _parser() -> argparse.ArgumentParser:
     morph_kwargs: dict[str, object] = {
         "type": str,
         "default": None,
-        "help": "Enable morphology preprocessing for the specified language",
+        "help": (
+            "Opt-in morphology preprocessing for the specified language; "
+            "disabled by default and may affect downstream token statistics"
+        ),
     }
     if morph_choices:
         morph_kwargs["choices"] = list(morph_choices)
@@ -1381,12 +1384,18 @@ def _parser() -> argparse.ArgumentParser:
     common.add_argument(
         "--morphology-case-markers",
         action="store_true",
-        help="Segment case markers when supported by the selected morphology plugin",
+        help=(
+            "Segment case markers when supported by the selected morphology plugin "
+            "(requires --morphology-lang)"
+        ),
     )
     common.add_argument(
         "--morphology-affix-tags",
         action="store_true",
-        help="Annotate productive affixes when supported by the selected morphology plugin",
+        help=(
+            "Annotate productive affixes when supported by the selected morphology plugin "
+            "(requires --morphology-lang)"
+        ),
     )
 
     train_bpe = subparsers.add_parser("train-bpe", parents=[common], help="Train a BPE model")
