@@ -10,10 +10,12 @@ from .bpe_gpu import (
     count_pairs_on_device,
     select_best_pair,
 )
+from .hybrid import HybridTrainer
 
 __all__ = [
     "BaseTrainer",
     "TrainerMetricsEWMA",
+    "HybridTrainer",
     "PairHistogramResult",
     "combine_histogram_results",
     "count_pairs_on_device",

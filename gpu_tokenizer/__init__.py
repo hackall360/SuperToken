@@ -19,11 +19,17 @@ try:  # pragma: no cover - optional torch dependency
 except Exception:  # pragma: no cover - allow import without torch
     GPUUnigramTrainer = None  # type: ignore
 
+try:  # pragma: no cover - optional torch dependency
+    from .trainers.hybrid import HybridTrainer  # type: ignore
+except Exception:  # pragma: no cover - allow import without torch
+    HybridTrainer = None  # type: ignore
+
 __all__ = [
     name
     for name in [
         "GPUBPETrainer",
         "GPUUnigramTrainer",
+        "HybridTrainer",
         "BaseTrainer",
         "BytePacker",
         "PackedBatcher",
