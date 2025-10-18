@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
+from typing import TYPE_CHECKING
 
 from .io import MemoryMappedShard
+
+if TYPE_CHECKING:  # pragma: no cover - typing helpers
+    from .morphology import MorphologyPlugin
 
 BytesLike = memoryview | bytes | bytearray
 ChunkLike = BytesLike | Iterable[int]
@@ -25,15 +29,32 @@ def _iter_chunk_bytes(chunk: ChunkLike) -> Iterator[int]:
 class BytePacker:
     """Convert byte streams to integer id sequences."""
 
-    def __init__(self, bos: int | None = None, eos: int | None = None):
+    def __init__(
+        self,
+        bos: int | None = None,
+        eos: int | None = None,
+        *,
+        morphology: "MorphologyPlugin" | None = None,
+    ):
         self.bos = bos
         self.eos = eos
+        self.morphology = morphology
+
+    def _iter_chunk_pieces(self, chunk: ChunkLike) -> Iterator[ChunkLike]:
+        if isinstance(chunk, (bytes, bytearray, memoryview)):
+            if self.morphology is not None:
+                yield from self.morphology.iter_surfaces(chunk)
+            else:
+                yield chunk
+            return
+        yield chunk
 
     def encode_view(self, data: BytesLike) -> Iterator[int]:
         def _iterator() -> Iterator[int]:
             if self.bos is not None:
                 yield self.bos
-            yield from _iter_chunk_bytes(data)
+            for piece in self._iter_chunk_pieces(data):
+                yield from _iter_chunk_bytes(piece)
             if self.eos is not None:
                 yield self.eos
 
@@ -44,7 +65,8 @@ class BytePacker:
             if self.bos is not None:
                 yield self.bos
             for chunk in chunks:
-                yield from _iter_chunk_bytes(chunk)
+                for piece in self._iter_chunk_pieces(chunk):
+                    yield from _iter_chunk_bytes(piece)
             if self.eos is not None:
                 yield self.eos
 

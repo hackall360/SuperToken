@@ -26,6 +26,11 @@ from gpu_tokenizer import (
 )
 from gpu_tokenizer.code_mode import prepare_corpus
 from gpu_tokenizer.io import CorpusStreamer, MemoryMappedShard
+from gpu_tokenizer.morphology import (
+    MorphologyPlugin,
+    available_plugins as available_morphology_plugins,
+    create_plugin as create_morphology_plugin,
+)
 from gpu_tokenizer.dtypes import length_storage_dtype
 from gpu_tokenizer.trainers.base import BaseTrainer, CheckpointPayload
 from benchmarks import benchmark_runner
@@ -43,7 +48,11 @@ __all__ = [
 
 
 def _load_sequences(
-    paths: Iterable[Path], bos: int | None, eos: int | None
+    paths: Iterable[Path],
+    bos: int | None,
+    eos: int | None,
+    *,
+    morphology: MorphologyPlugin | None = None,
 ) -> Iterator[Iterator[int]]:
     """Yield tokenized documents drawn from memory-mapped shard files.
 
@@ -62,7 +71,7 @@ def _load_sequences(
         Opens :class:`MemoryMappedShard` handles via an :class:`ExitStack` so
         shard files stay memory-mapped for the lifetime of the generator.
     """
-    packer = BytePacker(bos=bos, eos=eos)
+    packer = BytePacker(bos=bos, eos=eos, morphology=morphology)
 
     def _generator() -> Iterator[Iterator[int]]:
         with ExitStack() as stack:
@@ -87,6 +96,35 @@ def _normalize_code_languages(raw: Sequence[str] | None) -> set[str]:
             if norm:
                 values.add(norm)
     return values
+
+
+def _resolve_morphology(
+    args: argparse.Namespace,
+) -> tuple[MorphologyPlugin | None, dict[str, object]]:
+    """Instantiate the requested morphology plugin described by *args*."""
+
+    lang = getattr(args, "morphology_lang", None)
+    if not lang:
+        return None, {"enabled": False}
+    case_markers = bool(getattr(args, "morphology_case_markers", False))
+    affix_tags = bool(getattr(args, "morphology_affix_tags", False))
+    try:
+        plugin = create_morphology_plugin(
+            lang,
+            case_markers=case_markers,
+            affix_tags=affix_tags,
+        )
+    except KeyError as exc:
+        choices = ", ".join(available_morphology_plugins()) or "<none>"
+        raise SystemExit(
+            f"Unknown morphology language '{lang}'. Available plugins: {choices}"
+        ) from exc
+    return plugin, {
+        "enabled": True,
+        "language": lang,
+        "case_markers": case_markers,
+        "affix_tags": affix_tags,
+    }
 
 
 def _detect_code_language(path: Path) -> str | None:
@@ -216,6 +254,7 @@ def _load_code_mode_sequences(
     languages: set[str] | None,
     meta_enabled: bool,
     meta_max_length: int = 8,
+    morphology: MorphologyPlugin | None = None,
 ) -> tuple[list[list[int]], dict[str, object]]:
     """Materialise integer token sequences for code-mode corpora."""
 
@@ -229,7 +268,7 @@ def _load_code_mode_sequences(
         meta_max_length=max(1, int(meta_max_length)),
     )
 
-    packer = BytePacker(bos=bos, eos=eos)
+    packer = BytePacker(bos=bos, eos=eos, morphology=morphology)
     sequences: list[list[int]] = []
     ast_samples = 0
     fallback_samples = 0
@@ -497,6 +536,7 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
     """
     sequences: list[list[int]] = []
     sources: list[dict[str, object]] = []
+    morphology_plugin, morphology_config = _resolve_morphology(args)
 
     if args.synthetic_docs > 0:
         synthetic = benchmark_runner.synthesize_corpus(
@@ -525,6 +565,7 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
             bos=args.bos,
             eos=args.eos,
             limit=args.max_real_docs,
+            morphology=morphology_plugin,
         )
         if real_sequences:
             sequences.extend(real_sequences)
@@ -605,6 +646,7 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
             "max_real_docs": args.max_real_docs,
             "bpe": bpe["config"],
             "unigram": unigram["config"],
+            "morphology": morphology_config,
         },
         bpe=bpe,
         unigram=unigram,
@@ -647,6 +689,8 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
     }
     if code_langs:
         code_mode_config["languages"] = sorted(code_langs)
+    morphology_plugin, morphology_config = _resolve_morphology(args)
+
     config = dict(trainer_config)
     config.update(
         {
@@ -669,6 +713,7 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
             "code_mode": code_mode_config,
         }
     )
+    config["morphology"] = morphology_config
     _log_resolved_config("train-bpe", config)
     if getattr(args, "dry_run", False):
         print("[dry-run] train-bpe initialization complete")
@@ -689,12 +734,13 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
             eos=args.eos,
             languages=code_langs if code_langs else None,
             meta_enabled=bool(getattr(args, "meta_compress", False)),
+            morphology=morphology_plugin,
         )
         batches = PackedBatcher(sequences, batch_size=batch_size, seed=args.seed)
         streamer = None
         dataset_tracker = None
     else:
-        packer = BytePacker(bos=args.bos, eos=args.eos)
+        packer = BytePacker(bos=args.bos, eos=args.eos, morphology=morphology_plugin)
 
         def _build_serialized_batches(
             serialized: dict[str, object],
@@ -1024,6 +1070,7 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
     }
     if code_langs:
         code_mode_config["languages"] = sorted(code_langs)
+    morphology_plugin, morphology_config = _resolve_morphology(args)
     config = dict(trainer_config)
     config.update(
         {
@@ -1038,6 +1085,7 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
             "code_mode": code_mode_config,
         }
     )
+    config["morphology"] = morphology_config
     _log_resolved_config("train-unigram", config)
     if getattr(args, "dry_run", False):
         print("[dry-run] train-unigram initialization complete")
@@ -1051,9 +1099,15 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
             eos=args.eos,
             languages=code_langs if code_langs else None,
             meta_enabled=bool(getattr(args, "meta_compress", False)),
+            morphology=morphology_plugin,
         )
     else:
-        sequences = _load_sequences(data_files, bos=args.bos, eos=args.eos)
+        sequences = _load_sequences(
+            data_files,
+            bos=args.bos,
+            eos=args.eos,
+            morphology=morphology_plugin,
+        )
 
     batches = _build_unigram_batches(sequences, batch_size=args.batch_size, seed=args.seed)
     for epoch in range(args.epochs):
@@ -1087,6 +1141,8 @@ def _cmd_train_hybrid(args: argparse.Namespace) -> None:
     if code_langs:
         code_mode_config["languages"] = sorted(code_langs)
 
+    morphology_plugin, morphology_config = _resolve_morphology(args)
+
     config = {
         "trainer": {
             "base_vocab": args.base_vocab,
@@ -1119,6 +1175,7 @@ def _cmd_train_hybrid(args: argparse.Namespace) -> None:
         "dry_run": bool(getattr(args, "dry_run", False)),
         "code_mode": code_mode_config,
     }
+    config["morphology"] = morphology_config
 
     _log_resolved_config("train-hybrid", config)
     if getattr(args, "dry_run", False):
@@ -1133,9 +1190,15 @@ def _cmd_train_hybrid(args: argparse.Namespace) -> None:
             eos=args.eos,
             languages=code_langs if code_langs else None,
             meta_enabled=bool(getattr(args, "meta_compress", False)),
+            morphology=morphology_plugin,
         )
     else:
-        sequences = _load_sequences(data_files, bos=args.bos, eos=args.eos)
+        sequences = _load_sequences(
+            data_files,
+            bos=args.bos,
+            eos=args.eos,
+            morphology=morphology_plugin,
+        )
     batches = list(
         _iter_packed_batches(sequences, batch_size=args.batch_size, seed=args.seed)
     )
@@ -1199,10 +1262,12 @@ def _cmd_stream_batches(args: argparse.Namespace) -> None:
     if not data_patterns:
         raise SystemExit("stream-batches requires at least one --data glob pattern")
     data_files = _expand_data_patterns(data_patterns)
+    morphology_plugin, _ = _resolve_morphology(args)
     sequences = _load_sequences(
         data_files,
         bos=getattr(args, "bos", None),
         eos=getattr(args, "eos", None),
+        morphology=morphology_plugin,
     )
     batch_size = getattr(args, "batch_size", 1024)
     seed = getattr(args, "seed", 1337)
@@ -1303,6 +1368,25 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Random jitter applied when throttling prefetch depth (0 disables)",
+    )
+    morph_choices = available_morphology_plugins()
+    morph_kwargs: dict[str, object] = {
+        "type": str,
+        "default": None,
+        "help": "Enable morphology preprocessing for the specified language",
+    }
+    if morph_choices:
+        morph_kwargs["choices"] = list(morph_choices)
+    common.add_argument("--morphology-lang", **morph_kwargs)
+    common.add_argument(
+        "--morphology-case-markers",
+        action="store_true",
+        help="Segment case markers when supported by the selected morphology plugin",
+    )
+    common.add_argument(
+        "--morphology-affix-tags",
+        action="store_true",
+        help="Annotate productive affixes when supported by the selected morphology plugin",
     )
 
     train_bpe = subparsers.add_parser("train-bpe", parents=[common], help="Train a BPE model")

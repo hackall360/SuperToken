@@ -9,7 +9,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import TYPE_CHECKING, Iterable, Iterator, Sequence
 
 import torch
 
@@ -22,6 +22,8 @@ from gpu_tokenizer import (
 )
 from gpu_tokenizer.io import MemoryMappedShard
 
+if TYPE_CHECKING:  # pragma: no cover - typing helper
+    from gpu_tokenizer.morphology import MorphologyPlugin
 
 @dataclass
 class CorpusSummary:
@@ -198,6 +200,7 @@ def load_real_corpus(
     bos: int | None,
     eos: int | None,
     limit: int | None,
+    morphology: "MorphologyPlugin" | None = None,
 ) -> list[list[int]]:
     """Load token sequences from byte-packed shards on disk.
 
@@ -246,7 +249,7 @@ def load_real_corpus(
     """
     if not paths:
         return []
-    packer = BytePacker(bos=bos, eos=eos)
+    packer = BytePacker(bos=bos, eos=eos, morphology=morphology)
     sequences: list[list[int]] = []
     # ExitStack ensures shards are closed in LIFO order even if iteration
     # exits early, so we acquire it before touching any filesystem resources.
