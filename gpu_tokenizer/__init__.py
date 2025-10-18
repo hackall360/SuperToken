@@ -2,12 +2,30 @@
 
 from __future__ import annotations
 
-from .autoscaler import AutoScaler
-from .cpu_packer import BytePacker
-from .datasets import PackedBatcher, StreamingPackedBatcher
-from .io import CorpusStreamer, MemoryMappedShard
-from .trainers import BaseTrainer
-from . import dist_runtime, lease_queue, ngram_stats, utils
+try:
+    from .autoscaler import AutoScaler
+except Exception:  # pragma: no cover - optional torch dependency
+    AutoScaler = None  # type: ignore
+try:
+    from .cpu_packer import BytePacker
+except Exception:  # pragma: no cover - optional dependency
+    BytePacker = None  # type: ignore
+try:
+    from .datasets import PackedBatcher, StreamingPackedBatcher
+except Exception:  # pragma: no cover - optional dependency
+    PackedBatcher = StreamingPackedBatcher = None  # type: ignore
+try:
+    from .io import CorpusStreamer, MemoryMappedShard
+except Exception:  # pragma: no cover - optional dependency
+    CorpusStreamer = MemoryMappedShard = None  # type: ignore
+try:
+    from .trainers import BaseTrainer
+except Exception:  # pragma: no cover - optional dependency
+    BaseTrainer = None  # type: ignore
+try:
+    from . import dist_runtime, lease_queue, ngram_stats, utils
+except Exception:  # pragma: no cover - optional dependency
+    dist_runtime = lease_queue = ngram_stats = utils = None  # type: ignore
 
 try:  # pragma: no cover - optional torch dependency
     from .bpe_trainer import GPUBPETrainer  # type: ignore
