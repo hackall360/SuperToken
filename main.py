@@ -24,6 +24,7 @@ from gpu_tokenizer import (
     StreamingPackedBatcher,
     utils,
 )
+from gpu_tokenizer.export import artifacts as export_artifacts
 from gpu_tokenizer.code_mode import prepare_corpus
 from gpu_tokenizer.io import CorpusStreamer, MemoryMappedShard
 from gpu_tokenizer.morphology import (
@@ -653,6 +654,55 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
         bpe_runs=bpe_suite,
     )
     print(f"Saved benchmark metadata → {output_path}")
+
+
+def _cmd_export_embeddings(args: argparse.Namespace) -> None:
+    """Export embedding artifacts derived from a tokenizer vocabulary."""
+
+    vocab = export_artifacts.load_vocab(args.vocab)
+    stats = export_artifacts.load_token_stats(args.stats) if args.stats else {}
+    prune = export_artifacts.prune_vocabulary(
+        vocab,
+        stats,
+        min_frequency=args.min_frequency,
+        keep_tokens=args.keep_token,
+    )
+    dtype = export_artifacts.resolve_dtype(args.dtype)
+    filtered_stats = {token: stats[token] for token in prune.vocab if token in stats}
+    embeddings = export_artifacts.generate_embedding_matrix(
+        prune.vocab,
+        filtered_stats,
+        dimension=args.dimension,
+        seed=args.seed,
+        dtype=dtype,
+    )
+    manifest = export_artifacts.build_manifest(
+        dimension=args.dimension,
+        dtype=dtype,
+        seed=args.seed,
+        prune=prune,
+        min_frequency=args.min_frequency,
+        preserved_tokens=args.keep_token or [],
+    )
+    paths = export_artifacts.write_export_package(
+        args.output_dir,
+        embeddings=embeddings,
+        vocab=prune.vocab,
+        manifest=manifest,
+        pruned=prune.pruned,
+    )
+    summary = {
+        "dimension": manifest.dimension,
+        "dtype": manifest.dtype,
+        "exported_tokens": manifest.exported_token_count,
+        "pruned_tokens": len(prune.pruned),
+        "output_dir": str(args.output_dir),
+    }
+    print(f"[export][export-embeddings] {json.dumps(summary, sort_keys=True)}")
+    print(
+        "Exported embeddings → "
+        f"{paths['embeddings']} ({manifest.exported_token_count} tokens)"
+    )
 
 
 def _cmd_train_bpe(args: argparse.Namespace) -> None:
@@ -1527,6 +1577,63 @@ def _parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Optional JSON config describing heterogeneous BPE benchmark runs",
+    )
+
+    export_embeddings = subparsers.add_parser(
+        "export-embeddings",
+        help="Export embedding matrices, manifests, and pruning metadata",
+    )
+    export_embeddings.set_defaults(func=_cmd_export_embeddings)
+    export_embeddings.add_argument(
+        "--vocab",
+        type=str,
+        required=True,
+        help="Path to a vocab JSON mapping tokens to ids",
+    )
+    export_embeddings.add_argument(
+        "--output-dir",
+        type=str,
+        required=True,
+        help="Directory where embedding export artifacts are written",
+    )
+    export_embeddings.add_argument(
+        "--dimension",
+        type=int,
+        default=256,
+        help="Embedding dimensionality for randomly initialised tokens",
+    )
+    export_embeddings.add_argument(
+        "--dtype",
+        type=str,
+        default="float32",
+        help="Floating-point dtype label (e.g. float32, float16) recorded in the manifest",
+    )
+    export_embeddings.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Seed controlling deterministic embedding initialisation",
+    )
+    export_embeddings.add_argument(
+        "--stats",
+        type=str,
+        default=None,
+        help="Optional JSON file providing co-training statistics for tokens",
+    )
+    export_embeddings.add_argument(
+        "--min-frequency",
+        type=float,
+        default=0.0,
+        help="Minimum observed frequency required to retain a token",
+    )
+    export_embeddings.add_argument(
+        "--keep-token",
+        action="append",
+        default=[],
+        help=(
+            "Token string to always preserve during pruning; repeat the flag to"
+            " keep multiple tokens"
+        ),
     )
     benchmark.add_argument(
         "--unigram-base-vocab",
