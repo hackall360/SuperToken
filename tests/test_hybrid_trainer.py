@@ -9,7 +9,8 @@ torch = pytest.importorskip("torch")
 
 from gpu_tokenizer import GPUBPETrainer, HybridTrainer
 from gpu_tokenizer.dtypes import length_storage_dtype
-from gpu_tokenizer.utils import apply_merge_once
+from gpu_tokenizer.trainers.hybrid import _build_piece_tables
+from gpu_tokenizer.utils import apply_merge_once, hash_merge_pair
 
 
 def _encode_corpus_to_batches(
@@ -120,4 +121,32 @@ def test_hybrid_trainer_improves_compression(tmp_path: Path) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["merges"] == [list(map(int, pair)) for pair in hybrid_merges]
     assert len(manifest["unigram_logp"]) == len(logp)
+
+
+def test_hybrid_privacy_manifest_redacts_merges(tmp_path: Path) -> None:
+    trainer = HybridTrainer(
+        base_vocab=64,
+        merges=1,
+        cycles=1,
+        unigram_epochs=1,
+        privacy_mode=True,
+        randomize_ties=False,
+        tie_seed=11,
+        privacy_salt="pepper",
+    )
+    trainer._final_merges = [(1, 2)]
+    id2piece, _, _ = _build_piece_tables(trainer.base_vocab, trainer._final_merges)
+    trainer._final_id2piece = id2piece
+    trainer._final_logp = torch.zeros(len(id2piece), dtype=torch.float32)
+    trainer._completed_cycles = 1
+
+    artifacts = trainer.save_artifacts(tmp_path)
+    manifest_path = Path(artifacts["manifest"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    expected_hash = hash_merge_pair((1, 2), "pepper")
+
+    assert manifest["privacy_mode"] is True
+    assert manifest["merge_count"] == len(trainer._final_merges)
+    assert manifest["merges"][0] == expected_hash
+    assert all(isinstance(entry, str) for entry in manifest["merges"])
 

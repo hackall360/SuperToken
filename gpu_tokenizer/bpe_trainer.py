@@ -8,6 +8,7 @@ import json
 import os
 import time
 import math
+import random
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import (
@@ -53,6 +54,7 @@ from .utils import (
     apply_merge_once,
     compact_histogram,
     count_pairs,
+    hash_merge_pair,
     peer_copy_tensor,
 )
 from .dist.launcher import get_histogram_reducer
@@ -684,6 +686,10 @@ class GPUBPETrainer(BaseTrainer):
         sync_every: int = 1,
         warm_start_merges: Optional[Sequence[tuple[int, int]]] = None,
         freeze_warm_start: bool = False,
+        privacy_mode: bool = False,
+        randomize_ties: bool | None = None,
+        tie_seed: int | None = None,
+        privacy_salt: bytes | bytearray | str | None = None,
     ) -> None:
         super().__init__()
         self.base_vocab = base_vocab
@@ -710,6 +716,17 @@ class GPUBPETrainer(BaseTrainer):
             list(warm_start_merges) if warm_start_merges is not None else []
         )
         self.freeze_warm_start = freeze_warm_start
+        self.privacy_mode = bool(privacy_mode)
+        if randomize_ties is None:
+            self.randomize_ties = self.privacy_mode
+        else:
+            self.randomize_ties = bool(randomize_ties)
+        self.tie_seed: int | None = int(tie_seed) if tie_seed is not None else None
+        self._tie_seed_value: int = int(self.tie_seed if self.tie_seed is not None else 0)
+        self._privacy_salt_input = privacy_salt
+        self._privacy_hash_salt = self._coerce_privacy_salt(privacy_salt)
+        self._tie_rng: random.Random | None = None
+        self._tie_rng_state: object | None = None
         self._warm_start_plan: Optional[dict[str, object]] = (
             {
                 "merges": list(self._seed_warm_start_merges),
@@ -789,6 +806,7 @@ class GPUBPETrainer(BaseTrainer):
         self._overlap_enabled: bool = True
         self._last_chunk_id: int | None = None
         self._autoscaler_window_log: list[dict[str, object]] = []
+        self._reset_tie_rng()
 
     def handle_chunk_start(
         self,
@@ -814,6 +832,56 @@ class GPUBPETrainer(BaseTrainer):
 
     # ------------------------------------------------------------------
     # Transfer accounting helpers
+    @staticmethod
+    def _coerce_privacy_salt(
+        salt: bytes | bytearray | str | None,
+    ) -> bytes:
+        if salt is None:
+            return b""
+        if isinstance(salt, (bytes, bytearray)):
+            return bytes(salt)
+        return str(salt).encode("utf-8")
+
+    @staticmethod
+    def _encode_random_state(state: object) -> object:
+        if isinstance(state, tuple):
+            return [GPUBPETrainer._encode_random_state(item) for item in state]
+        if isinstance(state, list):
+            return [GPUBPETrainer._encode_random_state(item) for item in state]
+        return state
+
+    @staticmethod
+    def _decode_random_state(state: object) -> object:
+        if isinstance(state, list):
+            return tuple(GPUBPETrainer._decode_random_state(item) for item in state)
+        if isinstance(state, tuple):
+            return tuple(GPUBPETrainer._decode_random_state(item) for item in state)
+        return state
+
+    def _reset_tie_rng(self) -> None:
+        if not self.randomize_ties:
+            self._tie_rng = None
+            self._tie_rng_state = None
+            return
+        self._tie_rng = random.Random(self._tie_seed_value)
+        self._tie_rng_state = self._tie_rng.getstate()
+
+    def _tie_breaker(self, candidates: Sequence[int], keys: torch.Tensor) -> int:
+        if not candidates:
+            raise ValueError("candidate list must not be empty")
+        if not self.randomize_ties or self._tie_rng is None:
+            return min(candidates, key=lambda idx: int(keys[int(idx)].item()))
+        choice = self._tie_rng.randrange(len(candidates))
+        selected = int(candidates[choice])
+        self._tie_rng_state = self._tie_rng.getstate()
+        return selected
+
+    def _merges_for_metadata(self) -> list[object]:
+        if not self.privacy_mode:
+            return [list(map(int, pair)) for pair in self.merges]
+        salt = self._privacy_hash_salt
+        return [hash_merge_pair((int(left), int(right)), salt) for left, right in self.merges]
+
     def metrics(self) -> Mapping[str, TrainerMetricsEWMA]:
         """Expose the registered metrics trackers for external consumers."""
 
@@ -1347,7 +1415,13 @@ class GPUBPETrainer(BaseTrainer):
             "vocab_size": int(self.vocab_size),
             "merges": [list(map(int, pair)) for pair in self.merges],
             "merge_step": int(self._merge_step),
+            "privacy_mode": bool(self.privacy_mode),
+            "randomize_ties": bool(self.randomize_ties),
+            "tie_seed": int(self.tie_seed) if self.tie_seed is not None else None,
+            "tie_seed_effective": int(self._tie_seed_value),
         }
+        if self._privacy_hash_salt:
+            model_section["privacy_salt"] = self._privacy_hash_salt.hex()
         warm_start_section = {
             "plan": (
                 {k: v for k, v in self._warm_start_plan.items()}
@@ -1437,12 +1511,21 @@ class GPUBPETrainer(BaseTrainer):
             "logs": logs_section,
         }
 
+        rng_section: dict[str, object] = {}
+        if self.randomize_ties and self._tie_rng is not None:
+            if self._tie_rng_state is None:
+                self._tie_rng_state = self._tie_rng.getstate()
+            rng_section["tie_breaker"] = {
+                "seed": int(self._tie_seed_value),
+                "state": self._encode_random_state(self._tie_rng_state),
+            }
+
         payload = CheckpointPayload(
             version=CheckpointPayload.CURRENT_VERSION,
             trainer=trainer_section,
             autoscaler=autoscaler_section,
             dataset=dataset_section,
-            rng={},
+            rng=rng_section,
         )
 
         tensors: dict[str, torch.Tensor] = {
@@ -1493,6 +1576,61 @@ class GPUBPETrainer(BaseTrainer):
         self.merges = [tuple(map(int, pair)) for pair in merges_raw]
         self.vocab_size = int(model_section.get("vocab_size", self.vocab_size))
         self._merge_step = int(model_section.get("merge_step", len(self.merges)))
+        privacy_flag = model_section.get("privacy_mode")
+        if privacy_flag is not None:
+            self.privacy_mode = bool(privacy_flag)
+        randomize_flag = model_section.get("randomize_ties")
+        if randomize_flag is not None:
+            self.randomize_ties = bool(randomize_flag)
+        elif privacy_flag is not None:
+            self.randomize_ties = self.privacy_mode
+        tie_seed_raw = model_section.get("tie_seed")
+        if tie_seed_raw is None:
+            self.tie_seed = None
+        else:
+            try:
+                self.tie_seed = int(tie_seed_raw)
+            except (TypeError, ValueError):
+                self.tie_seed = None
+        effective_seed = model_section.get("tie_seed_effective")
+        if effective_seed is not None:
+            try:
+                self._tie_seed_value = int(effective_seed)
+            except (TypeError, ValueError):
+                self._tie_seed_value = int(self.tie_seed) if self.tie_seed is not None else 0
+        elif self.tie_seed is not None:
+            self._tie_seed_value = int(self.tie_seed)
+        else:
+            self._tie_seed_value = 0
+        salt_hex = model_section.get("privacy_salt")
+        if salt_hex is not None:
+            try:
+                self._privacy_hash_salt = bytes.fromhex(str(salt_hex))
+            except (TypeError, ValueError):
+                self._privacy_hash_salt = self._coerce_privacy_salt(salt_hex)
+            self._privacy_salt_input = self._privacy_hash_salt
+        elif not self._privacy_hash_salt:
+            self._privacy_hash_salt = self._coerce_privacy_salt(self._privacy_salt_input)
+        rng_meta = payload.rng if isinstance(payload.rng, Mapping) else {}
+        tie_rng_meta = rng_meta.get("tie_breaker") if isinstance(rng_meta, Mapping) else None
+        rng_state: object | None = None
+        if isinstance(tie_rng_meta, Mapping):
+            seed_override = tie_rng_meta.get("seed")
+            try:
+                if seed_override is not None:
+                    self._tie_seed_value = int(seed_override)
+            except (TypeError, ValueError):
+                pass
+            state_payload = tie_rng_meta.get("state")
+            if state_payload is not None:
+                rng_state = self._decode_random_state(state_payload)
+        self._reset_tie_rng()
+        if rng_state is not None and self._tie_rng is not None:
+            try:
+                self._tie_rng.setstate(rng_state)
+                self._tie_rng_state = rng_state
+            except Exception:  # pragma: no cover - defensive
+                self._tie_rng_state = self._tie_rng.getstate()
 
         warm_section = trainer_meta.get("warm_start")
         if not isinstance(warm_section, Mapping):
@@ -3970,7 +4108,10 @@ class GPUBPETrainer(BaseTrainer):
                             stage_kind,
                         )
                 histogram = PairHistogramResult(agg_keys, agg_counts)
-                selected_key, selected_count, _ = select_best_pair(histogram)
+                tie_breaker = self._tie_breaker if self.randomize_ties else None
+                selected_key, selected_count, _ = select_best_pair(
+                    histogram, tie_breaker=tie_breaker
+                )
                 best_key_value = selected_key
                 best_count = selected_count
             if best_key_value is None:
@@ -4337,8 +4478,13 @@ class GPUBPETrainer(BaseTrainer):
         meta = {
             "base_vocab": self.base_vocab,
             "vocab_size": self.vocab_size,
-            "merges": self.merges,
+            "merges": self._merges_for_metadata(),
         }
+        if self.privacy_mode:
+            meta["privacy_mode"] = True
+            meta["merge_count"] = len(self.merges)
+            meta["randomize_ties"] = bool(self.randomize_ties)
+            meta["tie_seed"] = int(self._tie_seed_value)
         with open(meta_path, "w", encoding="utf-8") as handle:
             json.dump(meta, handle)
 

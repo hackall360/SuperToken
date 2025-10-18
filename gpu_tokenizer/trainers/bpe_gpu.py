@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional, Sequence
+from typing import Callable, Iterable, Optional, Sequence
 
 import torch
 
@@ -95,6 +95,8 @@ def combine_histogram_results(
 
 def select_best_pair(
     histogram: PairHistogramResult,
+    *,
+    tie_breaker: Callable[[Sequence[int], torch.Tensor], int] | None = None,
 ) -> tuple[Optional[int], int, Optional[int]]:
     """Return the best packed pair key, its count, and the tensor index."""
 
@@ -111,8 +113,18 @@ def select_best_pair(
     if candidate_indices.numel() == 1:
         best_idx = candidate_indices[0]
     else:
-        keys = histogram.keys
-        best_idx = candidate_indices[torch.argmin(keys[candidate_indices])]
+        if tie_breaker is not None:
+            candidates = [int(idx.item()) for idx in candidate_indices]
+            try:
+                chosen = int(tie_breaker(candidates, histogram.keys))
+            except Exception as exc:  # pragma: no cover - defensive guard
+                raise RuntimeError("tie_breaker callable failed to select an index") from exc
+            if chosen not in candidates:
+                raise ValueError("tie_breaker must return one of the candidate indices")
+            best_idx = candidate_indices.new_tensor(chosen)
+        else:
+            keys = histogram.keys
+            best_idx = candidate_indices[torch.argmin(keys[candidate_indices])]
 
     best_key = histogram.keys[best_idx]
     return int(best_key.item()), best_count, int(best_idx.item())
