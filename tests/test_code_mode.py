@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import logging
 import sys
 import types
 from pathlib import Path
@@ -35,6 +36,8 @@ def _load_module(name: str):
 linearizer = _load_module("linearizer")
 py_frontend = _load_module("py_frontend")
 ts_frontend = _load_module("ts_frontend")
+meta_compress = _load_module("meta_compress")
+pipeline = _load_module("pipeline")
 
 linearize_python_source = py_frontend.linearize_python_source
 linearize_typescript_source = ts_frontend.linearize_typescript_source
@@ -97,3 +100,71 @@ export function greet(name) {
     mapping = result.symbols
     for placeholder in placeholders:
         assert mapping[placeholder]
+
+
+def test_meta_token_compressor_discovers_patterns():
+    compressor = meta_compress.MetaTokenCompressor(max_pattern_length=3, min_frequency=2)
+    sequences = [
+        ["A", "B", "C", "A", "B", "C"],
+        ["X", "A", "B", "C", "Y"],
+    ]
+    result = compressor.compress(sequences)
+
+    assert result.dictionary, "expected meta tokens to be discovered"
+    assert result.dictionary["META0"] == ["A", "B", "C"]
+    assert any("META0" in seq for seq in result.sequences)
+
+
+def test_prepare_corpus_meta_and_fallback(caplog):
+    entries = [
+        {
+            "language": "python",
+            "source": "\n" "def alpha(x):\n" "    return x * 2\n" "\n" "def beta(x):\n" "    return x * 2\n",
+            "filename": "alpha.py",
+        },
+        {
+            "language": "python",
+            "source": "def broken(: pass",
+            "filename": "broken.py",
+        },
+        {
+            "language": "typescript",
+            "source": "export function hi(name) { return name.toUpperCase(); }",
+            "filename": "hi.ts",
+        },
+    ]
+
+    caplog.set_level(logging.WARNING)
+    corpus = pipeline.prepare_corpus(entries, meta_enabled=True, meta_max_length=4)
+
+    assert len(corpus.samples) == len(entries)
+    fallbacks = corpus.byte_fallbacks()
+    assert fallbacks, "expected at least one byte-level fallback"
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
+    for sample in fallbacks:
+        assert sample.metadata["fallback"] is True
+        assert all(isinstance(byte, int) for byte in sample.tokens)
+
+    ast_samples = corpus.ast_samples()
+    if corpus.meta_tokens:
+        meta_keys = set(corpus.meta_tokens)
+        assert meta_keys
+        assert any(any(token in meta_keys for token in sample.tokens) for sample in ast_samples)
+        assert all(1 < len(pattern) <= 4 for pattern in corpus.meta_tokens.values())
+
+
+def test_prepare_corpus_disable_meta():
+    entries = [
+        {
+            "language": "python",
+            "source": "def gamma(y):\n    return y + 1\n",
+            "filename": "gamma.py",
+        }
+    ]
+    corpus = pipeline.prepare_corpus(entries, meta_enabled=False, meta_max_length=3)
+
+    assert corpus.meta_tokens == {}
+    ast_samples = corpus.ast_samples()
+    assert ast_samples, "expected AST samples to be present"
+    for sample in ast_samples:
+        assert all(not token.startswith("META") for token in sample.tokens)
