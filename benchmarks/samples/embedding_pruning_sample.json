@@ -1,0 +1,220 @@
+{
+  "timestamp": "20251018T120718Z",
+  "config": {
+    "vocab_size": 64,
+    "embedding_dim": 16,
+    "class_count": 4,
+    "train_samples": 4096,
+    "eval_samples": 1024,
+    "epochs": 8,
+    "batch_size": 128,
+    "learning_rate": 0.25,
+    "prune_frequency_threshold": 0.01,
+    "seed": 2025
+  },
+  "dataset": {
+    "train_samples": 4096,
+    "eval_samples": 1024,
+    "vocab_size": 64,
+    "class_count": 4
+  },
+  "baseline": {
+    "wall_time_s": 0.6803110050004761,
+    "throughput_samples_per_s": 6020.775747993572,
+    "final_loss": 0.07950597909207706,
+    "final_accuracy": 1.0,
+    "evaluation": {
+      "loss": 0.0815044743702614,
+      "accuracy": 1.0
+    },
+    "telemetry": {
+      "epochs": [
+        {
+          "epoch": 1,
+          "loss": 1.3573355216251675,
+          "accuracy": 0.367919921875
+        },
+        {
+          "epoch": 2,
+          "loss": 1.2411710305400803,
+          "accuracy": 0.659912109375
+        },
+        {
+          "epoch": 3,
+          "loss": 1.0210464154936423,
+          "accuracy": 0.906494140625
+        },
+        {
+          "epoch": 4,
+          "loss": 0.6858529952173157,
+          "accuracy": 0.976806640625
+        },
+        {
+          "epoch": 5,
+          "loss": 0.38825141466845087,
+          "accuracy": 0.984619140625
+        },
+        {
+          "epoch": 6,
+          "loss": 0.22088370605731475,
+          "accuracy": 0.99462890625
+        },
+        {
+          "epoch": 7,
+          "loss": 0.1382860186526427,
+          "accuracy": 0.999267578125
+        },
+        {
+          "epoch": 8,
+          "loss": 0.09476670932745922,
+          "accuracy": 1.0
+        }
+      ]
+    }
+  },
+  "pruned": {
+    "wall_time_s": 0.6111254160005046,
+    "throughput_samples_per_s": 6087.130239723049,
+    "final_loss": 0.0619567639644677,
+    "final_accuracy": 1.0,
+    "evaluation": {
+      "loss": 0.0606569942722303,
+      "accuracy": 1.0
+    },
+    "telemetry": {
+      "epochs": [
+        {
+          "epoch": 1,
+          "loss": 1.3392213783218483,
+          "accuracy": 0.4327956989247312
+        },
+        {
+          "epoch": 2,
+          "loss": 1.219459497339849,
+          "accuracy": 0.738978494623656
+        },
+        {
+          "epoch": 3,
+          "loss": 0.9805863313205699,
+          "accuracy": 0.875268817204301
+        },
+        {
+          "epoch": 4,
+          "loss": 0.6323900346612515,
+          "accuracy": 0.9771505376344086
+        },
+        {
+          "epoch": 5,
+          "loss": 0.3422624719629486,
+          "accuracy": 1.0
+        },
+        {
+          "epoch": 6,
+          "loss": 0.18612764836028767,
+          "accuracy": 1.0
+        },
+        {
+          "epoch": 7,
+          "loss": 0.11216805987815069,
+          "accuracy": 1.0
+        },
+        {
+          "epoch": 8,
+          "loss": 0.07506128000929302,
+          "accuracy": 1.0
+        }
+      ]
+    },
+    "dataset": {
+      "train_samples": 3720,
+      "eval_samples": 918,
+      "vocab_size": 48
+    }
+  },
+  "pruning": {
+    "threshold": 0.01,
+    "kept_tokens": 48,
+    "pruned_tokens": [
+      {
+        "token": 3,
+        "count": 37.0,
+        "frequency": 0.009033203125
+      },
+      {
+        "token": 4,
+        "count": 6.0,
+        "frequency": 0.00146484375
+      },
+      {
+        "token": 7,
+        "count": 16.0,
+        "frequency": 0.00390625
+      },
+      {
+        "token": 9,
+        "count": 15.0,
+        "frequency": 0.003662109375
+      },
+      {
+        "token": 12,
+        "count": 12.0,
+        "frequency": 0.0029296875
+      },
+      {
+        "token": 13,
+        "count": 15.0,
+        "frequency": 0.003662109375
+      },
+      {
+        "token": 14,
+        "count": 20.0,
+        "frequency": 0.0048828125
+      },
+      {
+        "token": 17,
+        "count": 23.0,
+        "frequency": 0.005615234375
+      },
+      {
+        "token": 18,
+        "count": 28.0,
+        "frequency": 0.0068359375
+      },
+      {
+        "token": 24,
+        "count": 37.0,
+        "frequency": 0.009033203125
+      },
+      {
+        "token": 28,
+        "count": 35.0,
+        "frequency": 0.008544921875
+      },
+      {
+        "token": 30,
+        "count": 6.0,
+        "frequency": 0.00146484375
+      },
+      {
+        "token": 52,
+        "count": 29.0,
+        "frequency": 0.007080078125
+      },
+      {
+        "token": 55,
+        "count": 25.0,
+        "frequency": 0.006103515625
+      },
+      {
+        "token": 61,
+        "count": 37.0,
+        "frequency": 0.009033203125
+      },
+      {
+        "token": 62,
+        "count": 35.0,
+        "frequency": 0.008544921875
+      }
+    ]
+  }
+}
