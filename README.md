@@ -58,8 +58,13 @@ python main.py train-bpe \
   --merges 50000 \
   --token-bytes 8192 \
   --target-util 0.85 \
+  --morphology-lang tr \
+  --morphology-case-markers \
   --out-dir ./artifacts/bpe
 ```
+
+Enable morphology plugins only when you need them—leaving `--morphology-lang` unset keeps byte statistics identical to the raw
+corpus. The example above activates the Turkish segmenter and optional case markers to demonstrate the new flags.
 
 Need resilience against interruptions? The BPE trainer now supports periodic checkpointing and seamless resume:
 
@@ -101,10 +106,26 @@ python main.py train-hybrid \
   --merges 50000 \
   --cycles 2 \
   --unigram-epochs 2 \
+  --privacy tie-randomize \
   --out-dir ./artifacts/hybrid
 ```
 
 The hybrid workflow exports Hugging Face-ready BPE files alongside SentencePiece probabilities and a manifest describing each cycle.
+
+Switch to the AST-aware pipeline when training on source repositories. Code-mode can be paired with morphology and privacy guards just like the text pipelines:
+
+```bash
+python main.py train-bpe \
+  --data repo.jsonl \
+  --merges 32000 \
+  --code-mode \
+  --code-langs python typescript \
+  --meta-compress \
+  --privacy hash-merges \
+  --out-dir ./artifacts/code-bpe
+```
+
+The CLI prints a `code_mode` summary block so you can audit AST coverage and meta-token compression gains. Enable `--privacy` to redact merge histories (`hash-merges`) or randomise tie-breaks (`tie-randomize`) before exporting.
 
 ## Privacy Modes
 SuperToken provides an opt-in privacy guard for the merge history produced by the GPU trainers. The `--privacy` flag, available on the `train-bpe` and `train-hybrid` subcommands, accepts three modes:

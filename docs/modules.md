@@ -4,15 +4,15 @@ This guide provides deeper context for the core modules that power SuperToken's 
 
 ## Trainers
 
-The training frontends live in [`gpu_tokenizer/bpe_trainer.py`](../gpu_tokenizer/bpe_trainer.py) and [`gpu_tokenizer/unigram_trainer.py`](../gpu_tokenizer/unigram_trainer.py). They orchestrate dataset streaming, invoke CUDA/Triton kernels, and persist vocabularies and merge tables. When extending the trainers:
+The training frontends live in [`gpu_tokenizer/bpe_trainer.py`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/bpe_trainer.py) and [`gpu_tokenizer/unigram_trainer.py`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/unigram_trainer.py). They orchestrate dataset streaming, invoke CUDA/Triton kernels, and persist vocabularies and merge tables. When extending the trainers:
 
 - Look at the `TrainerConfig` dataclasses for knobs around checkpointing, merge export, and normalization behaviors.
-- Reuse the packing helpers from [`gpu_tokenizer/cpu_packer.py`](../gpu_tokenizer/cpu_packer.py) to prepare byte tensors efficiently.
+- Reuse the packing helpers from [`gpu_tokenizer/cpu_packer.py`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/cpu_packer.py) to prepare byte tensors efficiently.
 - Integrate new kernels by following the call sites in the `step` and `finalize` methods.
 
 ## Autoscaler
 
-[`gpu_tokenizer/autoscaler.py`](../gpu_tokenizer/autoscaler.py) houses the adaptive batching logic that keeps GPUs saturated. The `AutoScaler` class exposes:
+[`gpu_tokenizer/autoscaler.py`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/autoscaler.py) houses the adaptive batching logic that keeps GPUs saturated. The `AutoScaler` class exposes:
 
 - `observe_throughput` hooks you can call with step timing information.
 - `suggest_batch_size` to derive the next batch size based on utilization targets and guardrails.
@@ -22,7 +22,7 @@ If you need to plug in custom heuristics, subclass `AutoScaler` and override `_c
 
 ## Streaming I/O
 
-The streaming pipeline is split across [`gpu_tokenizer/datasets.py`](../gpu_tokenizer/datasets.py) and [`gpu_tokenizer/io.py`](../gpu_tokenizer/io.py). Together they:
+The streaming pipeline is split across [`gpu_tokenizer/datasets.py`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/datasets.py) and [`gpu_tokenizer/io.py`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/io.py). Together they:
 
 - Support globbed input shards with optional compression (`none`, `zstd`, `lz4`).
 - Provide background worker pools for asynchronous prefetch and decompression.

@@ -1,0 +1,28 @@
+site_name: SuperToken Docs
+site_description: "GPU-accelerated tokenization workflows"
+repo_url: https://github.com/example/SuperToken
+site_url: https://example.com/SuperToken
+
+docs_dir: docs
+
+nav:
+  - Home: index.md
+  - Guides:
+      - CLI usage: cli.md
+      - API reference: api.md
+      - Architecture: architecture.md
+      - Performance: performance.md
+      - Modules: modules.md
+  - Cookbook:
+      - Hybrid schedule: cookbook/hybrid_workflow.md
+      - Code-aware training: cookbook/code_mode.md
+      - Morphology workflow: cookbook/morphology.md
+      - Embedding pruning: cookbook/embedding_pruning.md
+
+markdown_extensions:
+  - admonition
+  - codehilite
+  - tables
+  - toc:
+      permalink: true
+  - attr_list

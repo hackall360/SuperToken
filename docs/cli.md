@@ -1,6 +1,6 @@
 # CLI Usage Guide
 
-SuperToken ships a single `main.py` entry point that exposes tokenizer training and benchmarking workflows. This guide expands on the quick-start snippets from the [README](../README.md#quick-start) and connects them to the system design described in the [architecture overview](architecture.md).
+SuperToken ships a single `main.py` entry point that exposes tokenizer training and benchmarking workflows. This guide expands on the quick-start snippets from the [README](https://github.com/example/SuperToken/blob/main/README.md#quick-start) and connects them to the system design described in the [architecture overview](architecture.md).
 
 ## Quick Navigation
 - [Global flags](#global-flags)
@@ -60,9 +60,10 @@ Key arguments:
 - `--code-mode`: Preprocess structured code entries instead of byte streams. When enabled the trainer loads corpora eagerly and ignores autoscaler resize events.
 - `--code-langs`: Restrict code-mode runs to specific languages (for example `--code-langs python typescript`).
 - `--meta-compress`: Discover and apply meta-token compression on AST sequences.
+- `--morphology-lang` / `--morphology-case-markers` / `--morphology-affix-tags`: Opt into language-aware segmentation and optional annotations.
 - `--privacy` / `--privacy-salt` / `--tie-seed`: Opt into merge redaction and tie randomization (see [Privacy options](#privacy-options)).
 
-Behind the scenes the [`GPUBPETrainer`](../gpu_tokenizer/bpe_trainer.py) collaborates with the autoscaler, dataset readers, and checkpoint writers described in the [architecture overview](architecture.md#trainer-pipeline).
+Behind the scenes the [`GPUBPETrainer`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/bpe_trainer.py) collaborates with the autoscaler, dataset readers, and checkpoint writers described in the [architecture overview](architecture.md#trainer-pipeline).
 
 ### Distributed execution flags
 
@@ -111,8 +112,9 @@ Important options:
 - `--code-mode`: Enable the code-mode ingestion pipeline for JSON or source code repositories.
 - `--code-langs`: Optional allowlist applied when `--code-mode` is set.
 - `--meta-compress`: Toggle meta-token discovery while preparing code-mode corpora.
+- `--morphology-lang` / `--morphology-case-markers` / `--morphology-affix-tags`: Apply morphology segmentation before packing batches.
 
-The [`GPUUnigramTrainer`](../gpu_tokenizer/unigram_trainer.py) reuses the same streaming and autoscaling primitives; refer to the [API reference](api.md#trainers) for extension hooks.
+The [`GPUUnigramTrainer`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/unigram_trainer.py) reuses the same streaming and autoscaling primitives; refer to the [API reference](api.md#trainers) for extension hooks.
 
 ## `train-hybrid`
 Alternate between BPE warm-up phases and unigram refinement without leaving the CLI:
@@ -135,9 +137,10 @@ Key arguments:
 - `--code-mode`: Run both phases on AST-linearised corpora.
 - `--code-langs`: Filter the code-mode corpus to specific languages.
 - `--meta-compress`: Share meta-token compression dictionaries across BPE and unigram phases.
+- `--morphology-lang` / `--morphology-case-markers` / `--morphology-affix-tags`: Carry morphology preprocessing through both phases.
 - `--privacy` / `--privacy-salt` / `--tie-seed`: Apply the same privacy guard as the standalone BPE trainer to hybrid manifests.
 
-After training the command emits a `hybrid_manifest.json`, Hugging Face-compatible `merges.txt`/`tokenizer.json`, and a SentencePiece-style `unigram.prob`/`unigram.model` pair for downstream consumers. The [`HybridTrainer`](../gpu_tokenizer/trainers/hybrid.py) section of the API reference describes the orchestration hooks in more detail.
+After training the command emits a `hybrid_manifest.json`, Hugging Face-compatible `merges.txt`/`tokenizer.json`, and a SentencePiece-style `unigram.prob`/`unigram.model` pair for downstream consumers. The [`HybridTrainer`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/trainers/hybrid.py) section of the API reference describes the orchestration hooks in more detail.
 
 ## Privacy options
 
@@ -148,6 +151,29 @@ Both the `train-bpe` and `train-hybrid` subcommands accept `--privacy` with thre
 - `tie-randomize` hashes merges and randomizes tie-breaks. This sacrifices deterministic parity across devices; provide `--tie-seed` to reproduce the stochastic ordering when needed.
 
 Every manifest now emits a `privacy` block summarizing the active mode, whether merges were redacted, the effective tie seed, and whether a salt was configured. Downstream tooling should inspect this block instead of inferring privacy status from merge contents. Remember that enabling tie randomization changes merge selection order even when `--tie-seed` is supplied—use this mode only when deterministic parity is not required.
+
+## `export-embeddings`
+
+Transform a trained vocabulary into an embedding package, optionally pruning rarely used tokens:
+
+```bash
+python main.py export-embeddings \
+  --vocab artifacts/bpe/vocab.json \
+  --token-stats artifacts/bpe/stats.json \
+  --min-frequency 5 \
+  --embedding-dim 256 \
+  --out-dir artifacts/bpe/embeddings
+```
+
+Key switches:
+
+- `--vocab`: Path to a tokenizer vocabulary JSON file (the CLI accepts both BPE and unigram outputs).
+- `--token-stats`: Optional token usage statistics gathered during co-training; counts drive pruning and weight seeding.
+- `--min-frequency`: Drop tokens whose observed frequency falls below the provided threshold (set to `0` to disable pruning).
+- `--keep-token`: Repeatable flag that pins tokens regardless of frequency (for example `--keep-token <pad>`).
+- `--embedding-dim` / `--embedding-dtype` / `--embedding-seed`: Control the shape and initialization of synthesized vectors.
+
+The command writes four artifacts—`vocab.json`, `embeddings.json`, `manifest.json`, and `pruning.json`—and logs a summary describing how many tokens were pruned alongside the preserved specials. See [docs/api.md](api.md#embedding-exports) for programmatic access to the export helpers.
 
 ## `benchmark`
 Compare trainers using real and synthetic corpora in a single run:
@@ -186,7 +212,7 @@ When resuming, the CLI rebuilds trainers, reloads autoscaler state, and seeks th
 ## Extending the CLI
 To add a new command:
 
-1. Open [`main.py`](../main.py) and extend the `build_parser` function with your subcommand and options.
+1. Open [`main.py`](https://github.com/example/SuperToken/blob/main/main.py) and extend the `build_parser` function with your subcommand and options.
 2. Implement a handler that wires command-line arguments to a trainer or benchmarking routine.
 3. Reuse the shared logging, autoscaling, and dataset helpers exposed in the [API reference](api.md).
 

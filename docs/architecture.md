@@ -11,12 +11,12 @@ SuperToken couples GPU-centric tokenizer trainers with a streaming data engine a
 - [Related guides](#related-guides)
 
 ## Trainer Pipeline
-The core training loop is shared between the [BPE](../gpu_tokenizer/bpe_trainer.py) and [unigram](../gpu_tokenizer/unigram_trainer.py) implementations. Each step is designed to maximize GPU residency:
+The core training loop is shared between the [BPE](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/bpe_trainer.py) and [unigram](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/unigram_trainer.py) implementations. Each step is designed to maximize GPU residency:
 
 1. **Shard discovery** – Dataset providers enumerate files or glob patterns and create an iterator of logical shards.
 2. **Streaming ingestion** – Reader workers pull shards through the I/O adapters, decompress data when required, and feed bytes into the host staging buffers.
 3. **Packing** – The packing utilities collate sequences into contiguous device-ready tensors, applying special tokens or padding rules.
-4. **Autoscaled batching** – The [`AutoScaler`](../gpu_tokenizer/autoscaler.py) recommends the next batch size based on throughput telemetry captured in the previous iteration.
+4. **Autoscaled batching** – The [`AutoScaler`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/autoscaler.py) recommends the next batch size based on throughput telemetry captured in the previous iteration.
 5. **GPU kernels** – Trainer-specific CUDA/Triton kernels execute merge scoring or unigram probability updates.
 6. **Checkpointing and metrics** – Trainers optionally snapshot state (merge tables, unigram weights, autoscaler state) and surface progress to the CLI logger.
 
@@ -35,8 +35,8 @@ The autoscaler exposes hooks for alternative policies (e.g., PID-style controlle
 ## Dataset and Streaming Layers
 SuperToken treats data as an infinite stream:
 
-- **Datasets module** – [`gpu_tokenizer/datasets`](../gpu_tokenizer/datasets/__init__.py) exports high-level abstractions such as `IterableCorpus`, synthetic generators, and shard samplers.
-- **I/O adapters** – [`gpu_tokenizer/io`](../gpu_tokenizer/io/__init__.py) centralizes compression handling, memory mapping, and threaded prefetch.
+- **Datasets module** – [`gpu_tokenizer/datasets`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/datasets/__init__.py) exports high-level abstractions such as `IterableCorpus`, synthetic generators, and shard samplers.
+- **I/O adapters** – [`gpu_tokenizer/io`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/io/__init__.py) centralizes compression handling, memory mapping, and threaded prefetch.
 - **Prefetch workers** – Configurable worker pools overlap disk reads with GPU execution, reducing idle windows.
 - **Backpressure** – Autoscaler suggestions feed back into the dataset layer to avoid queue overflows or starvation.
 
@@ -66,4 +66,4 @@ Custom benchmarks should live under the `benchmarks/` package, reusing the datas
 - [API reference](api.md)
 - [Module guide](modules.md)
 - [Performance notes and benchmarks](performance.md)
-- [Project README](../README.md)
+- [Project README](https://github.com/example/SuperToken/blob/main/README.md)

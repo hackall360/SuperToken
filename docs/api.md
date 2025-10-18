@@ -4,6 +4,7 @@ This reference collects the most commonly extended classes and functions in Supe
 
 ## Quick Navigation
 - [Trainers](#trainers)
+- [HybridTrainer](#hybridtrainer)
 - [Autoscaler](#autoscaler)
 - [Datasets](#datasets)
 - [Morphology plugins](#morphology-plugins)
@@ -11,12 +12,13 @@ This reference collects the most commonly extended classes and functions in Supe
 - [I/O and streaming](#io-and-streaming)
 - [Checkpointing](#checkpointing)
 - [Privacy controls](#privacy-controls)
+- [Embedding exports](#embedding-exports)
 - [CLI helpers](#cli-helpers)
 - [Benchmarking utilities](#benchmarking-utilities)
 - [Related guides](#related-guides)
 
 ## Trainers
-Located in [`gpu_tokenizer/bpe_trainer.py`](../gpu_tokenizer/bpe_trainer.py) and [`gpu_tokenizer/unigram_trainer.py`](../gpu_tokenizer/unigram_trainer.py).
+Located in [`gpu_tokenizer/bpe_trainer.py`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/bpe_trainer.py) and [`gpu_tokenizer/unigram_trainer.py`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/unigram_trainer.py).
 
 ### `GPUBPETrainer`
 - **Purpose**: Learns merge operations using GPU kernels.
@@ -37,8 +39,19 @@ Located in [`gpu_tokenizer/bpe_trainer.py`](../gpu_tokenizer/bpe_trainer.py) and
 
 Both trainers rely on the dataset and autoscaler layers described below. Reusing them is the fastest way to implement new algorithms; see the [architecture overview](architecture.md#trainer-pipeline) for lifecycle context.
 
+### `HybridTrainer`
+Located in [`gpu_tokenizer/trainers/hybrid.py`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/trainers/hybrid.py).
+
+- **Purpose**: Alternates BPE warm-start phases with unigram refinement without reloading corpora.
+- **Key methods**:
+  - `__init__(dataset, autoscaler, *, merges, cycles, unigram_epochs, ...)` wires shared resources into the phased schedule.
+  - `train(progress_logger)` orchestrates the BPE→unigram hand-offs, persisting per-cycle checkpoints and manifest updates.
+  - `save(out_dir)` exports BPE merges, SentencePiece-compatible unigram artifacts, and the consolidated `hybrid_manifest.json`.
+- **Privacy & morphology**: The trainer respects `privacy` configuration when emitting manifests and forwards morphology plugins to both phases so segmentation remains consistent.
+- **Extension points**: Override `run_cycle()` to plug in additional evaluation passes or custom export hooks after each iteration.
+
 ## Autoscaler
-Defined in [`gpu_tokenizer/autoscaler.py`](../gpu_tokenizer/autoscaler.py).
+Defined in [`gpu_tokenizer/autoscaler.py`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/autoscaler.py).
 
 ### `AutoScaler`
 - **Purpose**: Adjusts batch sizes to maintain target GPU utilization.
@@ -52,7 +65,7 @@ Defined in [`gpu_tokenizer/autoscaler.py`](../gpu_tokenizer/autoscaler.py).
 The autoscaler is invoked by trainers and referenced by CLI options such as `--target-util`. Review the [CLI usage guide](cli.md#global-flags) for how users configure it.
 
 ## Datasets
-Entry points live in [`gpu_tokenizer/datasets/__init__.py`](../gpu_tokenizer/datasets/__init__.py).
+Entry points live in [`gpu_tokenizer/datasets/__init__.py`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/datasets/__init__.py).
 
 - **`IterableCorpus`**: Abstract base that yields byte sequences for packing.
 - **`FileShardDataset`**: Streams text files using glob patterns and optional compression.
@@ -63,7 +76,7 @@ Datasets are composable: you can wrap corpora with filters, sampling policies, o
 
 ## Morphology plugins
 
-Morphology preprocessing hooks live in [`gpu_tokenizer/morphology/`](../gpu_tokenizer/morphology). They are **opt-in**; the CLI
+Morphology preprocessing hooks live in [`gpu_tokenizer/morphology/`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/morphology). They are **opt-in**; the CLI
 does not activate any plugin unless `--morphology-lang` is specified. Leaving the flag unset guarantees that byte sequences fed
 into the trainers stay untouched so baseline token statistics remain reproducible.
 
@@ -73,13 +86,13 @@ into the trainers stay untouched so baseline token statistics remain reproducibl
 - **`available_plugins()` / `create_plugin(name, **config)`** – Discovery helpers used by the CLI. Plugins register themselves
   via `register_plugin(name, cls)` on import.
 
-The built-in [`TurkishMorphologyPlugin`](../gpu_tokenizer/morphology/turkish.py) demonstrates the expected segmentation API and
+The built-in [`TurkishMorphologyPlugin`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/morphology/turkish.py) demonstrates the expected segmentation API and
 honours `case_markers`/`affix_tags` toggles. When experimenting with new languages, start with `create_plugin("tr")` to inspect
 the emitted segments and ensure `plugin.recompose(plugin.presegment(sample)) == sample` before feeding data into the trainers.
 Refer to [docs/cookbook/morphology.md](cookbook/morphology.md) for an end-to-end training example with fidelity checks.
 
 ## Code mode helpers
-The code-mode pipeline lives under [`gpu_tokenizer/code_mode/`](../gpu_tokenizer/code_mode). It transforms structured source samples into canonical token sequences that downstream trainers can consume.
+The code-mode pipeline lives under [`gpu_tokenizer/code_mode/`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/code_mode). It transforms structured source samples into canonical token sequences that downstream trainers can consume.
 
 - **`prepare_corpus(entries, meta_enabled=True, meta_max_length=8)`**: Accepts dictionaries containing `language`, `source`, and optional `filename` fields. Returns a `CodeModeCorpus` with AST-linearised samples, byte-level fallbacks, and an optional meta-token dictionary.
 - **`MetaTokenCompressor`**: Discovers frequently occurring token runs and rewrites them as compact `META*` placeholders when `meta_enabled` is true. The compressor enforces a configurable maximum pattern length so merges remain interpretable.
@@ -88,7 +101,7 @@ The code-mode pipeline lives under [`gpu_tokenizer/code_mode/`](../gpu_tokenizer
 The CLI integrates these helpers via `--code-mode`, `--code-langs`, and `--meta-compress`. When AST parsing fails the pipeline emits byte-level fallbacks that retain metadata (`fallback=True`) so you can audit corpus quality. BPE code-mode runs load the entire corpus eagerly and therefore ignore autoscaler resize events and `--resume-from` checkpoints, whereas unigram and hybrid trainers operate on reusable in-memory batches.
 
 ## I/O and Streaming
-Defined across [`gpu_tokenizer/io/__init__.py`](../gpu_tokenizer/io/__init__.py) and helper modules.
+Defined across [`gpu_tokenizer/io/__init__.py`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/io/__init__.py) and helper modules.
 
 - **Compression adapters**: Dispatch to codec-specific readers (`zstd`, `lz4`, or plain text).
 - **Memory mapping**: Utilities for mapping shards into shared buffers when the filesystem permits.
@@ -115,8 +128,21 @@ The BPE and hybrid trainers expose optional privacy guards that redact merge his
 
 Every `state.json` produced by `save_checkpoint` now includes `payload["trainer"]["privacy"]` with the mode, merge redaction flag, tie seed metadata, and salt status. Consumers should inspect this section instead of inferring behavior from raw merge tables. Consult [docs/cli.md](cli.md#privacy-options) for CLI examples and the trade-offs between `none`, `hash-merges`, and `tie-randomize`.
 
+## Embedding exports
+
+Export helpers live in [`gpu_tokenizer/export/artifacts.py`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/export/artifacts.py) and bridge trained vocabularies with downstream embedding trainers.
+
+- **`load_vocab(path)`**: Reads a tokenizer vocabulary JSON (token→id mapping) from disk.
+- **`load_token_stats(path)`**: Loads optional token usage metadata produced during co-training. Counts and per-token vectors inform pruning and embedding seeding.
+- **`prune_vocabulary(vocab, stats, *, min_frequency, keep_tokens)`**: Produces a renumbered vocabulary while collecting pruned token metadata.
+- **`generate_embedding_matrix(vocab, stats, *, dimension, seed, dtype)`**: Synthesizes an embedding matrix aligned with the surviving vocabulary, reusing stored vectors when available.
+- **`build_manifest(...)`**: Summarises export parameters (dimension, dtype, seed, min frequency, preserved tokens) for logging and reproducibility.
+- **`write_export_package(out_dir, embeddings, vocab, manifest, pruned)`**: Persists the embeddings, pruned vocabulary, manifest, and bookkeeping JSON sidecars.
+
+The [`export-embeddings` CLI command](cli.md#export-embeddings) composes these helpers. Downstream applications can import `gpu_tokenizer.export` directly to embed SuperToken vocabularies into custom pipelines or notebooks.
+
 ## CLI Helpers
-Within [`main.py`](../main.py):
+Within [`main.py`](https://github.com/example/SuperToken/blob/main/main.py):
 
 - **`build_parser()`** – Declares subcommands and shared options.
 - **`main(argv=None)`** – Entry point that dispatches to subcommand handlers.
@@ -125,7 +151,7 @@ Within [`main.py`](../main.py):
 Reuse these helpers when embedding SuperToken into larger applications or notebooks. The design expectations are summarized in the [architecture overview](architecture.md#cli-integration).
 
 ## Benchmarking Utilities
-Located under [`benchmarks/`](../benchmarks/).
+Located under [`benchmarks/`](https://github.com/example/SuperToken/blob/main/benchmarks/).
 
 - **`run_benchmark()`** – Executes trainers against provided corpora and aggregates metrics.
 - **Telemetry writers** – Format tabular output and JSON payloads for downstream consumption.
