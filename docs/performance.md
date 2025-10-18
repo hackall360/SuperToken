@@ -183,7 +183,7 @@ configured target. Use `--compression`, `--io-workers`, and
 
 ## Continuous benchmarking pipeline
 
-Automated performance tracking lives in [`.github/workflows/bench.yml`](../.github/workflows/bench.yml).
+Automated performance tracking lives in [`.github/workflows/bench.yml`](https://github.com/example/SuperToken/blob/main/.github/workflows/bench.yml).
 Each run provisions Python 3.12 and the CUDA-enabled PyTorch wheel (`torch==2.5.1+cu118`),
 installs the plotting dependencies (`matplotlib`/`pandas`), and executes the synthetic
 benchmark with TorchScript disabled to avoid the `torch.nonzero` signature regression:
