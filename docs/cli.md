@@ -6,6 +6,7 @@ SuperToken ships a single `main.py` entry point that exposes tokenizer training 
 - [Global flags](#global-flags)
 - [`train-bpe`](#train-bpe)
 - [`train-unigram`](#train-unigram)
+- [`train-hybrid`](#train-hybrid)
 - [`benchmark`](#benchmark)
 - [Streaming options](#streaming-options)
 - [Checkpointing and resume](#checkpointing-and-resume)
@@ -93,6 +94,27 @@ Important options:
 - `--min-prob`: Optional probability floor for retention.
 
 The [`GPUUnigramTrainer`](../gpu_tokenizer/unigram_trainer.py) reuses the same streaming and autoscaling primitives; refer to the [API reference](api.md#trainers) for extension hooks.
+
+## `train-hybrid`
+Alternate between BPE warm-up phases and unigram refinement without leaving the CLI:
+
+```bash
+python main.py train-hybrid \
+  --data "data/**/*.txt" \
+  --merges 50000 \
+  --cycles 2 \
+  --unigram-epochs 2 \
+  --out-dir ./artifacts/hybrid
+```
+
+Key arguments:
+
+- `--cycles`: Number of BPE→unigram handoff rounds to execute.
+- `--unigram-epochs`: Epochs to run inside each unigram phase.
+- `--warm-start`: Optional path to a JSON manifest containing seeded merge pairs.
+- `--checkpoint-dir`: Directory where per-cycle checkpoints are stored.
+
+After training the command emits a `hybrid_manifest.json`, Hugging Face-compatible `merges.txt`/`tokenizer.json`, and a SentencePiece-style `unigram.prob`/`unigram.model` pair for downstream consumers. The [`HybridTrainer`](../gpu_tokenizer/trainers/hybrid.py) section of the API reference describes the orchestration hooks in more detail.
 
 ## `benchmark`
 Compare trainers using real and synthetic corpora in a single run:

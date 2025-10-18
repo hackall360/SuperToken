@@ -1,11 +1,13 @@
 import json
+import math
 from pathlib import Path
 
 import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 
 from gpu_tokenizer.bpe_trainer import GPUBPETrainer
+from gpu_tokenizer.trainers.hybrid import HybridTrainer, _build_piece_tables
 
 try:
     from tokenizers import Tokenizer
@@ -45,3 +47,46 @@ def test_save_emits_huggingface_artifacts(tmp_path: Path) -> None:
     encoding = tokenizer.encode(sample)
     assert tokenizer.decode(encoding.ids) == sample
     assert tokenizer.get_vocab_size(with_added_tokens=True) == trainer.vocab_size
+
+
+@pytest.mark.skipif(Tokenizer is None, reason="tokenizers library is unavailable")
+def test_hybrid_save_emits_combined_artifacts(tmp_path: Path) -> None:
+    sentencepiece = pytest.importorskip("sentencepiece")
+
+    trainer = HybridTrainer(base_vocab=256, merges=1, cycles=1, unigram_epochs=1)
+    trainer._final_merges = [(ord("h"), ord("i"))]
+    id2piece, _, _ = _build_piece_tables(trainer.base_vocab, trainer._final_merges)
+    trainer._final_id2piece = id2piece
+    trainer._final_logp = torch.full(
+        (len(id2piece),),
+        -math.log(max(len(id2piece), 1)),
+        dtype=torch.float32,
+    )
+    trainer._completed_cycles = 1
+
+    artifacts = trainer.save(tmp_path)
+
+    merges_path = tmp_path / "merges.txt"
+    tokenizer_path = tmp_path / "tokenizer.json"
+    unigram_prob_path = tmp_path / "unigram.prob"
+    unigram_model_path = tmp_path / "unigram.model"
+    manifest_path = tmp_path / "hybrid_manifest.json"
+
+    assert merges_path.exists()
+    assert tokenizer_path.exists()
+    assert unigram_prob_path.exists()
+    assert manifest_path.exists()
+    assert unigram_model_path.exists()
+
+    tokenizer = Tokenizer.from_file(str(tokenizer_path))
+    encoding = tokenizer.encode("hi")
+    assert tokenizer.decode(encoding.ids) == "hi"
+
+    processor = sentencepiece.SentencePieceProcessor(model_file=str(unigram_model_path))
+    loaded = processor.LoadVocabulary(str(unigram_prob_path), threshold=0)
+    assert loaded > 0
+    sp_ids = processor.encode("hi", out_type=int)
+    assert sp_ids
+
+    assert artifacts["merges"] == str(merges_path)
+    assert artifacts["unigram_prob"] == str(unigram_prob_path)

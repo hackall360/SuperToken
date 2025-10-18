@@ -65,6 +65,215 @@ def _build_piece_tables(
     return id2piece, piece2id, max_len
 
 
+def _bytes_to_unicode() -> dict[int, str]:
+    """Mirror the byte→unicode mapping used by Hugging Face BPE tokenizers."""
+
+    bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return {b: chr(c) for b, c in zip(bs, cs)}
+
+
+def _build_bpe_tokenizer_artifacts(
+    base_vocab: int, merges: Sequence[tuple[int, int]]
+) -> tuple[dict[str, int], list[str], dict[str, object]]:
+    """Construct vocab/merges/config triples compatible with Hugging Face."""
+
+    byte_encoder = _bytes_to_unicode()
+    token_strings: list[str] = []
+    added_tokens: list[dict[str, object]] = []
+
+    for token_id in range(base_vocab):
+        if 0 <= token_id < 256:
+            token_strings.append(byte_encoder[token_id])
+        else:
+            content = f"<|{token_id}|>"
+            token_strings.append(content)
+            added_tokens.append(
+                {
+                    "id": token_id,
+                    "content": content,
+                    "single_word": False,
+                    "lstrip": False,
+                    "rstrip": False,
+                    "normalized": False,
+                    "special": True,
+                }
+            )
+
+    for idx, (left_id, right_id) in enumerate(merges):
+        try:
+            left = token_strings[left_id]
+            right = token_strings[right_id]
+        except IndexError as exc:  # pragma: no cover - defensive guard
+            raise ValueError(
+                f"Invalid merge pair {(left_id, right_id)} at position {idx}"
+            ) from exc
+        token_strings.append(left + right)
+
+    expected_vocab = base_vocab + len(merges)
+    vocab = {token: idx for idx, token in enumerate(token_strings)}
+    if len(vocab) != expected_vocab:
+        raise ValueError(
+            "Mismatch between expected vocab size and constructed vocabulary length"
+        )
+
+    merge_strings = [
+        f"{token_strings[left]} {token_strings[right]}" for left, right in merges
+    ]
+
+    tokenizer_config: dict[str, object] = {
+        "version": "1.0",
+        "truncation": None,
+        "padding": None,
+        "added_tokens": added_tokens,
+        "normalizer": None,
+        "pre_tokenizer": {
+            "type": "ByteLevel",
+            "add_prefix_space": False,
+            "trim_offsets": True,
+            "use_regex": True,
+        },
+        "post_processor": None,
+        "decoder": {"type": "ByteLevel"},
+        "model": {
+            "type": "BPE",
+            "dropout": None,
+            "unk_token": None,
+            "continuing_subword_prefix": "",
+            "end_of_word_suffix": "",
+            "fuse_unk": False,
+            "byte_fallback": False,
+            "vocab": vocab,
+            "merges": merge_strings,
+        },
+    }
+
+    return vocab, merge_strings, tokenizer_config
+
+
+def _write_bpe_tokenizer_files(
+    output_dir: Path,
+    vocab: Mapping[str, int],
+    merges: Sequence[str],
+    tokenizer_config: Mapping[str, object],
+) -> dict[str, str]:
+    """Persist Hugging Face compatible tokenizer artifacts."""
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    vocab_path = output_dir / "vocab.json"
+    merges_path = output_dir / "merges.txt"
+    tokenizer_path = output_dir / "tokenizer.json"
+
+    with open(vocab_path, "w", encoding="utf-8") as handle:
+        json.dump(dict(vocab), handle, ensure_ascii=False)
+
+    with open(merges_path, "w", encoding="utf-8") as handle:
+        handle.write("#version: 0.2\n")
+        for merge in merges:
+            handle.write(f"{merge}\n")
+
+    with open(tokenizer_path, "w", encoding="utf-8") as handle:
+        json.dump(dict(tokenizer_config), handle, ensure_ascii=False)
+
+    return {
+        "vocab": os.fspath(vocab_path),
+        "merges": os.fspath(merges_path),
+        "tokenizer": os.fspath(tokenizer_path),
+    }
+
+
+def _encode_unigram_piece(piece: bytes) -> str:
+    text = piece.decode("latin-1")
+    return text.replace(" ", "▁")
+
+
+def _write_unigram_probabilities(
+    path: Path, logp: torch.Tensor, id2piece: Mapping[int, bytes]
+) -> Path:
+    """Write a text file containing sentencepiece-compatible probabilities."""
+
+    if not id2piece:
+        raise ValueError("id2piece mapping is empty; cannot export unigram probabilities")
+
+    vocab_size = max(id2piece) + 1
+    if logp.numel() < vocab_size:
+        raise ValueError("log probability tensor does not cover the full vocabulary")
+
+    probs = torch.softmax(logp.detach().cpu(), dim=0)
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write("# piece\tprobability\n")
+        for idx in range(vocab_size):
+            piece = id2piece.get(idx)
+            if piece is None:
+                raise ValueError(f"Missing unigram piece for id {idx}")
+            encoded = _encode_unigram_piece(piece)
+            prob = float(probs[idx].item())
+            handle.write(f"{encoded}\t{prob:.12f}\n")
+    return path
+
+
+def _write_sentencepiece_model(
+    output_dir: Path,
+    id2piece: Mapping[int, bytes],
+    logp: torch.Tensor,
+    max_piece_len: int,
+) -> Path | None:
+    """Emit a SentencePiece model if the dependency is available."""
+
+    try:
+        from sentencepiece import sentencepiece_model_pb2 as sp_pb2  # type: ignore
+    except Exception:  # pragma: no cover - optional dependency
+        return None
+
+    vocab_size = max(id2piece) + 1 if id2piece else logp.numel()
+    if logp.numel() < vocab_size:
+        raise ValueError("log probability tensor does not cover the full vocabulary")
+
+    model = sp_pb2.ModelProto()
+    model.model_type = sp_pb2.ModelProto.UNIGRAM
+    trainer_spec = model.trainer_spec
+    trainer_spec.model_type = sp_pb2.TrainerSpec.UNIGRAM
+    trainer_spec.vocab_size = vocab_size
+    trainer_spec.character_coverage = 1.0
+    trainer_spec.byte_fallback = True
+    trainer_spec.max_sentencepiece_length = max_piece_len
+    trainer_spec.add_dummy_prefix = False
+    trainer_spec.remove_extra_whitespaces = False
+    trainer_spec.split_by_whitespace = False
+    trainer_spec.pad_id = -1
+    trainer_spec.unk_id = -1
+    trainer_spec.bos_id = -1
+    trainer_spec.eos_id = -1
+    trainer_spec.shuffle_input_sentence = False
+    trainer_spec.seed_sentencepiece_size = 0
+    trainer_spec.input_sentence_size = 0
+
+    normalizer_spec = model.normalizer_spec
+    normalizer_spec.name = "identity"
+    normalizer_spec.precompiled_charsmap = b""
+
+    for idx in range(vocab_size):
+        piece_bytes = id2piece.get(idx)
+        if piece_bytes is None:
+            raise ValueError(f"Missing unigram piece for id {idx}")
+        piece = model.pieces.add()
+        piece.piece = _encode_unigram_piece(piece_bytes)
+        piece.score = float(logp[idx].item())
+        piece.type = sp_pb2.ModelProto.SentencePiece.NORMAL
+
+    model_path = output_dir / "unigram.model"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with model_path.open("wb") as handle:
+        handle.write(model.SerializeToString())
+    return model_path
+
+
 def _extract_tokens_per_second(payload: Mapping[str, Any] | None) -> float | None:
     """Best-effort retrieval of throughput metrics from a summary payload."""
 
@@ -456,6 +665,43 @@ class HybridTrainer(BaseTrainer):
         with open(manifest_path, "w", encoding="utf-8") as handle:
             json.dump(manifest, handle, indent=2, sort_keys=True)
         return {"manifest": os.fspath(manifest_path)}
+
+    def save(self, output_dir: str | os.PathLike[str]) -> dict[str, str]:
+        """Persist combined BPE and unigram artifacts for hybrid models."""
+
+        if not self._final_merges:
+            raise RuntimeError("HybridTrainer.save requires trained BPE merges")
+        if not isinstance(self._final_logp, torch.Tensor):
+            raise RuntimeError("HybridTrainer.save requires unigram log probabilities")
+        if not self._final_id2piece:
+            raise RuntimeError("HybridTrainer.save requires populated unigram pieces")
+
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        artifacts = self.save_artifacts(output_path)
+        vocab, merges, tokenizer_config = _build_bpe_tokenizer_artifacts(
+            self.base_vocab, self._final_merges
+        )
+        bpe_paths = _write_bpe_tokenizer_files(output_path, vocab, merges, tokenizer_config)
+
+        logp = self._final_logp.detach().clone().cpu()
+        unigram_prob_path = _write_unigram_probabilities(
+            output_path / "unigram.prob", logp, self._final_id2piece
+        )
+        sp_path = _write_sentencepiece_model(
+            output_path, self._final_id2piece, logp, self.max_unigram_len
+        )
+
+        combined: dict[str, str] = dict(artifacts)
+        combined.update(bpe_paths)
+        combined["unigram_prob"] = os.fspath(unigram_prob_path)
+        if sp_path is not None:
+            combined["unigram_model"] = os.fspath(sp_path)
+
+        printed_paths = ", ".join(sorted(combined.values()))
+        print(f"Saved hybrid artifacts → {printed_paths}")
+        return combined
 
     # ------------------------------------------------------------------
     # Metrics plumbing
