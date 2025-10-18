@@ -15,6 +15,7 @@ SuperToken is a GPU-accelerated tokenizer toolkit that offers high-throughput by
 - [Features](#features)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+- [Privacy Modes](#privacy-modes)
 - [Command Reference](#command-reference)
 - [Benchmarking](#benchmarking)
 - [Architecture & API Overview](#architecture--api-overview)
@@ -104,6 +105,15 @@ python main.py train-hybrid \
 ```
 
 The hybrid workflow exports Hugging Face-ready BPE files alongside SentencePiece probabilities and a manifest describing each cycle.
+
+## Privacy Modes
+SuperToken provides an opt-in privacy guard for the merge history produced by the GPU trainers. The `--privacy` flag, available on the `train-bpe` and `train-hybrid` subcommands, accepts three modes:
+
+- `none` *(default)* – Export raw merge tables and maintain deterministic tie-breaks. Checkpoints and manifests record the merge pairs in plain text.
+- `hash-merges` – Replace merge IDs with salted hashes in all exported manifests. The `privacy` block written to `state.json`, `bpe_merges.json`, and `hybrid_manifest.json` indicates that merges were redacted and whether a salt was supplied via `--privacy-salt`.
+- `tie-randomize` – Hash merges **and** randomize tie-break resolution. This deliberately breaks deterministic parity across devices; provide `--tie-seed` to make the stochastic ordering reproducible across runs.
+
+Every exported manifest now includes a `"privacy"` section summarizing the active mode, whether merges were redacted, the effective tie seed, and if a salt was configured. Downstream consumers can inspect this block to detect redactions without reverse engineering trainer configuration. See [docs/cli.md](docs/cli.md#privacy-options) for end-to-end examples.
 
 ## Command Reference
 The CLI is organized into subcommands that share a common set of arguments.

@@ -240,6 +240,42 @@ def test_privacy_mode_redacts_merge_metadata(tmp_path: Path):
     assert payload["merge_count"] == 1
     assert payload["merges"][0] == hash_merge_pair((1, 2), b"secret")
     assert all(isinstance(entry, str) for entry in payload["merges"])
+    privacy_section = payload.get("privacy")
+    assert isinstance(privacy_section, dict)
+    assert privacy_section["mode"] == "hash-merges"
+    assert privacy_section["merges_redacted"] is True
+    assert privacy_section["randomize_ties"] is False
+    assert privacy_section.get("salt_configured") is True
+    assert privacy_section.get("tie_seed_effective") == trainer._tie_seed_value
+
+
+def test_privacy_checkpoint_annotations(tmp_path: Path) -> None:
+    trainer = GPUBPETrainer(
+        base_vocab=16,
+        merges=1,
+        device="cpu",
+        privacy_mode=True,
+        randomize_ties=True,
+        tie_seed=11,
+        privacy_salt="pepper",
+    )
+    trainer.merges = [(1, 2)]
+    trainer.vocab_size = trainer.base_vocab + len(trainer.merges)
+    checkpoint_state = trainer.save_checkpoint(tmp_path)
+    meta_path = tmp_path / "state.json"
+    payload = json.loads(meta_path.read_text("utf-8"))
+    trainer_section = payload.get("trainer", {})
+    privacy_section = trainer_section.get("privacy") if isinstance(trainer_section, dict) else None
+    assert isinstance(privacy_section, dict)
+    assert privacy_section["mode"] == "tie-randomize"
+    assert privacy_section["merges_redacted"] is True
+    assert privacy_section["randomize_ties"] is True
+    assert privacy_section["tie_seed"] == 11
+    assert privacy_section["tie_seed_effective"] == trainer._tie_seed_value
+    assert privacy_section.get("salt_configured") is True
+    model_section = trainer_section.get("model", {}) if isinstance(trainer_section, dict) else {}
+    assert model_section.get("privacy_mode") is True
+    assert checkpoint_state["payload"]["trainer"]["privacy"]["mode"] == "tie-randomize"
 
 
 def test_cpu_fastpath_pair_count_matches_baseline():
