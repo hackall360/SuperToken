@@ -134,15 +134,31 @@ def test_render_rank_metrics_table_formats_rows() -> None:
             "tokens_per_s": 1234.567,
             "lease_per_s": 890.123,
             "samples": 4.0,
+            "idle_ms": 12.5,
+            "lease_width": 8,
         },
         {
             "rank": 1,
             "tokens_per_s": 2222.0,
             "lease_per_s": 111.5,
             "samples": 8.0,
+            "idle_ms": 50.0,
+            "lease_width": 4,
             "per_rank": {
-                0: {"tokens_per_s": 1234.567, "lease_per_s": 890.123, "samples": 4.0},
-                1: {"tokens_per_s": 2222.0, "lease_per_s": 111.5, "samples": 8.0},
+                0: {
+                    "tokens_per_s": 1234.567,
+                    "lease_per_s": 890.123,
+                    "samples": 4.0,
+                    "idle_ms": 12.5,
+                    "lease_width": 8,
+                },
+                1: {
+                    "tokens_per_s": 2222.0,
+                    "lease_per_s": 111.5,
+                    "samples": 8.0,
+                    "idle_ms": 50.0,
+                    "lease_width": 4,
+                },
             },
         },
     ]
@@ -152,10 +168,13 @@ def test_render_rank_metrics_table_formats_rows() -> None:
     assert "Tokens/s" in table
     assert "Leases/s" in table
     assert "Samples" in table
+    assert "Idle EWMA (ms)" in table
+    assert "Lease Width" in table
     assert "0" in table
     assert "1" in table
     assert "1,234.57" in table
     assert "111.50" in table
+    assert "12.50 |           8" in table
 
 
 def test_format_iteration_summary_reads_nested_metrics() -> None:

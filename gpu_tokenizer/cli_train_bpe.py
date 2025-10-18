@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import math
 import os
 import sys
 import types
@@ -207,77 +208,84 @@ def _sanitize_cli_args(argv: Sequence[str] | None) -> List[str]:
 def render_rank_metrics_table(snapshots: Sequence[Mapping[str, object]]) -> str:
     """Return a formatted table summarising per-rank throughput metrics."""
 
-    aggregated: dict[int, tuple[float, float, float]] = {}
+    aggregated: dict[int, dict[str, float]] = {}
+
+    def _merge(rank_idx: int, stats: Mapping[str, object]) -> None:
+        entry = aggregated.setdefault(rank_idx, {})
+        for field in ("tokens_per_s", "lease_per_s", "samples"):
+            value = stats.get(field)
+            try:
+                numeric = float(value) if value is not None else None
+            except (TypeError, ValueError):
+                numeric = None
+            if numeric is not None and math.isfinite(numeric):
+                entry[field] = numeric
+        idle_obj = stats.get("idle_ms") or stats.get("idle_ewma_ms")
+        if idle_obj is not None:
+            try:
+                idle_numeric = float(idle_obj)
+            except (TypeError, ValueError):
+                idle_numeric = None
+            if idle_numeric is not None and math.isfinite(idle_numeric):
+                entry["idle_ms"] = idle_numeric
+        width_obj = stats.get("lease_width")
+        if width_obj is not None:
+            try:
+                width_numeric = float(width_obj)
+            except (TypeError, ValueError):
+                width_numeric = None
+            if width_numeric is not None and math.isfinite(width_numeric):
+                entry["lease_width"] = width_numeric
+
     for snapshot in snapshots:
         if not isinstance(snapshot, Mapping):
             continue
         per_rank = snapshot.get("per_rank")
         if isinstance(per_rank, Mapping):
             for rank_key, stats in per_rank.items():
+                if not isinstance(stats, Mapping):
+                    continue
                 try:
                     rank_idx = int(rank_key)
                 except (TypeError, ValueError):
                     continue
-                if not isinstance(stats, Mapping):
-                    continue
-                tokens_val = stats.get("tokens_per_s", 0.0)
-                leases_val = stats.get("lease_per_s", 0.0)
-                samples_val = stats.get("samples", 0.0)
-                try:
-                    tokens = float(tokens_val if tokens_val is not None else 0.0)
-                except (TypeError, ValueError):
-                    tokens = 0.0
-                try:
-                    leases = float(leases_val if leases_val is not None else 0.0)
-                except (TypeError, ValueError):
-                    leases = 0.0
-                try:
-                    samples = float(samples_val if samples_val is not None else 0.0)
-                except (TypeError, ValueError):
-                    samples = 0.0
-                aggregated[rank_idx] = (tokens, leases, samples)
+                _merge(rank_idx, stats)
 
         rank_val = snapshot.get("rank")
-        rank_idx: int | None
         try:
             rank_idx = int(rank_val) if rank_val is not None else None
         except (TypeError, ValueError):
             rank_idx = None
-        if rank_idx is None:
-            continue
-        tokens_val = snapshot.get("tokens_per_s", 0.0)
-        leases_val = snapshot.get("lease_per_s", 0.0)
-        samples_val = snapshot.get("samples", 0.0)
-        try:
-            tokens = float(tokens_val if tokens_val is not None else 0.0)
-        except (TypeError, ValueError):
-            tokens = 0.0
-        try:
-            leases = float(leases_val if leases_val is not None else 0.0)
-        except (TypeError, ValueError):
-            leases = 0.0
-        try:
-            samples = float(samples_val if samples_val is not None else 0.0)
-        except (TypeError, ValueError):
-            samples = 0.0
-        aggregated.setdefault(rank_idx, (tokens, leases, samples))
+        if rank_idx is not None:
+            _merge(rank_idx, snapshot)
 
     if not aggregated:
         return ""
 
     rows: list[list[str]] = []
     for rank_idx in sorted(aggregated):
-        tokens, leases, samples = aggregated[rank_idx]
+        stats = aggregated[rank_idx]
+        tokens = float(stats.get("tokens_per_s", 0.0))
+        leases = float(stats.get("lease_per_s", 0.0))
+        samples = float(stats.get("samples", 0.0))
+        idle_ms = float(stats.get("idle_ms", 0.0))
+        lease_width = stats.get("lease_width")
+        if lease_width is None or not math.isfinite(float(lease_width)):
+            lease_display = "0"
+        else:
+            lease_display = str(int(round(float(lease_width))))
         rows.append(
             [
                 str(rank_idx),
                 f"{tokens:,.2f}",
                 f"{leases:,.2f}",
                 f"{samples:,.2f}",
+                f"{idle_ms:,.2f}",
+                lease_display,
             ]
         )
 
-    headers = ["Rank", "Tokens/s", "Leases/s", "Samples"]
+    headers = ["Rank", "Tokens/s", "Leases/s", "Samples", "Idle EWMA (ms)", "Lease Width"]
     widths = [len(header) for header in headers]
     for row in rows:
         for idx, cell in enumerate(row):
@@ -656,6 +664,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     with dist_launcher.launch_rank(_trainer_factory, config=rank_config) as launch:
         trainer = launch.trainer
         trainer_ref["value"] = trainer
+        lease_client = launch.context.lease_client
         batcher_obj = trainer_artifacts.get("batcher")
         if batcher_obj is None:
             raise RuntimeError("Failed to initialise training batcher")
@@ -687,6 +696,47 @@ def main(argv: Sequence[str] | None = None) -> None:
 
                 if metrics_tracker is None or not getattr(metrics_tracker, "enabled", False):
                     return
+
+                if lease_client is not None:
+                    tokens_obj = summary.get("tokens", 0)
+                    duration_obj = summary.get("token_time_s", 0.0)
+                    try:
+                        tokens_val = int(tokens_obj if tokens_obj is not None else 0)
+                    except (TypeError, ValueError):
+                        tokens_val = 0
+                    try:
+                        duration_val = float(duration_obj) if duration_obj is not None else 0.0
+                    except (TypeError, ValueError):
+                        duration_val = 0.0
+                    idle_total = lease_client.drain_idle_time()
+                    feedback_payload: Mapping[str, object] | None = None
+                    try:
+                        feedback_payload = lease_client.feedback(
+                            tokens_val,
+                            duration_s=duration_val if duration_val > 0.0 else None,
+                            idle_duration_s=idle_total,
+                        )
+                    except Exception:
+                        feedback_payload = None
+                    if (
+                        feedback_payload is not None
+                        and hasattr(metrics_tracker, "record_feedback")
+                    ):
+                        try:
+                            idle_ms = feedback_payload.get("idle_ewma_ms")  # type: ignore[attr-defined]
+                            lease_width = feedback_payload.get("lease_width")  # type: ignore[attr-defined]
+                            max_active = feedback_payload.get("max_active")  # type: ignore[attr-defined]
+                        except Exception:
+                            idle_ms = lease_width = max_active = None
+                        try:
+                            metrics_tracker.record_feedback(
+                                rank=lease_client.rank,
+                                idle_ms=idle_ms,
+                                lease_width=lease_width,
+                                max_active=max_active,
+                            )
+                        except Exception:
+                            pass
 
                 try:
                     snapshot = metrics_tracker.snapshot()

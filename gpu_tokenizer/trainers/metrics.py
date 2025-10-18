@@ -119,6 +119,7 @@ class TrainerMetricsEWMA:
         tokens_per_s: float | None,
         lease_per_s: float | None,
         samples: float = 0.0,
+        extra: Mapping[str, float] | None = None,
     ) -> None:
         entry = self._rank_stats.setdefault(
             int(rank),
@@ -130,6 +131,15 @@ class TrainerMetricsEWMA:
             entry["lease_per_s"] = float(lease_per_s)
         if samples > 0.0 and math.isfinite(samples):
             entry["samples"] = float(entry.get("samples", 0.0)) + float(samples)
+        if extra:
+            for key, value in extra.items():
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(numeric):
+                    continue
+                entry[key] = numeric
 
     def update_rank_snapshot(self, snapshot: Mapping[str, object]) -> None:
         """Merge a per-rank snapshot gathered from a peer."""
@@ -141,6 +151,9 @@ class TrainerMetricsEWMA:
         tokens_obj = snapshot.get("tokens_per_s")
         leases_obj = snapshot.get("lease_per_s")
         samples_obj = snapshot.get("samples", 0.0)
+        idle_obj = snapshot.get("idle_ms") or snapshot.get("idle_ewma_ms")
+        width_obj = snapshot.get("lease_width")
+        max_active_obj = snapshot.get("max_active")
         try:
             tokens_val = float(tokens_obj) if tokens_obj is not None else None
         except (TypeError, ValueError):
@@ -153,11 +166,28 @@ class TrainerMetricsEWMA:
             samples_val = float(samples_obj) if samples_obj is not None else 0.0
         except (TypeError, ValueError):
             samples_val = 0.0
+        extras: dict[str, float] = {}
+        try:
+            if idle_obj is not None:
+                extras["idle_ms"] = float(idle_obj)
+        except (TypeError, ValueError):
+            pass
+        try:
+            if width_obj is not None:
+                extras["lease_width"] = float(width_obj)
+        except (TypeError, ValueError):
+            pass
+        try:
+            if max_active_obj is not None:
+                extras["max_active"] = float(max_active_obj)
+        except (TypeError, ValueError):
+            pass
         self._update_rank_entry(
             rank,
             tokens_per_s=tokens_val,
             lease_per_s=leases_val,
             samples=samples_val,
+            extra=extras if extras else None,
         )
 
     def record_tokens(
@@ -192,6 +222,51 @@ class TrainerMetricsEWMA:
                 lease_per_s=self._lease_per_s,
                 samples=1.0,
             )
+
+    def record_feedback(
+        self,
+        *,
+        rank: int | None = None,
+        idle_ms: float | None = None,
+        lease_width: float | None = None,
+        max_active: float | None = None,
+    ) -> None:
+        """Track supplemental lease telemetry for ``rank``."""
+
+        extras: dict[str, float] = {}
+        if idle_ms is not None:
+            try:
+                value = float(idle_ms)
+            except (TypeError, ValueError):
+                value = None
+            if value is not None and math.isfinite(value):
+                extras["idle_ms"] = value
+        if lease_width is not None:
+            try:
+                width_val = float(lease_width)
+            except (TypeError, ValueError):
+                width_val = None
+            if width_val is not None and math.isfinite(width_val):
+                extras["lease_width"] = width_val
+        if max_active is not None:
+            try:
+                max_val = float(max_active)
+            except (TypeError, ValueError):
+                max_val = None
+            if max_val is not None and math.isfinite(max_val):
+                extras["max_active"] = max_val
+        if not extras:
+            return
+        target_rank = rank if rank is not None else self.rank
+        if target_rank is None:
+            return
+        self._update_rank_entry(
+            int(target_rank),
+            tokens_per_s=None,
+            lease_per_s=None,
+            samples=0.0,
+            extra=extras,
+        )
 
     def record_iteration(self, total_duration_s: float, reduction_s: float) -> None:
         """Track the wall clock time spent on reductions versus the iteration total."""

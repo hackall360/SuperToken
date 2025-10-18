@@ -75,3 +75,19 @@ def test_blend_rank_weights_uniform_when_no_signal() -> None:
 
     assert set(blended) == {0, 1, 2}
     assert all(value == pytest.approx(1.0 / 3.0) for value in blended.values())
+
+
+def test_notary_feedback_scaling_favours_faster_ranks() -> None:
+    notary = dist_runtime.LeaseNotary(total_chunks=128, lease_ttl=5.0, max_active_leases=4)
+
+    for _ in range(8):
+        notary.apply_feedback(0, completed_tokens=100, duration_s=1.0, idle_duration_s=0.0)
+        notary.apply_feedback(1, completed_tokens=20, duration_s=1.0, idle_duration_s=0.0)
+
+    status = notary.rank_status()
+    fast = status.get(0, {})
+    slow = status.get(1, {})
+    assert fast
+    assert slow
+    assert fast.get("max_active", 0) > slow.get("max_active", 0)
+    assert slow.get("max_active", 0) >= 1
