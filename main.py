@@ -24,6 +24,7 @@ from gpu_tokenizer import (
     StreamingPackedBatcher,
     utils,
 )
+from gpu_tokenizer.code_mode import prepare_corpus
 from gpu_tokenizer.io import CorpusStreamer, MemoryMappedShard
 from gpu_tokenizer.dtypes import length_storage_dtype
 from gpu_tokenizer.trainers.base import BaseTrainer, CheckpointPayload
@@ -70,6 +71,199 @@ def _load_sequences(
                 yield packer.encode_shard(shard)
 
     return _generator()
+
+
+def _normalize_code_languages(raw: Sequence[str] | None) -> set[str]:
+    """Normalise values passed via ``--code-langs``."""
+
+    if not raw:
+        return set()
+    values: set[str] = set()
+    for item in raw:
+        if not item:
+            continue
+        for piece in str(item).split(","):
+            norm = piece.strip().lower()
+            if norm:
+                values.add(norm)
+    return values
+
+
+def _detect_code_language(path: Path) -> str | None:
+    """Infer a language label from *path* when possible."""
+
+    mapping = {
+        ".py": "python",
+        ".pyi": "python",
+        ".ts": "typescript",
+        ".tsx": "typescript",
+        ".js": "javascript",
+        ".jsx": "javascript",
+    }
+    return mapping.get(path.suffix.lower())
+
+
+def _coerce_code_entry(
+    payload: Mapping[str, object] | object,
+    *,
+    filename: str,
+    language_hint: str | None,
+) -> Mapping[str, object] | None:
+    """Convert arbitrary JSON entries into :func:`prepare_corpus` payloads."""
+
+    if not isinstance(payload, Mapping):
+        return None
+    entry = dict(payload)
+    entry.setdefault("filename", filename)
+    language = entry.get("language")
+    if not language and language_hint:
+        entry["language"] = language_hint
+    source = entry.get("source")
+    if not isinstance(source, str):
+        return None
+    return entry
+
+
+def _iter_code_entries(
+    paths: Iterable[Path], *, languages: set[str] | None
+) -> list[Mapping[str, object]]:
+    """Load structured code samples from ``paths``."""
+
+    allowed = {lang.lower() for lang in languages} if languages else None
+    entries: list[Mapping[str, object]] = []
+    for path in paths:
+        suffix = path.suffix.lower()
+        language_hint = _detect_code_language(path)
+        if suffix in {".json", ".jsonl", ".ndjson"}:
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    if suffix == ".json":
+                        payload = json.load(handle)
+                        if isinstance(payload, Sequence):
+                            iterator = enumerate(payload)
+                        elif isinstance(payload, Mapping):
+                            data = payload.get("entries")
+                            if not isinstance(data, Sequence):
+                                raise TypeError(
+                                    "JSON manifests must contain an array or an 'entries' list"
+                                )
+                            iterator = enumerate(data)
+                        else:
+                            raise TypeError("JSON manifests must contain an array of entries")
+                        for index, obj in iterator:
+                            entry = _coerce_code_entry(
+                                obj,
+                                filename=f"{path.name}#{index}",
+                                language_hint=language_hint,
+                            )
+                            if entry is None:
+                                continue
+                            language_value = str(entry.get("language", "")).strip().lower()
+                            if allowed and language_value and language_value not in allowed:
+                                continue
+                            if allowed and not language_value and language_hint and language_hint not in allowed:
+                                continue
+                            entries.append(entry)
+                    else:
+                        for index, line in enumerate(handle):
+                            stripped = line.strip()
+                            if not stripped:
+                                continue
+                            try:
+                                payload = json.loads(stripped)
+                            except json.JSONDecodeError as exc:  # pragma: no cover - defensive
+                                raise SystemExit(f"Failed to parse JSON entry in {path}: {exc}") from exc
+                            entry = _coerce_code_entry(
+                                payload,
+                                filename=f"{path.name}#{index}",
+                                language_hint=language_hint,
+                            )
+                            if entry is None:
+                                continue
+                            language_value = str(entry.get("language", "")).strip().lower()
+                            if allowed and language_value and language_value not in allowed:
+                                continue
+                            if allowed and not language_value and language_hint and language_hint not in allowed:
+                                continue
+                            entries.append(entry)
+            except json.JSONDecodeError as exc:
+                raise SystemExit(f"Failed to parse JSON manifest at {path}: {exc}") from exc
+        else:
+            try:
+                source = path.read_text(encoding="utf-8")
+            except OSError as exc:  # pragma: no cover - filesystem failure
+                raise SystemExit(f"Unable to read source file {path}: {exc}") from exc
+            language_value = language_hint or ""
+            if allowed and language_value and language_value not in allowed:
+                continue
+            if allowed and not language_value:
+                continue
+            entries.append(
+                {
+                    "language": language_value or language_hint or "",
+                    "source": source,
+                    "filename": path.name,
+                }
+            )
+    return entries
+
+
+def _load_code_mode_sequences(
+    paths: Iterable[Path],
+    *,
+    bos: int | None,
+    eos: int | None,
+    languages: set[str] | None,
+    meta_enabled: bool,
+    meta_max_length: int = 8,
+) -> tuple[list[list[int]], dict[str, object]]:
+    """Materialise integer token sequences for code-mode corpora."""
+
+    entries = _iter_code_entries(paths, languages=languages)
+    if not entries:
+        raise SystemExit("--code-mode requires at least one parseable code sample")
+
+    corpus = prepare_corpus(
+        entries,
+        meta_enabled=meta_enabled,
+        meta_max_length=max(1, int(meta_max_length)),
+    )
+
+    packer = BytePacker(bos=bos, eos=eos)
+    sequences: list[list[int]] = []
+    ast_samples = 0
+    fallback_samples = 0
+    languages_seen: set[str] = set()
+    total_tokens = 0
+
+    for sample in corpus.samples:
+        language = str(sample.metadata.get("language", "")).strip().lower()
+        if language:
+            languages_seen.add(language)
+        if sample.kind == "ast":
+            ast_samples += 1
+            serialized = "\n".join(map(str, sample.tokens)).encode("utf-8")
+        else:
+            fallback_samples += 1
+            serialized = bytes(int(b) & 0xFF for b in sample.tokens)
+        seq = list(packer.encode_sequence(serialized))
+        sequences.append(seq)
+        total_tokens += len(seq)
+
+    average_len = total_tokens / len(sequences) if sequences else 0.0
+    summary = {
+        "enabled": True,
+        "samples": len(corpus.samples),
+        "ast_samples": ast_samples,
+        "fallback_samples": fallback_samples,
+        "languages": sorted(languages_seen) if languages_seen else None,
+        "meta_compress": bool(meta_enabled),
+        "meta_tokens": {name: list(pattern) for name, pattern in corpus.meta_tokens.items()},
+        "meta_token_count": len(corpus.meta_tokens),
+        "meta_max_length": corpus.meta_max_length,
+        "average_sequence_length": average_len,
+    }
+    return sequences, summary
 
 
 def _expand_data_patterns(patterns: Sequence[str]) -> list[Path]:
@@ -445,6 +639,14 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
         raise SystemExit("train-bpe requires at least one --data glob pattern")
     data_files = _expand_data_patterns(data_patterns)
     trainer, autoscaler, batch_size, trainer_config = _build_bpe_trainer(args)
+    code_langs = _normalize_code_languages(getattr(args, "code_langs", None))
+    code_mode_active = bool(getattr(args, "code_mode", False))
+    code_mode_config: dict[str, object] = {
+        "enabled": code_mode_active,
+        "meta_compress": bool(getattr(args, "meta_compress", False)),
+    }
+    if code_langs:
+        code_mode_config["languages"] = sorted(code_langs)
     config = dict(trainer_config)
     config.update(
         {
@@ -464,233 +666,263 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
                 "out_dir": args.out_dir,
             },
             "dry_run": bool(getattr(args, "dry_run", False)),
+            "code_mode": code_mode_config,
         }
     )
     _log_resolved_config("train-bpe", config)
     if getattr(args, "dry_run", False):
         print("[dry-run] train-bpe initialization complete")
         return
-    packer = BytePacker(bos=args.bos, eos=args.eos)
-
-    def _build_serialized_batches(
-        serialized: dict[str, object],
-        default_bs: int,
-    ) -> tuple[int, Iterable[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None]:
-        sequences_raw = serialized.get("sequences", [])
-        sequences: list[list[int]] = []
-        if isinstance(sequences_raw, list):
-            for seq in sequences_raw:
-                if isinstance(seq, list):
-                    sequences.append([int(token) for token in seq])
-        if not sequences:
-            return 0, None
-        resume_bs = int(serialized.get("active_batch_size") or 0)
-        if resume_bs <= 0:
-            resume_bs = default_bs
-
-        class _SerializedIterable:
-            def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-                pin_memory = torch.cuda.is_available()
-                storage_width = 1
-                length_dtype = length_storage_dtype(storage_width)
-                tokens = torch.full(
-                    (resume_bs, storage_width),
-                    -1,
-                    dtype=torch.int32,
-                    pin_memory=pin_memory,
-                )
-                valid = torch.zeros(
-                    (resume_bs, storage_width),
-                    dtype=torch.uint8,
-                    pin_memory=pin_memory,
-                )
-                lengths = torch.zeros(
-                    (resume_bs,),
-                    dtype=length_dtype,
-                    pin_memory=pin_memory,
-                )
-
-                for start in range(0, len(sequences), resume_bs):
-                    chunk = sequences[start : start + resume_bs]
-                    if not chunk:
-                        continue
-                    max_len = max((len(seq) for seq in chunk), default=0)
-                    width = max(1, max_len)
-                    if width > storage_width:
-                        storage_width = width
-                        length_dtype = length_storage_dtype(storage_width)
-                        tokens = torch.full(
-                            (resume_bs, storage_width),
-                            -1,
-                            dtype=torch.int32,
-                            pin_memory=pin_memory,
-                        )
-                        valid = torch.zeros(
-                            (resume_bs, storage_width),
-                            dtype=torch.uint8,
-                            pin_memory=pin_memory,
-                        )
-                        lengths = torch.zeros(
-                            (resume_bs,),
-                            dtype=length_dtype,
-                            pin_memory=pin_memory,
-                        )
-                    count = len(chunk)
-                    tokens[:count].fill_(-1)
-                    valid[:count].zero_()
-                    lengths[:count].zero_()
-                    for row, seq in enumerate(chunk):
-                        L = len(seq)
-                        if L == 0:
-                            continue
-                        lengths[row] = L
-                        vals = torch.as_tensor(seq, dtype=torch.int32)
-                        tokens[row, :L] = vals
-                        valid[row, :L] = 1
-                    yield tokens[:count, :width], valid[:count, :width], lengths[:count]
-
-        return resume_bs, _SerializedIterable()
-
-    def _build_streamer(
-        *, restore_offsets: Mapping[str, object] | None = None
-    ) -> CorpusStreamer:
-        streamer = CorpusStreamer(
-            data_files,
-            compression=args.compression,
-            num_workers=args.io_workers,
-            max_prefetch=args.prefetch_batches,
-            autoscaler=autoscaler,
-            prefetch_jitter=max(0.0, float(getattr(args, "prefetch_jitter", 0.0))),
-        )
-        if restore_offsets:
-            streamer.restore_offsets(restore_offsets)
-        streamer.start()
-        return streamer
-
+    code_mode_summary: dict[str, object] | None = None
     resume_state: dict[str, object] | None = None
-    resume_batches: Iterable[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None = None
-    # Checkpoint resume flow:
-    # 1. Optionally load serialized state, including packed batches, from the
-    #    requested ``--resume-from`` directory.
-    # 2. When batches are available in the checkpoint metadata we replay them
-    #    directly so the autoscaler restarts from the previous batch size.
-    # 3. Otherwise we fall back to building a fresh :class:`CorpusStreamer`
-    #    pipeline that will be recreated whenever the autoscaler resizes.
-    if args.resume_from:
-        resume_state = trainer.load_checkpoint(str(args.resume_from))
-        payload_mapping = resume_state.get("payload")
-        if isinstance(payload_mapping, Mapping):
-            checkpoint_payload = CheckpointPayload.from_mapping(payload_mapping)
-        else:
-            legacy_meta = resume_state.get("metadata")
-            if isinstance(legacy_meta, Mapping):
-                checkpoint_payload = CheckpointPayload.from_legacy_metadata(legacy_meta)
-            else:
-                checkpoint_payload = CheckpointPayload()
+    streamer: CorpusStreamer | None
+    dataset_tracker: StreamingPackedBatcher | None
+    batches: Iterable[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+    packer: BytePacker | None = None
 
-        model_section = checkpoint_payload.trainer.get("model")
-        if not isinstance(model_section, Mapping):
-            model_section = checkpoint_payload.trainer
-        merge_step = model_section.get("merge_step")
-        print(
-            f"[checkpoint] Restored checkpoint from {args.resume_from}"
-            + (f" at merge {merge_step}" if merge_step is not None else "")
+    if code_mode_active:
+        if args.resume_from:
+            raise SystemExit("--resume-from is not supported when --code-mode is enabled")
+        sequences, code_mode_summary = _load_code_mode_sequences(
+            data_files,
+            bos=args.bos,
+            eos=args.eos,
+            languages=code_langs if code_langs else None,
+            meta_enabled=bool(getattr(args, "meta_compress", False)),
         )
+        batches = PackedBatcher(sequences, batch_size=batch_size, seed=args.seed)
+        streamer = None
+        dataset_tracker = None
+    else:
+        packer = BytePacker(bos=args.bos, eos=args.eos)
 
-        if checkpoint_payload.version != CheckpointPayload.CURRENT_VERSION:
-            print(
-                "[checkpoint] Warning: checkpoint schema version "
-                f"{checkpoint_payload.version} differs from expected "
-                f"{CheckpointPayload.CURRENT_VERSION}",
-                file=sys.stderr,
-            )
+        def _build_serialized_batches(
+            serialized: dict[str, object],
+            default_bs: int,
+        ) -> tuple[int, Iterable[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None]:
+            sequences_raw = serialized.get("sequences", [])
+            sequences: list[list[int]] = []
+            if isinstance(sequences_raw, list):
+                for seq in sequences_raw:
+                    if isinstance(seq, list):
+                        sequences.append([int(token) for token in seq])
+            if not sequences:
+                return 0, None
+            resume_bs = int(serialized.get("active_batch_size") or 0)
+            if resume_bs <= 0:
+                resume_bs = default_bs
 
-        config_errors: list[str] = []
-        config_warnings: list[str] = []
-        target_merges = model_section.get("target_merges")
-        try:
-            target_merges_int = int(target_merges) if target_merges is not None else None
-        except (TypeError, ValueError):
-            target_merges_int = None
-        if target_merges_int is None:
-            merges_list = model_section.get("merges")
-            if isinstance(merges_list, list):
-                target_merges_int = len(merges_list)
-        if target_merges_int is not None and target_merges_int != int(args.merges):
-            config_errors.append(
-                "CLI --merges does not match checkpoint target_merges"
-            )
-        base_vocab_val = model_section.get("base_vocab")
-        try:
-            base_vocab_int = int(base_vocab_val) if base_vocab_val is not None else None
-        except (TypeError, ValueError):
-            base_vocab_int = None
-        if base_vocab_int is not None and base_vocab_int != int(args.base_vocab):
-            config_warnings.append(
-                "CLI --base-vocab does not match checkpoint base_vocab"
-            )
-        for warning in config_warnings:
-            print(f"[checkpoint] Warning: {warning}", file=sys.stderr)
-        if config_errors:
-            for error in config_errors:
-                print(f"[checkpoint] Error: {error}", file=sys.stderr)
-            raise SystemExit("Checkpoint configuration mismatch")
+            class _SerializedIterable:
+                def __iter__(self) -> Iterator[
+                    tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+                ]:
+                    pin_memory = torch.cuda.is_available()
+                    storage_width = 1
+                    length_dtype = length_storage_dtype(storage_width)
+                    tokens = torch.full(
+                        (resume_bs, storage_width),
+                        -1,
+                        dtype=torch.int32,
+                        pin_memory=pin_memory,
+                    )
+                    valid = torch.zeros(
+                        (resume_bs, storage_width),
+                        dtype=torch.uint8,
+                        pin_memory=pin_memory,
+                    )
+                    lengths = torch.zeros(
+                        (resume_bs,),
+                        dtype=length_dtype,
+                        pin_memory=pin_memory,
+                    )
 
-        dataset_meta = checkpoint_payload.dataset
+                    for start in range(0, len(sequences), resume_bs):
+                        chunk = sequences[start : start + resume_bs]
+                        if not chunk:
+                            continue
+                        max_len = max((len(seq) for seq in chunk), default=0)
+                        width = max(1, max_len)
+                        if width > storage_width:
+                            storage_width = width
+                            length_dtype = length_storage_dtype(storage_width)
+                            tokens = torch.full(
+                                (resume_bs, storage_width),
+                                -1,
+                                dtype=torch.int32,
+                                pin_memory=pin_memory,
+                            )
+                            valid = torch.zeros(
+                                (resume_bs, storage_width),
+                                dtype=torch.uint8,
+                                pin_memory=pin_memory,
+                            )
+                            lengths = torch.zeros(
+                                (resume_bs,),
+                                dtype=length_dtype,
+                                pin_memory=pin_memory,
+                            )
+                        count = len(chunk)
+                        tokens[:count].fill_(-1)
+                        valid[:count].zero_()
+                        lengths[:count].zero_()
+                        for row, seq in enumerate(chunk):
+                            L = len(seq)
+                            if L == 0:
+                                continue
+                            lengths[row] = L
+                            vals = torch.as_tensor(seq, dtype=torch.int32)
+                            tokens[row, :L] = vals
+                            valid[row, :L] = 1
+                        yield tokens[:count, :width], valid[:count, :width], lengths[:count]
+
+            return resume_bs, _SerializedIterable()
+
+        def _build_streamer(
+            *, restore_offsets: Mapping[str, object] | None = None
+        ) -> CorpusStreamer:
+            streamer = CorpusStreamer(
+                data_files,
+                compression=args.compression,
+                num_workers=args.io_workers,
+                max_prefetch=args.prefetch_batches,
+                autoscaler=autoscaler,
+                prefetch_jitter=max(0.0, float(getattr(args, "prefetch_jitter", 0.0))),
+            )
+            if restore_offsets:
+                streamer.restore_offsets(restore_offsets)
+            streamer.start()
+            return streamer
+
+        resume_batches: Iterable[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] | None = None
         resume_stream_state: dict[str, object] | None = None
-        serialized_batches = dataset_meta.get("batches") if isinstance(dataset_meta, Mapping) else None
-        if serialized_batches is None:
-            serialized_batches = checkpoint_payload.trainer.get("batches")
-        if isinstance(serialized_batches, dict):
-            restored_bs, restored_iter = _build_serialized_batches(
-                serialized_batches,
-                batch_size,
+        if args.resume_from:
+            resume_state = trainer.load_checkpoint(str(args.resume_from))
+            payload_mapping = resume_state.get("payload")
+            if isinstance(payload_mapping, Mapping):
+                checkpoint_payload = CheckpointPayload.from_mapping(payload_mapping)
+            else:
+                legacy_meta = resume_state.get("metadata")
+                if isinstance(legacy_meta, Mapping):
+                    checkpoint_payload = CheckpointPayload.from_legacy_metadata(
+                        legacy_meta
+                    )
+                else:
+                    checkpoint_payload = CheckpointPayload()
+
+            model_section = checkpoint_payload.trainer.get("model")
+            if not isinstance(model_section, Mapping):
+                model_section = checkpoint_payload.trainer
+            merge_step = model_section.get("merge_step")
+            print(
+                f"[checkpoint] Restored checkpoint from {args.resume_from}"
+                + (f" at merge {merge_step}" if merge_step is not None else "")
             )
-            if restored_bs > 0:
-                batch_size = restored_bs
-            resume_batches = restored_iter
-        if isinstance(dataset_meta, Mapping):
-            stream_offsets = dataset_meta.get("stream_offsets")
-            if isinstance(stream_offsets, Mapping) and stream_offsets:
-                resume_stream_state = {"stream_offsets": dict(stream_offsets)}
-            stream_batch_size = dataset_meta.get("stream_batch_size")
+
+            if checkpoint_payload.version != CheckpointPayload.CURRENT_VERSION:
+                print(
+                    "[checkpoint] Warning: checkpoint schema version "
+                    f"{checkpoint_payload.version} differs from expected "
+                    f"{CheckpointPayload.CURRENT_VERSION}",
+                    file=sys.stderr,
+                )
+
+            config_errors: list[str] = []
+            config_warnings: list[str] = []
+            target_merges = model_section.get("target_merges")
             try:
-                stream_bs_val = (
-                    int(stream_batch_size) if stream_batch_size is not None else None
+                target_merges_int = (
+                    int(target_merges) if target_merges is not None else None
                 )
             except (TypeError, ValueError):
-                stream_bs_val = None
-            if stream_bs_val and stream_bs_val > 0:
-                if resume_stream_state is None:
-                    resume_stream_state = {}
-                resume_stream_state["batch_size"] = stream_bs_val
-
-    streamer: CorpusStreamer | None = None
-    dataset_tracker: StreamingPackedBatcher | None = None
-    if resume_batches is None:
-        restore_offsets = None
-        if resume_stream_state and isinstance(resume_stream_state.get("stream_offsets"), Mapping):
-            restore_offsets = resume_stream_state.get("stream_offsets")
-        streamer = _build_streamer(restore_offsets=restore_offsets)
-        batches: Iterable[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = StreamingPackedBatcher(
-            streamer,
-            packer.encode_view,
-            batch_size=batch_size,
-        )
-        dataset_tracker = batches if isinstance(batches, StreamingPackedBatcher) else None
-        if dataset_tracker and resume_stream_state:
-            dataset_tracker.load_stream_state(resume_stream_state)
-            restored_offsets = resume_stream_state.get("stream_offsets")
-            if isinstance(restored_offsets, Mapping) and restored_offsets:
-                print(
-                    f"[checkpoint] Restored dataset cursor for {len(restored_offsets)} shard(s)"
+                target_merges_int = None
+            if target_merges_int is None:
+                merges_list = model_section.get("merges")
+                if isinstance(merges_list, list):
+                    target_merges_int = len(merges_list)
+            if target_merges_int is not None and target_merges_int != int(args.merges):
+                config_errors.append(
+                    "CLI --merges does not match checkpoint target_merges"
                 )
-    else:
-        batches = resume_batches
+            base_vocab_val = model_section.get("base_vocab")
+            try:
+                base_vocab_int = (
+                    int(base_vocab_val) if base_vocab_val is not None else None
+                )
+            except (TypeError, ValueError):
+                base_vocab_int = None
+            if base_vocab_int is not None and base_vocab_int != int(args.base_vocab):
+                config_warnings.append(
+                    "CLI --base-vocab does not match checkpoint base_vocab"
+                )
+            for warning in config_warnings:
+                print(f"[checkpoint] Warning: {warning}", file=sys.stderr)
+            if config_errors:
+                for error in config_errors:
+                    print(f"[checkpoint] Error: {error}", file=sys.stderr)
+                raise SystemExit("Checkpoint configuration mismatch")
+
+            dataset_meta = checkpoint_payload.dataset
+            serialized_batches = (
+                dataset_meta.get("batches") if isinstance(dataset_meta, Mapping) else None
+            )
+            if serialized_batches is None:
+                serialized_batches = checkpoint_payload.trainer.get("batches")
+            if isinstance(serialized_batches, dict):
+                restored_bs, restored_iter = _build_serialized_batches(
+                    serialized_batches,
+                    batch_size,
+                )
+                if restored_bs > 0:
+                    batch_size = restored_bs
+                resume_batches = restored_iter
+            if isinstance(dataset_meta, Mapping):
+                stream_offsets = dataset_meta.get("stream_offsets")
+                if isinstance(stream_offsets, Mapping) and stream_offsets:
+                    resume_stream_state = {"stream_offsets": dict(stream_offsets)}
+                stream_batch_size = dataset_meta.get("stream_batch_size")
+                try:
+                    stream_bs_val = (
+                        int(stream_batch_size) if stream_batch_size is not None else None
+                    )
+                except (TypeError, ValueError):
+                    stream_bs_val = None
+                if stream_bs_val and stream_bs_val > 0:
+                    if resume_stream_state is None:
+                        resume_stream_state = {}
+                    resume_stream_state["batch_size"] = stream_bs_val
+        
+        streamer = None
         dataset_tracker = None
+        if resume_batches is None:
+            restore_offsets = None
+            if resume_stream_state and isinstance(
+                resume_stream_state.get("stream_offsets"), Mapping
+            ):
+                restore_offsets = resume_stream_state.get("stream_offsets")
+            streamer = _build_streamer(restore_offsets=restore_offsets)
+            batches = StreamingPackedBatcher(
+                streamer,
+                packer.encode_view,
+                batch_size=batch_size,
+            )
+            dataset_tracker = batches if isinstance(batches, StreamingPackedBatcher) else None
+            if dataset_tracker and resume_stream_state:
+                dataset_tracker.load_stream_state(resume_stream_state)
+                restored_offsets = resume_stream_state.get("stream_offsets")
+                if isinstance(restored_offsets, Mapping) and restored_offsets:
+                    print(
+                        f"[checkpoint] Restored dataset cursor for {len(restored_offsets)} shard(s)"
+                    )
+        else:
+            batches = resume_batches
+            dataset_tracker = None
+
     current_batch_size = batch_size
 
     autoscaler_windows: list[dict[str, object]] = []
+    code_mode_resize_warned = False
 
     def _capture_autoscaler_window(summary: dict[str, object]) -> None:
         window = summary.get("autoscaler") if isinstance(summary, dict) else None
@@ -698,11 +930,19 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
             autoscaler_windows.append(dict(window))
 
     def _handle_batch_resize(new_bs: int) -> None:
-        nonlocal batches, current_batch_size, streamer, dataset_tracker
+        nonlocal batches, current_batch_size, streamer, dataset_tracker, code_mode_resize_warned
         if new_bs <= 0 or new_bs == current_batch_size:
             return
+        if code_mode_active:
+            if not code_mode_resize_warned:
+                print(
+                    "[code-mode] Autoscaler resize ignored; batches are pre-packed",
+                    file=sys.stderr,
+                )
+                code_mode_resize_warned = True
+            return
         current_batch_size = new_bs
-        if streamer is None:
+        if streamer is None or packer is None:
             return
         # Autoscaler triggered a resize: tear down the current streamer so it
         # restarts with the new batch size and refreshed packing layout.
@@ -742,6 +982,8 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
             streamer.close()
     if args.out_dir:
         trainer.save(args.out_dir)
+    if code_mode_summary:
+        meta.setdefault("code_mode", {}).update(code_mode_summary)
     if autoscaler_windows:
         telemetry = meta.setdefault("telemetry", {})
         autoscaler_meta = telemetry.setdefault("autoscaler", {})
@@ -774,6 +1016,14 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
         raise SystemExit("train-unigram requires at least one --data glob pattern")
     data_files = _expand_data_patterns(data_patterns)
     trainer, trainer_config = _build_unigram_trainer(args)
+    code_langs = _normalize_code_languages(getattr(args, "code_langs", None))
+    code_mode_active = bool(getattr(args, "code_mode", False))
+    code_mode_config: dict[str, object] = {
+        "enabled": code_mode_active,
+        "meta_compress": bool(getattr(args, "meta_compress", False)),
+    }
+    if code_langs:
+        code_mode_config["languages"] = sorted(code_langs)
     config = dict(trainer_config)
     config.update(
         {
@@ -785,6 +1035,7 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
             },
             "output": args.out_dir,
             "dry_run": bool(getattr(args, "dry_run", False)),
+            "code_mode": code_mode_config,
         }
     )
     _log_resolved_config("train-unigram", config)
@@ -792,7 +1043,17 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
         print("[dry-run] train-unigram initialization complete")
         return
 
-    sequences = _load_sequences(data_files, bos=args.bos, eos=args.eos)
+    code_mode_summary: dict[str, object] | None = None
+    if code_mode_active:
+        sequences, code_mode_summary = _load_code_mode_sequences(
+            data_files,
+            bos=args.bos,
+            eos=args.eos,
+            languages=code_langs if code_langs else None,
+            meta_enabled=bool(getattr(args, "meta_compress", False)),
+        )
+    else:
+        sequences = _load_sequences(data_files, bos=args.bos, eos=args.eos)
 
     batches = _build_unigram_batches(sequences, batch_size=args.batch_size, seed=args.seed)
     for epoch in range(args.epochs):
@@ -800,6 +1061,12 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
         print(f"epoch {epoch + 1}: {stats}")
     if args.out_dir:
         trainer.save(args.out_dir)
+    if code_mode_summary:
+        print(
+            "[code-mode] processed {samples} samples (ast={ast_samples}, fallback={fallback_samples})".format(
+                **code_mode_summary
+            )
+        )
 
 
 def _cmd_train_hybrid(args: argparse.Namespace) -> None:
@@ -810,6 +1077,15 @@ def _cmd_train_hybrid(args: argparse.Namespace) -> None:
         raise SystemExit("train-hybrid requires at least one --data glob pattern")
     data_files = _expand_data_patterns(data_patterns)
     warm_start_merges = _load_warm_start_merges(getattr(args, "warm_start", None))
+
+    code_langs = _normalize_code_languages(getattr(args, "code_langs", None))
+    code_mode_active = bool(getattr(args, "code_mode", False))
+    code_mode_config: dict[str, object] = {
+        "enabled": code_mode_active,
+        "meta_compress": bool(getattr(args, "meta_compress", False)),
+    }
+    if code_langs:
+        code_mode_config["languages"] = sorted(code_langs)
 
     config = {
         "trainer": {
@@ -841,6 +1117,7 @@ def _cmd_train_hybrid(args: argparse.Namespace) -> None:
         },
         "output": args.out_dir,
         "dry_run": bool(getattr(args, "dry_run", False)),
+        "code_mode": code_mode_config,
     }
 
     _log_resolved_config("train-hybrid", config)
@@ -848,7 +1125,17 @@ def _cmd_train_hybrid(args: argparse.Namespace) -> None:
         print("[dry-run] train-hybrid initialization complete")
         return
 
-    sequences = _load_sequences(data_files, bos=args.bos, eos=args.eos)
+    code_mode_summary: dict[str, object] | None = None
+    if code_mode_active:
+        sequences, code_mode_summary = _load_code_mode_sequences(
+            data_files,
+            bos=args.bos,
+            eos=args.eos,
+            languages=code_langs if code_langs else None,
+            meta_enabled=bool(getattr(args, "meta_compress", False)),
+        )
+    else:
+        sequences = _load_sequences(data_files, bos=args.bos, eos=args.eos)
     batches = list(
         _iter_packed_batches(sequences, batch_size=args.batch_size, seed=args.seed)
     )
@@ -876,6 +1163,13 @@ def _cmd_train_hybrid(args: argparse.Namespace) -> None:
         bpe_fit_kwargs=bpe_fit_kwargs,
     )
     print(summary)
+
+    if code_mode_summary:
+        print(
+            "[code-mode] processed {samples} samples (ast={ast_samples}, fallback={fallback_samples})".format(
+                **code_mode_summary
+            )
+        )
 
     if args.out_dir:
         trainer.save(args.out_dir)
@@ -969,6 +1263,22 @@ def _parser() -> argparse.ArgumentParser:
     common.add_argument("--eos", type=int, default=None, help="Optional EOS token id")
     common.add_argument("--seed", type=int, default=1337, help="Shuffle seed")
     common.add_argument("--device", type=str, default=None, help="Torch device override")
+    common.add_argument(
+        "--code-mode",
+        action="store_true",
+        help="Enable AST-aware preprocessing for code corpora",
+    )
+    common.add_argument(
+        "--code-langs",
+        nargs="+",
+        default=None,
+        help="Restrict code-mode preprocessing to specific languages (e.g. python typescript)",
+    )
+    common.add_argument(
+        "--meta-compress",
+        action="store_true",
+        help="Enable meta-token compression when running in code mode",
+    )
     common.add_argument(
         "--compression",
         type=str,

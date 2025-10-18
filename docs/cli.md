@@ -4,6 +4,7 @@ SuperToken ships a single `main.py` entry point that exposes tokenizer training 
 
 ## Quick Navigation
 - [Global flags](#global-flags)
+- [Code mode workflows](#code-mode-workflows)
 - [`train-bpe`](#train-bpe)
 - [`train-unigram`](#train-unigram)
 - [`train-hybrid`](#train-hybrid)
@@ -23,9 +24,19 @@ Each subcommand inherits a shared set of options that configure inputs, autoscal
 | `--io-workers` | Number of background workers used for streaming ingestion. |
 | `--prefetch-batches` | Size of the host-side batch queue that feeds the GPU. |
 | `--target-util` | Desired GPU utilization ratio (0–1) forwarded to the autoscaler. |
-| `--log-json` | Emit JSON-formatted logs suitable for ingestion by dashboards. |
+| `--code-mode` | Enable the AST-based code preprocessing pipeline for JSON or source inputs. |
+| `--code-langs` | Optional allowlist of languages to process when code mode is active. |
+| `--meta-compress` | Discover and apply meta-token compression when code mode is active. |
 
 These options map directly onto the streaming and autoscaling layers documented in the [architecture overview](architecture.md#dataset-and-streaming-layers) and the [API reference](api.md#autoscaler).
+
+## Code mode workflows
+
+Pass `--code-mode` to any training subcommand to swap the default byte-stream ingestion for an AST-aware pipeline tailored to source code repositories. Code mode accepts newline-delimited JSON (`*.jsonl`/`*.ndjson`), JSON manifests containing an `entries` array, or raw source files (`.py`, `.pyi`, `.ts`, `.tsx`, `.js`, `.jsx`). Each structured entry must provide a `language`, `source`, and optional `filename`. When raw files are supplied the language is inferred from the extension; the `--code-langs` allowlist filters entries that the current run should process.
+
+AST linearisation produces canonical placeholder tokens for identifiers and literals while preserving metadata about the originating language and file. When `--meta-compress` is present the pipeline also discovers repeating token patterns and replaces them with synthetic `META*` markers to reduce downstream token counts. Any entry that fails AST parsing automatically falls back to byte-level tokenisation; the CLI flags these fallbacks in the emitted summaries so corpus issues remain visible.
+
+Because code-mode corpora are pre-packed in memory, the BPE trainer ignores autoscaler resize requests and disables `--resume-from` checkpoints for these runs. Checkpointing continues to work for unigram and hybrid trainers because their batches are replayed locally.
 
 ## `train-bpe`
 Train a byte-pair encoding tokenizer backed by GPU kernels:
@@ -45,6 +56,9 @@ Key arguments:
 - `--token-bytes`: Maximum packed byte length per batch.
 - `--checkpoint-dir`: Directory for periodic checkpoints.
 - `--checkpoint-every`: Number of steps between checkpoints.
+- `--code-mode`: Preprocess structured code entries instead of byte streams. When enabled the trainer loads corpora eagerly and ignores autoscaler resize events.
+- `--code-langs`: Restrict code-mode runs to specific languages (for example `--code-langs python typescript`).
+- `--meta-compress`: Discover and apply meta-token compression on AST sequences.
 
 Behind the scenes the [`GPUBPETrainer`](../gpu_tokenizer/bpe_trainer.py) collaborates with the autoscaler, dataset readers, and checkpoint writers described in the [architecture overview](architecture.md#trainer-pipeline).
 
@@ -92,6 +106,9 @@ Important options:
 - `--vocab-size`: Target vocabulary size after pruning.
 - `--epochs`: Number of passes over the corpus.
 - `--min-prob`: Optional probability floor for retention.
+- `--code-mode`: Enable the code-mode ingestion pipeline for JSON or source code repositories.
+- `--code-langs`: Optional allowlist applied when `--code-mode` is set.
+- `--meta-compress`: Toggle meta-token discovery while preparing code-mode corpora.
 
 The [`GPUUnigramTrainer`](../gpu_tokenizer/unigram_trainer.py) reuses the same streaming and autoscaling primitives; refer to the [API reference](api.md#trainers) for extension hooks.
 
@@ -113,6 +130,9 @@ Key arguments:
 - `--unigram-epochs`: Epochs to run inside each unigram phase.
 - `--warm-start`: Optional path to a JSON manifest containing seeded merge pairs.
 - `--checkpoint-dir`: Directory where per-cycle checkpoints are stored.
+- `--code-mode`: Run both phases on AST-linearised corpora.
+- `--code-langs`: Filter the code-mode corpus to specific languages.
+- `--meta-compress`: Share meta-token compression dictionaries across BPE and unigram phases.
 
 After training the command emits a `hybrid_manifest.json`, Hugging Face-compatible `merges.txt`/`tokenizer.json`, and a SentencePiece-style `unigram.prob`/`unigram.model` pair for downstream consumers. The [`HybridTrainer`](../gpu_tokenizer/trainers/hybrid.py) section of the API reference describes the orchestration hooks in more detail.
 

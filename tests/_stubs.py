@@ -133,6 +133,7 @@ def install_torch_stub() -> None:
     utils_stub.cpp_extension = cpp_stub
 
     torch_stub.jit = types.SimpleNamespace(script=lambda fn: fn)
+    torch_stub.__super_token_stub__ = True
 
     sys.modules["torch"] = torch_stub
     sys.modules["torch.distributed"] = dist_stub
