@@ -12,6 +12,7 @@ import torch
 
 from ..bpe_trainer import GPUBPETrainer
 from ..unigram_trainer import GPUUnigramTrainer
+from ..utils import hash_merge_pair
 from .base import BaseTrainer, CheckpointPayload
 
 
@@ -346,6 +347,10 @@ class HybridTrainer(BaseTrainer):
         unigram_epochs: int = 1,
         max_unigram_len: int = 8,
         warm_start_merges: Sequence[tuple[int, int]] | None = None,
+        privacy_mode: bool = False,
+        randomize_ties: bool | None = None,
+        tie_seed: int | None = None,
+        privacy_salt: bytes | bytearray | str | None = None,
         bpe_trainer_factory: Callable[..., GPUBPETrainer] = GPUBPETrainer,
         unigram_trainer_factory: Callable[..., GPUUnigramTrainer] = GPUUnigramTrainer,
         bpe_init_kwargs: Mapping[str, Any] | None = None,
@@ -370,6 +375,43 @@ class HybridTrainer(BaseTrainer):
         self._unigram_init_kwargs = dict(unigram_init_kwargs or {})
         self._bpe_fit_kwargs = dict(bpe_fit_kwargs or {})
         self._unigram_fit_kwargs = dict(unigram_fit_kwargs or {})
+        privacy_flag = bool(privacy_mode)
+        if randomize_ties is None:
+            randomize_flag = privacy_flag
+        else:
+            randomize_flag = bool(randomize_ties)
+        tie_seed_value: int | None = int(tie_seed) if tie_seed is not None else None
+        if isinstance(privacy_salt, (bytes, bytearray)):
+            salt_bytes = bytes(privacy_salt)
+        elif isinstance(privacy_salt, str):
+            salt_bytes = privacy_salt.encode("utf-8")
+        else:
+            salt_bytes = b""
+        if "privacy_mode" not in self._bpe_init_kwargs:
+            self._bpe_init_kwargs["privacy_mode"] = privacy_flag
+        if "randomize_ties" not in self._bpe_init_kwargs and (
+            randomize_ties is not None or privacy_flag
+        ):
+            self._bpe_init_kwargs["randomize_ties"] = randomize_flag
+        if "tie_seed" not in self._bpe_init_kwargs and (
+            tie_seed_value is not None or randomize_flag
+        ):
+            seed_payload = int(tie_seed_value) if tie_seed_value is not None else 0
+            self._bpe_init_kwargs["tie_seed"] = seed_payload
+        if "privacy_salt" not in self._bpe_init_kwargs and (
+            privacy_salt is not None or privacy_flag
+        ):
+            salt_payload: bytes | bytearray | str | None
+            if privacy_salt is not None:
+                salt_payload = privacy_salt
+            else:
+                salt_payload = salt_bytes if salt_bytes else None
+            self._bpe_init_kwargs["privacy_salt"] = salt_payload
+        self.privacy_mode = privacy_flag
+        self.randomize_ties = randomize_flag
+        self.tie_seed = tie_seed_value
+        self._privacy_salt_input = privacy_salt
+        self._privacy_hash_salt = salt_bytes
         self._phase_history: list[dict[str, Any]] = []
         self._final_merges: list[tuple[int, int]] = []
         self._final_logp: torch.Tensor | None = None
@@ -380,6 +422,12 @@ class HybridTrainer(BaseTrainer):
 
     # ------------------------------------------------------------------
     # Lifecycle helpers
+    def _manifest_merges(self) -> list[object]:
+        if not self.privacy_mode:
+            return [list(map(int, pair)) for pair in self._final_merges]
+        salt = self._privacy_hash_salt
+        return [hash_merge_pair((int(left), int(right)), salt) for left, right in self._final_merges]
+
     def fit(
         self,
         batches: Iterable[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
@@ -651,7 +699,7 @@ class HybridTrainer(BaseTrainer):
             "base_vocab": self.base_vocab,
             "vocab_size": self.base_vocab + len(self._final_merges),
             "cycles": self._completed_cycles,
-            "merges": [list(map(int, pair)) for pair in self._final_merges],
+            "merges": self._manifest_merges(),
             "unigram_logp": (
                 self._final_logp.detach().cpu().tolist()
                 if isinstance(self._final_logp, torch.Tensor)
@@ -662,6 +710,14 @@ class HybridTrainer(BaseTrainer):
             },
             "phase_history": _sanitize_for_json(self._phase_history),
         }
+        if self.privacy_mode:
+            manifest["privacy_mode"] = True
+            manifest["merge_count"] = len(self._final_merges)
+            manifest["randomize_ties"] = bool(self.randomize_ties)
+            if self.tie_seed is not None or self.randomize_ties:
+                manifest["tie_seed"] = (
+                    int(self.tie_seed) if self.tie_seed is not None else 0
+                )
         with open(manifest_path, "w", encoding="utf-8") as handle:
             json.dump(manifest, handle, indent=2, sort_keys=True)
         return {"manifest": os.fspath(manifest_path)}

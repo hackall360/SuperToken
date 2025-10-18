@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import hashlib
 import logging
 import os
 import socket
@@ -131,6 +132,29 @@ def peer_copy_tensor(
         return False
 
     return True
+
+
+def hash_merge_pair(
+    pair: Tuple[int, int],
+    salt: bytes | bytearray | str | None = None,
+) -> str:
+    """Return a stable privacy-preserving digest for ``pair``."""
+
+    if isinstance(salt, str):
+        salt_bytes = salt.encode("utf-8")
+    elif isinstance(salt, (bytes, bytearray)):
+        salt_bytes = bytes(salt)
+    elif salt is None:
+        salt_bytes = b""
+    else:  # pragma: no cover - defensive fallback for odd salt types
+        salt_bytes = str(salt).encode("utf-8")
+
+    left, right = (int(pair[0]), int(pair[1]))
+    digest = hashlib.sha256()
+    digest.update(salt_bytes)
+    digest.update(left.to_bytes(8, "big", signed=False))
+    digest.update(right.to_bytes(8, "big", signed=False))
+    return digest.hexdigest()
 
 
 def _clear_cached_process_groups() -> None:

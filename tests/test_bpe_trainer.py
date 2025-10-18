@@ -1,7 +1,10 @@
-import pytest
+import json
+import time
+from pathlib import Path
 from types import MethodType
 from typing import Sequence
-import time
+
+import pytest
 
 torch = pytest.importorskip("torch")
 if getattr(torch, "_SUPERTOKEN_TORCH_STUB", False) or not hasattr(torch, "tensor"):
@@ -32,7 +35,7 @@ from gpu_tokenizer.cpu_fastpath import (
     count_pairs_fastpath,
     should_route_to_cpu,
 )
-from gpu_tokenizer.utils import apply_merge_once, count_pairs
+from gpu_tokenizer.utils import apply_merge_once, count_pairs, hash_merge_pair
 from tests.adversarial_corpora import get_adversarial_corpora
 
 
@@ -183,6 +186,60 @@ def test_reprocessing_chunk_matches_baseline_vocab_and_merges():
     assert retry_result["vocab_size"] == baseline_result["vocab_size"]
     assert retry_result["merges"] == baseline_result["merges"]
     assert len(retry_trainer.merges) == len(set(retry_trainer.merges))
+
+
+def test_tie_breaker_respects_randomization(tmp_path: Path):
+    seqs = [
+        [0, 1, 0, 1],
+        [0, 2, 0, 2],
+    ]
+    batch = _make_batch(seqs)
+
+    deterministic = GPUBPETrainer(
+        base_vocab=16, merges=1, device="cpu", randomize_ties=False
+    )
+    deterministic.fit([batch], log_every=100)
+    assert deterministic.merges == [(0, 1)]
+
+    seeded_a = GPUBPETrainer(
+        base_vocab=16, merges=1, device="cpu", randomize_ties=True, tie_seed=123
+    )
+    seeded_b = GPUBPETrainer(
+        base_vocab=16, merges=1, device="cpu", randomize_ties=True, tie_seed=123
+    )
+    seeded_c = GPUBPETrainer(
+        base_vocab=16, merges=1, device="cpu", randomize_ties=True, tie_seed=456
+    )
+
+    seeded_a.fit([batch], log_every=100)
+    seeded_b.fit([batch], log_every=100)
+    seeded_c.fit([batch], log_every=100)
+
+    assert seeded_a.merges == seeded_b.merges
+    assert seeded_a.merges in ([(0, 1)], [(0, 2)])
+    assert seeded_c.merges in ([(0, 1)], [(0, 2)])
+    assert seeded_c.merges != seeded_a.merges
+
+
+def test_privacy_mode_redacts_merge_metadata(tmp_path: Path):
+    trainer = GPUBPETrainer(
+        base_vocab=32,
+        merges=1,
+        device="cpu",
+        privacy_mode=True,
+        randomize_ties=False,
+        tie_seed=7,
+        privacy_salt=b"secret",
+    )
+    trainer.merges = [(1, 2)]
+    trainer.vocab_size = trainer.base_vocab + len(trainer.merges)
+    paths = trainer.save_artifacts(tmp_path)
+    meta_path = Path(paths["metadata"])
+    payload = json.loads(meta_path.read_text("utf-8"))
+    assert payload["privacy_mode"] is True
+    assert payload["merge_count"] == 1
+    assert payload["merges"][0] == hash_merge_pair((1, 2), b"secret")
+    assert all(isinstance(entry, str) for entry in payload["merges"])
 
 
 def test_cpu_fastpath_pair_count_matches_baseline():
