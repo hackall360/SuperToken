@@ -6,6 +6,7 @@ This reference collects the most commonly extended classes and functions in Supe
 - [Trainers](#trainers)
 - [Autoscaler](#autoscaler)
 - [Datasets](#datasets)
+- [Code mode helpers](#code-mode-helpers)
 - [I/O and streaming](#io-and-streaming)
 - [Checkpointing](#checkpointing)
 - [CLI helpers](#cli-helpers)
@@ -57,6 +58,15 @@ Entry points live in [`gpu_tokenizer/datasets/__init__.py`](../gpu_tokenizer/dat
 - **`ChainedCorpus`**: Combines multiple corpora while maintaining consistent interfaces.
 
 Datasets are composable: you can wrap corpora with filters, sampling policies, or metadata enrichers before handing them to a trainer. The [architecture overview](architecture.md#dataset-and-streaming-layers) illustrates how these iterables feed the GPU.
+
+## Code mode helpers
+The code-mode pipeline lives under [`gpu_tokenizer/code_mode/`](../gpu_tokenizer/code_mode). It transforms structured source samples into canonical token sequences that downstream trainers can consume.
+
+- **`prepare_corpus(entries, meta_enabled=True, meta_max_length=8)`**: Accepts dictionaries containing `language`, `source`, and optional `filename` fields. Returns a `CodeModeCorpus` with AST-linearised samples, byte-level fallbacks, and an optional meta-token dictionary.
+- **`MetaTokenCompressor`**: Discovers frequently occurring token runs and rewrites them as compact `META*` placeholders when `meta_enabled` is true. The compressor enforces a configurable maximum pattern length so merges remain interpretable.
+- **`linearize_python_source` / `linearize_typescript_source`**: Language-specific front-ends that produce placeholder-rich token streams and symbol sidecars.
+
+The CLI integrates these helpers via `--code-mode`, `--code-langs`, and `--meta-compress`. When AST parsing fails the pipeline emits byte-level fallbacks that retain metadata (`fallback=True`) so you can audit corpus quality. BPE code-mode runs load the entire corpus eagerly and therefore ignore autoscaler resize events and `--resume-from` checkpoints, whereas unigram and hybrid trainers operate on reusable in-memory batches.
 
 ## I/O and Streaming
 Defined across [`gpu_tokenizer/io/__init__.py`](../gpu_tokenizer/io/__init__.py) and helper modules.
