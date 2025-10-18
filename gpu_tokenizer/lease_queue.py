@@ -78,6 +78,8 @@ class LeaseNotary:
         self._rank_weights: Dict[int, float] = {}
         self._rank_lease_scale: Dict[int, float] = {}
         self._rank_max_active: Dict[int, int] = {}
+        self._rank_throughput: Dict[int, float] = {}
+        self._rank_last_lease: Dict[int, int] = {}
         self._min_lease_size = int(min_lease_size)
         self._max_lease_size = int(max_lease_size) if max_lease_size is not None else None
         self._max_active_leases = int(max_active_leases)
@@ -126,6 +128,98 @@ class LeaseNotary:
 
         with self._lock:
             self._record_idle_locked(rank, duration_s)
+
+    def apply_feedback(
+        self,
+        rank: int,
+        *,
+        completed_tokens: int,
+        duration_s: Optional[float] = None,
+        idle_duration_s: float = 0.0,
+    ) -> Dict[str, float]:
+        """Update adaptive lease parameters using throughput feedback."""
+
+        tokens = max(0, int(completed_tokens))
+        try:
+            elapsed = float(duration_s) if duration_s is not None else 0.0
+        except (TypeError, ValueError):
+            elapsed = 0.0
+        idle = float(idle_duration_s) if idle_duration_s is not None else 0.0
+
+        with self._lock:
+            if idle > 0.0 and math.isfinite(idle):
+                self._record_idle_locked(rank, idle)
+
+            if elapsed > 0.0 and math.isfinite(elapsed):
+                sample = float(tokens) / elapsed if tokens > 0 else 0.0
+            else:
+                sample = float(tokens)
+
+            if not math.isfinite(sample):
+                sample = 0.0
+
+            prev = self._rank_throughput.get(rank)
+            if prev is None or not math.isfinite(prev):
+                ewma = sample
+            else:
+                alpha = 0.2
+                ewma = (alpha * sample) + ((1.0 - alpha) * prev)
+
+            if not math.isfinite(ewma):
+                ewma = 0.0
+
+            self._rank_throughput[int(rank)] = ewma
+
+            values = [
+                value
+                for value in self._rank_throughput.values()
+                if value > 0.0 and math.isfinite(value)
+            ]
+            average = sum(values) / len(values) if values else (ewma if ewma > 0.0 else 1.0)
+            if not math.isfinite(average) or average <= 0.0:
+                average = 1.0
+
+            raw_scale = ewma / average if average > 0.0 else 1.0
+            if not math.isfinite(raw_scale) or raw_scale <= 0.0:
+                raw_scale = self._rank_lease_scale.get(rank, 1.0)
+            min_scale = 0.25
+            max_scale = 4.0
+            raw_scale = max(min_scale, min(max_scale, raw_scale))
+
+            prev_scale = self._rank_lease_scale.get(rank)
+            if prev_scale is None or prev_scale <= 0.0 or not math.isfinite(prev_scale):
+                scale = raw_scale
+            else:
+                lower = max(min_scale, prev_scale * 0.5)
+                upper = min(max_scale, prev_scale * 1.5)
+                scale = max(lower, min(raw_scale, upper))
+            self._rank_lease_scale[int(rank)] = scale
+
+            target_limit = int(round(scale * float(self._max_active_leases)))
+            target_limit = max(1, min(self._max_active_leases, target_limit))
+            prev_limit = self._rank_max_active.get(rank)
+            if prev_limit is None or prev_limit <= 0:
+                limit = target_limit
+            elif target_limit > prev_limit:
+                limit = min(self._max_active_leases, prev_limit + 1)
+            elif target_limit < prev_limit:
+                limit = max(1, prev_limit - 1)
+            else:
+                limit = prev_limit
+            self._rank_max_active[int(rank)] = limit
+
+            idle_stats = self._idle_metrics.get(int(rank), {})
+            idle_ewma_s = float(idle_stats.get("ewma_s", 0.0)) if idle_stats else 0.0
+            last_width = int(self._rank_last_lease.get(int(rank), self._min_lease_size))
+
+            return {
+                "throughput": ewma,
+                "scale": scale,
+                "max_active": limit,
+                "idle_ewma_s": idle_ewma_s,
+                "idle_ewma_ms": idle_ewma_s * 1000.0,
+                "lease_width": last_width,
+            }
 
     def idle_metrics(self) -> Dict[int, Dict[str, float]]:
         """Return a snapshot of the accumulated idle telemetry."""
@@ -221,6 +315,7 @@ class LeaseNotary:
                 self._next_chunk_id += 1
                 lease = Lease(start, end, chunk_id)
                 self._next_idx = end
+            self._rank_last_lease[rank] = max(0, lease.end - lease.start)
             self._record_new_chunk(lease, attempts=attempts_increment)
 
             now = self._now()
@@ -369,6 +464,8 @@ class LeaseNotary:
                 "rank_weights": dict(self._rank_weights),
                 "rank_lease_scale": dict(self._rank_lease_scale),
                 "rank_max_active": dict(self._rank_max_active),
+                "rank_throughput": dict(self._rank_throughput),
+                "rank_last_lease": dict(self._rank_last_lease),
                 "min_lease_size": self._min_lease_size,
                 "max_lease_size": self._max_lease_size,
                 "max_active_leases": self._max_active_leases,
@@ -399,6 +496,8 @@ class LeaseNotary:
         rank_weights_raw = state.get("rank_weights", {})
         rank_lease_scale_raw = state.get("rank_lease_scale", {})
         rank_max_active_raw = state.get("rank_max_active", {})
+        rank_throughput_raw = state.get("rank_throughput", {})
+        rank_last_lease_raw = state.get("rank_last_lease", {})
         min_lease_size = int(state.get("min_lease_size", self._min_lease_size))
         raw_max_lease = state.get("max_lease_size", self._max_lease_size)
         max_active_leases = int(state.get("max_active_leases", self._max_active_leases))
@@ -502,6 +601,30 @@ class LeaseNotary:
                     continue
                 rank_max_active[rank] = limit
 
+        rank_throughput: Dict[int, float] = {}
+        if isinstance(rank_throughput_raw, dict):
+            for raw_rank, raw_value in rank_throughput_raw.items():
+                try:
+                    rank = int(raw_rank)
+                    value = float(raw_value)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(value):
+                    continue
+                rank_throughput[rank] = value
+
+        rank_last_lease: Dict[int, int] = {}
+        if isinstance(rank_last_lease_raw, dict):
+            for raw_rank, raw_value in rank_last_lease_raw.items():
+                try:
+                    rank = int(raw_rank)
+                    width = int(raw_value)
+                except (TypeError, ValueError):
+                    continue
+                if width <= 0:
+                    continue
+                rank_last_lease[rank] = width
+
         idle_metrics_raw = state.get("idle_metrics", {})
         idle_metrics: Dict[int, Dict[str, float]] = {}
         if isinstance(idle_metrics_raw, dict):
@@ -568,6 +691,8 @@ class LeaseNotary:
                 rank: min(limit, self._max_active_leases)
                 for rank, limit in rank_max_active.items()
             }
+            self._rank_throughput = rank_throughput
+            self._rank_last_lease = rank_last_lease
             self._min_lease_size = min_lease_size
             self._max_lease_size = max_lease_size
             self._max_active_leases = max_active_leases
@@ -661,4 +786,28 @@ class LeaseNotary:
 
         with self._lock:
             return dict(self._rank_weights)
+
+    def rank_status(self) -> Dict[int, Dict[str, float]]:
+        """Return a snapshot of adaptive lease parameters per rank."""
+
+        with self._lock:
+            ranks = (
+                set(self._rank_weights)
+                | set(self._rank_lease_scale)
+                | set(self._rank_max_active)
+                | set(self._rank_throughput)
+                | set(self._rank_last_lease)
+                | set(self._idle_metrics)
+            )
+            status: Dict[int, Dict[str, float]] = {}
+            for rank in sorted(ranks):
+                idle_stats = self._idle_metrics.get(rank, {})
+                status[rank] = {
+                    "scale": float(self._rank_lease_scale.get(rank, 1.0)),
+                    "max_active": float(self._rank_max_active.get(rank, self._max_active_leases)),
+                    "throughput": float(self._rank_throughput.get(rank, 0.0)),
+                    "lease_width": float(self._rank_last_lease.get(rank, self._min_lease_size)),
+                    "idle_ewma_ms": float(idle_stats.get("ewma_s", 0.0)) * 1000.0,
+                }
+            return status
 

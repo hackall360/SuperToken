@@ -152,6 +152,7 @@ class DistributedLeaseClient:
         self.world_size = world_size
         self._host_state = host_state
         self._root = root
+        self._idle_accumulator = 0.0
 
     @property
     def total_chunks(self) -> int:
@@ -280,7 +281,48 @@ class DistributedLeaseClient:
     def record_idle(self, duration_s: float) -> None:
         """Record *duration_s* seconds of idle time for this rank."""
 
-        self._host_state.notary.record_idle(self.rank, duration_s)
+        try:
+            idle = float(duration_s)
+        except (TypeError, ValueError):
+            return
+        if idle <= 0.0 or not math.isfinite(idle):
+            return
+        self._idle_accumulator += idle
+        with self._host_state.lock:
+            self._host_state.notary.record_idle(self.rank, idle)
+
+    def drain_idle_time(self) -> float:
+        """Return and reset the accumulated idle time since last feedback."""
+
+        idle = self._idle_accumulator
+        self._idle_accumulator = 0.0
+        return idle
+
+    def feedback(
+        self,
+        completed_tokens: int,
+        *,
+        duration_s: float | None = None,
+        idle_duration_s: float | None = None,
+    ) -> Dict[str, float]:
+        """Propagate throughput feedback to the shared :class:`LeaseNotary`."""
+
+        tokens = max(0, int(completed_tokens))
+        idle = idle_duration_s if idle_duration_s is not None else self.drain_idle_time()
+        self._idle_accumulator = 0.0
+        with self._host_state.lock:
+            return self._host_state.notary.apply_feedback(
+                self.rank,
+                completed_tokens=tokens,
+                duration_s=duration_s,
+                idle_duration_s=idle if idle is not None else 0.0,
+            )
+
+    def lease_status(self) -> Dict[int, Dict[str, float]]:
+        """Return the current adaptive lease telemetry for all ranks."""
+
+        with self._host_state.lock:
+            return self._host_state.notary.rank_status()
 
     def iter_leases(self, preferred_size: int) -> Iterator[Tuple[int, int, int]]:
         while True:
