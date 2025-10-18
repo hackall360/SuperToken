@@ -33,7 +33,8 @@ SuperToken is a GPU-accelerated tokenizer toolkit that offers high-throughput by
 - **CPU parity mode** for the unigram trainer, reusing the same candidate extension, forward/backward scoring, and pruning logic when CUDA is unavailable.
 - **Adaptive autoscaling** batch suggestion system to maintain target GPU utilization using the `AutoScaler` utility.
 - **Streaming corpus ingestion** with optional compression, memory-mapped shards, and background worker prefetch.
-- **Packed sequence helpers** that minimize host-device transfers and keep kernels fed with contiguous bytes.
+- **Opt-in morphology preprocessing** powered by pluggable annotators. Keep token statistics stable by default and selectively
+  enable language-specific passes when you need them.
 
 ## Installation
 This project requires Python 3.10+ and a working PyTorch installation with CUDA support.
@@ -149,6 +150,26 @@ Common flags include:
 - `--bos`/`--eos`: Optionally inject special token IDs during packing.
 
 Run `python main.py --help` for a full list of options.
+
+### Morphology plugins (opt-in)
+
+SuperToken ships with a small, safe-by-default morphology layer that leaves byte streams untouched unless explicitly enabled.
+Plugins pre-segment text before it reaches the `BytePacker`, which can improve compression ratios for agglutinative languages
+at the cost of changing downstream token statistics. To enable a plugin, pass `--morphology-lang` with one of the advertised
+language codes (for example, `tr` for the bundled Turkish segmenter):
+
+```bash
+python main.py train-bpe \
+  --data "data/**/*.txt" \
+  --merges 50000 \
+  --morphology-lang tr \
+  --morphology-case-markers \
+  --out-dir ./artifacts/bpe-tr
+```
+
+Leave the flag unset to retain the raw byte stream. See [docs/api.md](docs/api.md#morphology-plugins) for the plugin interface
+and [docs/cookbook/morphology.md](docs/cookbook/morphology.md) for an end-to-end recipe that trains with the Turkish plugin and
+verifies reconstruction fidelity.
 
 ## Architecture & API Overview
 

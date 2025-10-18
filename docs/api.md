@@ -6,6 +6,7 @@ This reference collects the most commonly extended classes and functions in Supe
 - [Trainers](#trainers)
 - [Autoscaler](#autoscaler)
 - [Datasets](#datasets)
+- [Morphology plugins](#morphology-plugins)
 - [Code mode helpers](#code-mode-helpers)
 - [I/O and streaming](#io-and-streaming)
 - [Checkpointing](#checkpointing)
@@ -58,6 +59,23 @@ Entry points live in [`gpu_tokenizer/datasets/__init__.py`](../gpu_tokenizer/dat
 - **`ChainedCorpus`**: Combines multiple corpora while maintaining consistent interfaces.
 
 Datasets are composable: you can wrap corpora with filters, sampling policies, or metadata enrichers before handing them to a trainer. The [architecture overview](architecture.md#dataset-and-streaming-layers) illustrates how these iterables feed the GPU.
+
+## Morphology plugins
+
+Morphology preprocessing hooks live in [`gpu_tokenizer/morphology/`](../gpu_tokenizer/morphology). They are **opt-in**; the CLI
+does not activate any plugin unless `--morphology-lang` is specified. Leaving the flag unset guarantees that byte sequences fed
+into the trainers stay untouched so baseline token statistics remain reproducible.
+
+- **`MorphologyPlugin`** – Abstract base defining the `presegment()` and `recompose()` contract.
+- **`MorphologySegment`** – Lightweight dataclass describing a surface form, optional tags, and roles. Segments emitted from
+  `presegment()` are consumed by the `BytePacker` when a plugin is active.
+- **`available_plugins()` / `create_plugin(name, **config)`** – Discovery helpers used by the CLI. Plugins register themselves
+  via `register_plugin(name, cls)` on import.
+
+The built-in [`TurkishMorphologyPlugin`](../gpu_tokenizer/morphology/turkish.py) demonstrates the expected segmentation API and
+honours `case_markers`/`affix_tags` toggles. When experimenting with new languages, start with `create_plugin("tr")` to inspect
+the emitted segments and ensure `plugin.recompose(plugin.presegment(sample)) == sample` before feeding data into the trainers.
+Refer to [docs/cookbook/morphology.md](cookbook/morphology.md) for an end-to-end training example with fidelity checks.
 
 ## Code mode helpers
 The code-mode pipeline lives under [`gpu_tokenizer/code_mode/`](../gpu_tokenizer/code_mode). It transforms structured source samples into canonical token sequences that downstream trainers can consume.
