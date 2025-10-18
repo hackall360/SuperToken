@@ -56,7 +56,11 @@ jobs:
 
       - name: Generate trend report
         run: |
-          python benchmarks/trend_report.py --input artifacts/benchmarks --output-dir artifacts/benchmarks/trends
+          python benchmarks/trend_report.py \
+            --input artifacts/benchmarks \
+            --output-dir artifacts/benchmarks/trends \
+            --baseline-bpe 1.0 \
+            --baseline-unigram 1.0
 
       - name: Collect outputs
         id: collect

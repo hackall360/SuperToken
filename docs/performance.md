@@ -224,3 +224,65 @@ python benchmarks/trend_report.py --input <path/to/json/dir> --output-dir <path/
 
 Because the JSON history is version-controlled via workflow artifacts, spotting regressions
 becomes a matter of comparing the latest trend plot against previous runs.
+
+### Running the expanded benchmark suite locally
+
+Three helper constructors in `benchmarks/benchmark_runner.py` assemble ready-to-run
+scenario sweeps:
+
+* `generate_streaming_compression_runs` – toggles overlap-enabled streaming transfers
+  versus a sequential baseline on a single device.
+* `generate_multi_gpu_runs` – compares a single GPU baseline against a multi-GPU data
+  parallel run and records scaling efficiency targets.
+* `generate_hybrid_runs` – models asymmetric hybrid setups where a fast device is
+  assisted by helper GPUs with custom weights.
+
+Use them to materialise a JSON configuration for the benchmark CLI without hand-editing:
+
+```bash
+python - <<'PY'
+from dataclasses import asdict
+from pathlib import Path
+from benchmarks import generate_streaming_compression_runs, generate_multi_gpu_runs
+
+config_dir = Path("artifacts/benchmarks/configs")
+config_dir.mkdir(parents=True, exist_ok=True)
+
+streaming = [asdict(spec) for spec in generate_streaming_compression_runs(batch_size=64, device="cuda:0")]
+multi = [asdict(spec) for spec in generate_multi_gpu_runs(batch_size=64, baseline_device="cuda:0", data_parallel_devices=["cuda:0", "cuda:1"])]
+
+payload = {"runs": streaming + multi}
+(config_dir / "streaming_and_multi.json").write_text(__import__("json").dumps(payload, indent=2))
+PY
+
+PYTORCH_JIT=0 python main.py benchmark \
+  --synthetic-docs 16 \
+  --synthetic-min-len 64 \
+  --synthetic-max-len 128 \
+  --synthetic-vocab 512 \
+  --bpe-merges 256 \
+  --bpe-batch-size 64 \
+  --bpe-config artifacts/benchmarks/configs/streaming_and_multi.json \
+  --unigram-batch-size 64 \
+  --unigram-vocab 512 \
+  --unigram-epochs 3 \
+  --output-dir artifacts/benchmarks \
+  --device cuda:0
+```
+
+The JSON schema in `benchmarks/schema.py` captures the full benchmark payload; run
+`benchmarks.validate_benchmark_output(json.loads(path.read_text()))` when scripting
+custom pipelines to catch format drift early. After each local sweep, regenerate
+trend artefacts with baseline checks that mirror CI:
+
+```bash
+python benchmarks/trend_report.py \
+  --input artifacts/benchmarks \
+  --output-dir artifacts/benchmarks/trends \
+  --baseline-bpe 1.0 \
+  --baseline-unigram 1.0
+```
+
+If the latest throughput dips below the requested threshold the CLI exits non-zero and
+prints a human-readable summary of the regression. The generated manifest includes the
+baseline comparison, Markdown table, and PNG plot so the results match what CI produces.

@@ -40,6 +40,76 @@ class TrendPoint:
         return self.tokens / self.unigram_wall
 
 
+def evaluate_baseline(
+    points: Sequence[TrendPoint],
+    *,
+    baseline_bpe: float | None,
+    baseline_unigram: float | None,
+) -> dict[str, object]:
+    """Compare the latest throughput figures against requested baselines."""
+
+    latest = points[-1] if points else None
+    observed_bpe = latest.bpe_tokens_per_second if latest else None
+    observed_unigram = latest.unigram_tokens_per_second if latest else None
+
+    def _met(observed: float | None, target: float | None) -> bool | None:
+        if target is None:
+            return None
+        if observed is None:
+            return False
+        return observed >= target
+
+    def _delta(observed: float | None, target: float | None) -> float | None:
+        if observed is None or target is None:
+            return None
+        return observed - target
+
+    result = {
+        "latest_timestamp": latest.timestamp.isoformat() if latest else None,
+        "bpe_target_tokens_per_s": baseline_bpe,
+        "bpe_observed_tokens_per_s": observed_bpe,
+        "bpe_delta_tokens_per_s": _delta(observed_bpe, baseline_bpe),
+        "bpe_met": _met(observed_bpe, baseline_bpe),
+        "unigram_target_tokens_per_s": baseline_unigram,
+        "unigram_observed_tokens_per_s": observed_unigram,
+        "unigram_delta_tokens_per_s": _delta(observed_unigram, baseline_unigram),
+        "unigram_met": _met(observed_unigram, baseline_unigram),
+        "messages": [],
+        "failed_metrics": [],
+    }
+
+    def _format(value: float | None) -> str:
+        if value is None:
+            return "n/a"
+        return f"{value:,.2f}"
+
+    if baseline_bpe is not None:
+        if result["bpe_met"]:
+            result["messages"].append(
+                f"BPE throughput {_format(observed_bpe)} tokens/s meets baseline {_format(baseline_bpe)}"
+            )
+        else:
+            result["messages"].append(
+                f"BPE throughput {_format(observed_bpe)} tokens/s below baseline {_format(baseline_bpe)}"
+            )
+            result["failed_metrics"].append("bpe")
+
+    if baseline_unigram is not None:
+        if result["unigram_met"]:
+            result["messages"].append(
+                "Unigram throughput "
+                f"{_format(observed_unigram)} tokens/s meets baseline {_format(baseline_unigram)}"
+            )
+        else:
+            result["messages"].append(
+                "Unigram throughput "
+                f"{_format(observed_unigram)} tokens/s below baseline {_format(baseline_unigram)}"
+            )
+            result["failed_metrics"].append("unigram")
+
+    return result
+
+
 def _load_point(path: Path) -> TrendPoint:
     """Parse a benchmark JSON snapshot into a :class:`TrendPoint`.
 
@@ -292,6 +362,18 @@ def build_parser() -> argparse.ArgumentParser:
         default="trend_plot.png",
         help="File name for the rendered PNG chart",
     )
+    parser.add_argument(
+        "--baseline-bpe",
+        type=float,
+        default=None,
+        help="Target tokens/s for the GPUBPETrainer. When provided the CLI fails if the latest run is slower.",
+    )
+    parser.add_argument(
+        "--baseline-unigram",
+        type=float,
+        default=None,
+        help="Target tokens/s for the GPUUnigramTrainer. When provided the CLI fails if the latest run is slower.",
+    )
     return parser
 
 
@@ -356,8 +438,25 @@ def main(argv: Sequence[str] | None = None) -> None:
             for point in points
         ],
     }
+    baseline_summary = evaluate_baseline(
+        points,
+        baseline_bpe=args.baseline_bpe,
+        baseline_unigram=args.baseline_unigram,
+    )
+    manifest["baseline_evaluation"] = {
+        key: value
+        for key, value in baseline_summary.items()
+        if key not in {"messages", "failed_metrics"}
+    }
     manifest_path = output_dir / "trend_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    for message in baseline_summary.get("messages", []):
+        print(message)
+
+    if baseline_summary.get("failed_metrics"):
+        metrics = ", ".join(baseline_summary["failed_metrics"])
+        raise SystemExit(f"Baseline regression detected for: {metrics}")
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
