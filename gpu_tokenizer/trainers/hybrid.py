@@ -428,6 +428,23 @@ class HybridTrainer(BaseTrainer):
         salt = self._privacy_hash_salt
         return [hash_merge_pair((int(left), int(right)), salt) for left, right in self._final_merges]
 
+    def _privacy_summary(self) -> dict[str, object]:
+        mode = "none"
+        if self.randomize_ties:
+            mode = "tie-randomize"
+        elif self.privacy_mode:
+            mode = "hash-merges"
+        summary: dict[str, object] = {
+            "mode": mode,
+            "merges_redacted": bool(self.privacy_mode),
+            "randomize_ties": bool(self.randomize_ties),
+        }
+        if self.tie_seed is not None or self.randomize_ties:
+            summary["tie_seed"] = int(self.tie_seed) if self.tie_seed is not None else 0
+        if self._privacy_hash_salt:
+            summary["salt_configured"] = True
+        return summary
+
     def fit(
         self,
         batches: Iterable[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
@@ -593,6 +610,7 @@ class HybridTrainer(BaseTrainer):
             "unigram_epochs": self.unigram_epochs,
             "max_unigram_len": self.max_unigram_len,
         }
+        trainer_section["privacy"] = self._privacy_summary()
         payload = CheckpointPayload(
             version=CheckpointPayload.CURRENT_VERSION,
             trainer=trainer_section,
@@ -623,6 +641,22 @@ class HybridTrainer(BaseTrainer):
         self._completed_cycles = int(trainer_meta.get("cycles", 0))
         self.unigram_epochs = int(trainer_meta.get("unigram_epochs", self.unigram_epochs))
         self.max_unigram_len = int(trainer_meta.get("max_unigram_len", self.max_unigram_len))
+        privacy_meta = trainer_meta.get("privacy")
+        if isinstance(privacy_meta, Mapping):
+            mode_label = str(privacy_meta.get("mode", "")).lower()
+            if mode_label == "none":
+                self.privacy_mode = False
+            elif mode_label in {"hash-merges", "tie-randomize"}:
+                self.privacy_mode = True
+            randomize_meta = privacy_meta.get("randomize_ties")
+            if randomize_meta is not None:
+                self.randomize_ties = bool(randomize_meta)
+            if "tie_seed" in privacy_meta:
+                tie_seed_raw = privacy_meta.get("tie_seed")
+                try:
+                    self.tie_seed = int(tie_seed_raw) if tie_seed_raw is not None else None
+                except (TypeError, ValueError):
+                    self.tie_seed = None
 
         tensors = state_dict.get("tensors") if isinstance(state_dict, Mapping) else None
         if isinstance(tensors, Mapping):
@@ -710,6 +744,7 @@ class HybridTrainer(BaseTrainer):
             },
             "phase_history": _sanitize_for_json(self._phase_history),
         }
+        manifest["privacy"] = self._privacy_summary()
         if self.privacy_mode:
             manifest["privacy_mode"] = True
             manifest["merge_count"] = len(self._final_merges)

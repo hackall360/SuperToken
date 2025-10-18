@@ -149,4 +149,40 @@ def test_hybrid_privacy_manifest_redacts_merges(tmp_path: Path) -> None:
     assert manifest["merge_count"] == len(trainer._final_merges)
     assert manifest["merges"][0] == expected_hash
     assert all(isinstance(entry, str) for entry in manifest["merges"])
+    privacy_section = manifest.get("privacy")
+    assert isinstance(privacy_section, dict)
+    assert privacy_section["mode"] == "hash-merges"
+    assert privacy_section["merges_redacted"] is True
+    assert privacy_section["randomize_ties"] is False
+    assert privacy_section.get("salt_configured") is True
+    assert privacy_section.get("tie_seed") == 11
+
+
+def test_hybrid_state_privacy_annotations(tmp_path: Path) -> None:
+    trainer = HybridTrainer(
+        base_vocab=64,
+        merges=1,
+        cycles=1,
+        unigram_epochs=1,
+        privacy_mode=True,
+        randomize_ties=True,
+        tie_seed=17,
+        privacy_salt="paprika",
+    )
+    trainer._final_merges = [(2, 3)]
+    id2piece, _, _ = _build_piece_tables(trainer.base_vocab, trainer._final_merges)
+    trainer._final_id2piece = id2piece
+    trainer._final_logp = torch.zeros(len(id2piece), dtype=torch.float32)
+    trainer._completed_cycles = 2
+
+    trainer.save_checkpoint(tmp_path)
+    payload = json.loads((tmp_path / "state.json").read_text("utf-8"))
+    trainer_section = payload.get("trainer", {})
+    privacy_section = trainer_section.get("privacy") if isinstance(trainer_section, dict) else None
+    assert isinstance(privacy_section, dict)
+    assert privacy_section["mode"] == "tie-randomize"
+    assert privacy_section["merges_redacted"] is True
+    assert privacy_section["randomize_ties"] is True
+    assert privacy_section["tie_seed"] == 17
+    assert privacy_section.get("salt_configured") is True
 

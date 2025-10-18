@@ -882,6 +882,25 @@ class GPUBPETrainer(BaseTrainer):
         salt = self._privacy_hash_salt
         return [hash_merge_pair((int(left), int(right)), salt) for left, right in self.merges]
 
+    def _privacy_summary(self) -> dict[str, object]:
+        mode = "none"
+        if self.randomize_ties:
+            mode = "tie-randomize"
+        elif self.privacy_mode:
+            mode = "hash-merges"
+        summary: dict[str, object] = {
+            "mode": mode,
+            "merges_redacted": bool(self.privacy_mode),
+            "randomize_ties": bool(self.randomize_ties),
+        }
+        if self.randomize_ties or self.tie_seed is not None:
+            summary["tie_seed_effective"] = int(self._tie_seed_value)
+            if self.tie_seed is not None:
+                summary["tie_seed"] = int(self.tie_seed)
+        if self._privacy_hash_salt:
+            summary["salt_configured"] = True
+        return summary
+
     def metrics(self) -> Mapping[str, TrainerMetricsEWMA]:
         """Expose the registered metrics trackers for external consumers."""
 
@@ -1510,6 +1529,7 @@ class GPUBPETrainer(BaseTrainer):
             "counters": counters_section,
             "logs": logs_section,
         }
+        trainer_section["privacy"] = self._privacy_summary()
 
         rng_section: dict[str, object] = {}
         if self.randomize_ties and self._tie_rng is not None:
@@ -1611,6 +1631,28 @@ class GPUBPETrainer(BaseTrainer):
             self._privacy_salt_input = self._privacy_hash_salt
         elif not self._privacy_hash_salt:
             self._privacy_hash_salt = self._coerce_privacy_salt(self._privacy_salt_input)
+        privacy_meta = trainer_meta.get("privacy")
+        if isinstance(privacy_meta, Mapping):
+            mode_label = str(privacy_meta.get("mode", "")).lower()
+            if mode_label == "none":
+                self.privacy_mode = False
+            elif mode_label in {"hash-merges", "tie-randomize"}:
+                self.privacy_mode = True
+            randomize_meta = privacy_meta.get("randomize_ties")
+            if randomize_meta is not None:
+                self.randomize_ties = bool(randomize_meta)
+            if "tie_seed" in privacy_meta:
+                tie_seed_raw = privacy_meta.get("tie_seed")
+                try:
+                    self.tie_seed = int(tie_seed_raw) if tie_seed_raw is not None else None
+                except (TypeError, ValueError):
+                    self.tie_seed = None
+            tie_seed_effective = privacy_meta.get("tie_seed_effective")
+            if tie_seed_effective is not None:
+                try:
+                    self._tie_seed_value = int(tie_seed_effective)
+                except (TypeError, ValueError):
+                    pass
         rng_meta = payload.rng if isinstance(payload.rng, Mapping) else {}
         tie_rng_meta = rng_meta.get("tie_breaker") if isinstance(rng_meta, Mapping) else None
         rng_state: object | None = None
@@ -4480,6 +4522,7 @@ class GPUBPETrainer(BaseTrainer):
             "vocab_size": self.vocab_size,
             "merges": self._merges_for_metadata(),
         }
+        meta["privacy"] = self._privacy_summary()
         if self.privacy_mode:
             meta["privacy_mode"] = True
             meta["merge_count"] = len(self.merges)

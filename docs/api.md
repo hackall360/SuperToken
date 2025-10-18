@@ -10,6 +10,7 @@ This reference collects the most commonly extended classes and functions in Supe
 - [Code mode helpers](#code-mode-helpers)
 - [I/O and streaming](#io-and-streaming)
 - [Checkpointing](#checkpointing)
+- [Privacy controls](#privacy-controls)
 - [CLI helpers](#cli-helpers)
 - [Benchmarking utilities](#benchmarking-utilities)
 - [Related guides](#related-guides)
@@ -104,6 +105,15 @@ Shared helpers reside alongside trainers and datasets.
 - **CLI integration**: `--checkpoint-dir`, `--checkpoint-every`, and `--resume-from` map to the helpers listed above.
 
 When designing new trainers, implement `state_dict()`/`load_state_dict()` pairs so checkpoints remain compatible with the existing resume logic. The [CLI usage guide](cli.md#checkpointing-and-resume) documents the user-facing switches.
+
+## Privacy controls
+The BPE and hybrid trainers expose optional privacy guards that redact merge histories from exported artifacts:
+
+- **`privacy_mode`** (bool) enables hashing of merge pairs in `bpe_merges.json` and `hybrid_manifest.json`. When active, the manifests emit a `privacy` block summarizing the redaction.
+- **`randomize_ties`** (bool) toggles stochastic tie-breaking. The effective seed is recorded in the same `privacy` block so downstream consumers know when deterministic parity no longer holds. Pair this with `tie_seed` to reproduce stochastic merges across runs.
+- **`privacy_salt`** (bytes/str) injects a caller-provided salt into the merge hashes. The salt itself is never written to disk; manifests only advertise that a salt was configured.
+
+Every `state.json` produced by `save_checkpoint` now includes `payload["trainer"]["privacy"]` with the mode, merge redaction flag, tie seed metadata, and salt status. Consumers should inspect this section instead of inferring behavior from raw merge tables. Consult [docs/cli.md](cli.md#privacy-options) for CLI examples and the trade-offs between `none`, `hash-merges`, and `tie-randomize`.
 
 ## CLI Helpers
 Within [`main.py`](../main.py):

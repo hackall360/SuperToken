@@ -465,21 +465,40 @@ def _build_bpe_trainer(
         token_bytes_per_example=args.token_bytes
     )
     resolved_batch = min(args.max_batch, max(args.min_batch, suggestion_state.batch_size))
+    privacy_label = str(getattr(args, "privacy", "none") or "none").lower()
+    privacy_enabled = privacy_label != "none"
+    randomize_ties = privacy_label == "tie-randomize"
+    tie_seed = getattr(args, "tie_seed", None)
+    privacy_salt = getattr(args, "privacy_salt", None)
     trainer = GPUBPETrainer(
         base_vocab=args.base_vocab,
         merges=args.merges,
         device=args.device,
         autoscaler=autoscaler,
+        privacy_mode=privacy_enabled,
+        randomize_ties=randomize_ties,
+        tie_seed=tie_seed,
+        privacy_salt=privacy_salt,
     )
     suggestion = asdict(suggestion_state)
     suggestion["requested_batch_size"] = suggestion_state.batch_size
     suggestion["resolved_batch_size"] = resolved_batch
     suggestion["window_snapshot"] = suggestion_window
+    privacy_config = {
+        "mode": (
+            "tie-randomize"
+            if randomize_ties
+            else ("hash-merges" if privacy_enabled else "none")
+        ),
+        "tie_seed": int(tie_seed) if tie_seed is not None else None,
+        "salt_configured": bool(privacy_salt),
+    }
     config: dict[str, object] = {
         "trainer": {
             "base_vocab": args.base_vocab,
             "merges": args.merges,
             "device": args.device,
+            "privacy": privacy_config,
         },
         "autoscaler": {
             "target_util": args.target_util,
@@ -761,6 +780,13 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
             },
             "dry_run": bool(getattr(args, "dry_run", False)),
             "code_mode": code_mode_config,
+        }
+    )
+    config["trainer"].setdefault("privacy", {}).update(
+        {
+            "mode": str(getattr(args, "privacy", "none") or "none").lower(),
+            "tie_seed": int(args.tie_seed) if args.tie_seed is not None else None,
+            "salt_configured": bool(getattr(args, "privacy_salt", None)),
         }
     )
     config["morphology"] = morphology_config
@@ -1193,6 +1219,12 @@ def _cmd_train_hybrid(args: argparse.Namespace) -> None:
 
     morphology_plugin, morphology_config = _resolve_morphology(args)
 
+    privacy_label = str(getattr(args, "privacy", "none") or "none").lower()
+    privacy_enabled = privacy_label != "none"
+    randomize_ties = privacy_label == "tie-randomize"
+    tie_seed = getattr(args, "tie_seed", None)
+    privacy_salt = getattr(args, "privacy_salt", None)
+
     config = {
         "trainer": {
             "base_vocab": args.base_vocab,
@@ -1200,6 +1232,11 @@ def _cmd_train_hybrid(args: argparse.Namespace) -> None:
             "cycles": args.cycles,
             "unigram_epochs": args.unigram_epochs,
             "max_unigram_len": args.max_unigram_len,
+            "privacy": {
+                "mode": privacy_label,
+                "tie_seed": int(tie_seed) if tie_seed is not None else None,
+                "salt_configured": bool(privacy_salt),
+            },
         },
         "data": {
             "patterns": list(data_patterns),
@@ -1263,6 +1300,10 @@ def _cmd_train_hybrid(args: argparse.Namespace) -> None:
         unigram_epochs=args.unigram_epochs,
         max_unigram_len=args.max_unigram_len,
         warm_start_merges=warm_start_merges,
+        privacy_mode=privacy_enabled,
+        randomize_ties=randomize_ties,
+        tie_seed=tie_seed,
+        privacy_salt=privacy_salt,
         bpe_init_kwargs={"device": args.device},
     )
 
@@ -1459,6 +1500,35 @@ def _parser() -> argparse.ArgumentParser:
     train_bpe.add_argument("--log-every", type=int, default=100)
     train_bpe.add_argument("--out-dir", type=str, default="./bpe_out")
     train_bpe.add_argument(
+        "--privacy",
+        type=str,
+        default="none",
+        choices=["none", "hash-merges", "tie-randomize"],
+        help=(
+            "Privacy guard for exported merges. 'hash-merges' redacts merge IDs, "
+            "while 'tie-randomize' also randomizes tie-breaks—breaking deterministic "
+            "parity across devices unless you also provide --tie-seed."
+        ),
+    )
+    train_bpe.add_argument(
+        "--privacy-salt",
+        type=str,
+        default=None,
+        help=(
+            "Optional hex or UTF-8 salt mixed into hashed merges when privacy is enabled. "
+            "The salt itself is never written to manifests."
+        ),
+    )
+    train_bpe.add_argument(
+        "--tie-seed",
+        type=int,
+        default=None,
+        help=(
+            "Seed controlling randomized tie-breaks. Combine with --privacy tie-randomize "
+            "to make stochastic runs reproducible."
+        ),
+    )
+    train_bpe.add_argument(
         "--checkpoint-dir",
         type=str,
         default=None,
@@ -1498,6 +1568,33 @@ def _parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Optional JSON manifest containing seed merges",
+    )
+    train_hybrid.add_argument(
+        "--privacy",
+        type=str,
+        default="none",
+        choices=["none", "hash-merges", "tie-randomize"],
+        help=(
+            "Apply the BPE privacy guard when exporting hybrid manifests. See train-bpe "
+            "for mode semantics; tie randomization sacrifices deterministic parity unless "
+            "--tie-seed is provided."
+        ),
+    )
+    train_hybrid.add_argument(
+        "--privacy-salt",
+        type=str,
+        default=None,
+        help=(
+            "Optional salt used when hashing merge metadata in privacy-aware hybrid exports."
+        ),
+    )
+    train_hybrid.add_argument(
+        "--tie-seed",
+        type=int,
+        default=None,
+        help=(
+            "Seed forwarded to the BPE phase when tie randomization is enabled for privacy."
+        ),
     )
     train_hybrid.add_argument(
         "--checkpoint-dir",

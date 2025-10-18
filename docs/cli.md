@@ -8,6 +8,7 @@ SuperToken ships a single `main.py` entry point that exposes tokenizer training 
 - [`train-bpe`](#train-bpe)
 - [`train-unigram`](#train-unigram)
 - [`train-hybrid`](#train-hybrid)
+- [Privacy options](#privacy-options)
 - [`benchmark`](#benchmark)
 - [Streaming options](#streaming-options)
 - [Checkpointing and resume](#checkpointing-and-resume)
@@ -59,6 +60,7 @@ Key arguments:
 - `--code-mode`: Preprocess structured code entries instead of byte streams. When enabled the trainer loads corpora eagerly and ignores autoscaler resize events.
 - `--code-langs`: Restrict code-mode runs to specific languages (for example `--code-langs python typescript`).
 - `--meta-compress`: Discover and apply meta-token compression on AST sequences.
+- `--privacy` / `--privacy-salt` / `--tie-seed`: Opt into merge redaction and tie randomization (see [Privacy options](#privacy-options)).
 
 Behind the scenes the [`GPUBPETrainer`](../gpu_tokenizer/bpe_trainer.py) collaborates with the autoscaler, dataset readers, and checkpoint writers described in the [architecture overview](architecture.md#trainer-pipeline).
 
@@ -133,8 +135,19 @@ Key arguments:
 - `--code-mode`: Run both phases on AST-linearised corpora.
 - `--code-langs`: Filter the code-mode corpus to specific languages.
 - `--meta-compress`: Share meta-token compression dictionaries across BPE and unigram phases.
+- `--privacy` / `--privacy-salt` / `--tie-seed`: Apply the same privacy guard as the standalone BPE trainer to hybrid manifests.
 
 After training the command emits a `hybrid_manifest.json`, Hugging Face-compatible `merges.txt`/`tokenizer.json`, and a SentencePiece-style `unigram.prob`/`unigram.model` pair for downstream consumers. The [`HybridTrainer`](../gpu_tokenizer/trainers/hybrid.py) section of the API reference describes the orchestration hooks in more detail.
+
+## Privacy options
+
+Both the `train-bpe` and `train-hybrid` subcommands accept `--privacy` with three modes:
+
+- `none` *(default)* exports raw merge pairs and preserves deterministic tie-breaks.
+- `hash-merges` replaces merge IDs with salted hashes in `bpe_merges.json`, `state.json`, and `hybrid_manifest.json`. Supply `--privacy-salt` with a hex or UTF-8 value to avoid identical hashes across runs; the salt itself is never written to disk.
+- `tie-randomize` hashes merges and randomizes tie-breaks. This sacrifices deterministic parity across devices; provide `--tie-seed` to reproduce the stochastic ordering when needed.
+
+Every manifest now emits a `privacy` block summarizing the active mode, whether merges were redacted, the effective tie seed, and whether a salt was configured. Downstream tooling should inspect this block instead of inferring privacy status from merge contents. Remember that enabling tie randomization changes merge selection order even when `--tie-seed` is supplied—use this mode only when deterministic parity is not required.
 
 ## `benchmark`
 Compare trainers using real and synthetic corpora in a single run:
