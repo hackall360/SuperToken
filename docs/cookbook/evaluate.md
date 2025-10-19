@@ -41,6 +41,20 @@ The JSON file is designed to be machine- and human-friendly. The table below sum
 | `morphology` | Segmentation statistics plus the resolved CLI configuration. |
 | `code_mode` | Whether AST ingestion was active, language coverage, and meta-token stats. |
 
+### Metric definitions
+
+- **Compression ratio** – ``tokens_per_byte`` is the total token count divided by
+  raw UTF-8 bytes; ``bytes_per_token`` is its reciprocal. Both values include
+  merge application so they reflect the final tokenizer output.
+- **OOV rate** – the fraction of produced tokens that do not exist in the
+  provided vocabulary. ``0.0`` means every token was in-vocabulary.
+- **Morphology purity** – the share of morphology segments that carried at least
+  one tag when the morphology plugin was enabled.
+- **Code-mode reduction** – the fractional decrease in AST token length achieved
+  by meta-token compression. ``0.0`` means meta tokens provided no savings; a
+  positive value indicates how much shorter the compressed AST stream is
+  compared to expanding every meta token back to its original pattern.
+
 Example entries from the repository’s golden regression report:
 
 ```json

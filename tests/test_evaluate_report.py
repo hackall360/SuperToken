@@ -136,6 +136,10 @@ def test_code_mode_report_summarises_meta_tokens() -> None:
     assert summary["meta_token_count"] == 33
     assert "META0" in summary["meta_compress"]
     assert all(name.startswith("META") for name in summary["meta_compress"])
+    assert 0.0 <= summary["reduction"] < 1.0
+
+    morphology = report["morphology"]
+    assert morphology["purity"] == pytest.approx(morphology["tagged_segments"] / morphology["total_segments"])
 
 
 def test_cookbook_command_snippet_lists_required_flags() -> None:

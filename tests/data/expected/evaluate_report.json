@@ -14,7 +14,8 @@
       "meta_max_length": 8
     },
     "documents": 3,
-    "mode": "plain"
+    "mode": "plain",
+    "reduction": 0.0
   },
   "compression": {
     "bytes_per_token": 1.411764705882353,
@@ -37,6 +38,7 @@
     },
     "documents": 3,
     "enabled": true,
+    "purity": 0.3448275862068966,
     "roles": {
       "case": 10
     },
