@@ -4,6 +4,7 @@
     "merges": "tests/data/models/bpe/merges.json",
     "tokenizer": "tests/data/models/bpe/tokenizer.json",
     "vocab": "tests/data/models/bpe/vocab.json",
+    "model_type": "bpe",
     "vocab_size": 35
   },
   "code_mode": {

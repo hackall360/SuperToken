@@ -66,6 +66,7 @@ def test_cli_wrapper_returns_structured_result() -> None:
         vocab_path=paths["vocab"],
         merges_path=paths["merges"],
         tokenizer_path=paths["tokenizer"],
+        model_type="bpe",
         morphology=plugin,
         morphology_config={
             "enabled": True,
@@ -86,6 +87,7 @@ def test_cli_wrapper_returns_structured_result() -> None:
         "tokens": expected["corpus"]["total_tokens"],
         "tokens_per_byte": expected["compression"]["tokens_per_byte"],
         "oov_rate": expected["oov"]["rate"],
+        "model_type": "bpe",
     }
 
 

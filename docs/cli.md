@@ -265,17 +265,20 @@ python main.py evaluate \
   --artifacts tests/data/models/bpe \
   --morphology-lang tr \
   --deterministic \
-  --output ./reports/evaluate.json
+  --output ./reports/evaluate.json \
+  --summary-format table
 ```
 
 Key switches:
 
-- `--artifacts`: Directory containing `vocab.json`, `merges.(json|txt)`, and optionally `tokenizer.json`. Override any component via `--vocab`, `--merges`, or `--tokenizer`.
-- `--output`: File path where the structured report should be written. When omitted the full JSON payload is printed to stdout.
+- `--artifacts`: Directory containing `vocab.json`, `merges.(json|txt)`, and optionally `tokenizer.json`. Override any component via `--vocab`, `--merges`, or `--tokenizer`. SentencePiece exports expose `unigram.vocab` and can omit merge histories.
+- `--model-type`: Force `bpe` or `unigram` detection when the defaults (`auto`) are ambiguous. BPE runs require a merge history; unigram runs expect SentencePiece-style vocabularies and ignore merges.
+- `--output`: File path where the structured report should be written. When omitted the command writes to `reports/evaluate.json`; use `--output -` to stream JSON to stdout.
 - `--deterministic`: Sort OOV listings and meta-token summaries so repeated runs remain byte-identical.
 - `--meta-max-length`: Upper bound on meta-token discovery length when `--code-mode` corpora are evaluated.
 - `--code-mode` / `--code-langs` / `--meta-compress`: Reuse the AST-aware pipeline described in [Code mode workflows](#code-mode-workflows) when evaluating source code manifests.
 - `--morphology-*`: The same segmentation toggles exposed by the training commands. When enabled the report records both the aggregate statistics and the resolved morphology configuration.
+- `--summary-format`: Choose between a human-readable banner (`table`), machine-friendly output (`json`), or silence (`none`).
 
 The command writes a JSON object with several top-level sections:
 
@@ -297,6 +300,7 @@ not conform to it. A compact example looks like this:
     "merges": null,
     "tokenizer": "tokenizer.json",
     "vocab": "vocab.json",
+    "model_type": "bpe",
     "vocab_size": 42000
   },
   "code_mode": {

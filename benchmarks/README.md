@@ -15,7 +15,8 @@ python main.py evaluate \
   --data path/to/corpus.txt \
   --artifacts path/to/exported/tokenizer \
   --deterministic \
-  --output artifacts/eval/report.json
+  --output artifacts/eval/report.json \
+  --summary-format table
 
 python main.py benchmark \
   --synthetic-docs 8 \
@@ -40,3 +41,5 @@ python main.py evaluate --data path/to/corpus.txt --artifacts path/to/tokenizer
 
 CI pipelines can enforce evaluation by omitting the environment variable or by
 supplying the `--force-evaluation` flag, which overrides the skip toggle.
+
+SentencePiece exports can be evaluated directly by replacing `--artifacts` with `--vocab path/to/unigram.vocab --model-type unigram`. The command will still emit the JSON report under `reports/evaluate.json` when `--output` is omitted.

@@ -98,6 +98,18 @@ python main.py train-unigram \
 
 Both commands will automatically adapt the batch size in response to your GPU throughput and persist the resulting vocabulary files.
 
+Evaluate exported artifacts against a reference corpus in a single step—the CLI writes a schema-validated JSON report to `reports/evaluate.json` by default and prints a human-friendly banner summarising key metrics:
+
+```bash
+python main.py evaluate \
+  --data tests/data/evaluate_corpus/plain.txt \
+  --artifacts tests/data/models/bpe \
+  --deterministic \
+  --summary-format table
+```
+
+Switch to `--model-type unigram` when scoring SentencePiece packages (`unigram.vocab`) and use `--summary-format json` if you prefer machine-readable summaries in stdout.
+
 Alternate between BPE warm starts and unigram refinement in a single run:
 
 ```bash

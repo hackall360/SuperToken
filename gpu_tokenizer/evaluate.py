@@ -7,7 +7,7 @@ import random
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Iterable, Literal, Mapping, Sequence
 
 from .cpu_packer import BytePacker
 from .code_mode import prepare_corpus
@@ -49,6 +49,7 @@ class EvaluateCLIOptions:
     vocab_path: Path
     merges_path: Path | None = None
     tokenizer_path: Path | None = None
+    model_type: str = "auto"
     bos: int | None = None
     eos: int | None = None
     morphology: MorphologyPlugin | None = None
@@ -66,6 +67,9 @@ class EvaluateCLIResult:
 
     report: dict[str, object]
     summary: dict[str, object]
+
+
+ModelType = Literal["bpe", "unigram"]
 
 
 def _expand_data_patterns(patterns: Sequence[str]) -> list[Path]:
@@ -282,6 +286,93 @@ def _load_merges(path: Path, vocab: Mapping[str, int]) -> list[MergeRule]:
     return merges
 
 
+def _load_sentencepiece_vocab(path: Path) -> dict[str, int]:
+    vocab: dict[str, int] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for index, raw_line in enumerate(handle):
+            line = raw_line.strip()
+            if not line:
+                continue
+            if "\t" in line:
+                token, _ = line.split("\t", 1)
+            else:
+                pieces = line.split()
+                if not pieces:
+                    continue
+                token = pieces[0]
+            if token not in vocab:
+                vocab[token] = index
+    return vocab
+
+
+def resolve_model_type(
+    vocab_path: Path,
+    merges_path: Path | None,
+    hint: str | None = None,
+) -> ModelType:
+    """Resolve the artifact flavour used during evaluation.
+
+    Args:
+        vocab_path: Path to the provided vocabulary artifact.
+        merges_path: Optional path to the merge history.
+        hint: Optional string hint supplied via the CLI.
+
+    Returns:
+        Literal indicating whether BPE or unigram exports are being evaluated.
+
+    Raises:
+        ValueError: If the combination of hint/paths cannot be reconciled.
+    """
+
+    choice = str(hint or "auto").strip().lower()
+    if choice not in {"auto", "bpe", "unigram"}:
+        raise ValueError(
+            f"Unknown model type {hint!r}; expected 'auto', 'bpe', or 'unigram'."
+        )
+
+    suffix = vocab_path.suffix.lower()
+
+    if choice == "bpe":
+        if merges_path is None:
+            raise ValueError(
+                "BPE evaluation requires a merge history; provide --merges or "
+                "an artifacts directory containing merges.(json|txt)."
+            )
+        return "bpe"
+
+    if choice == "unigram":
+        if merges_path is not None:
+            raise ValueError(
+                "Unigram evaluation ignores merge tables; remove --merges or set "
+                "--model-type bpe if you meant to score a BPE export."
+            )
+        return "unigram"
+
+    # Auto-detection path
+    if suffix == ".vocab":
+        if merges_path is not None:
+            raise ValueError(
+                "SentencePiece vocabulary detected but a merge file was also "
+                "provided; drop --merges or force --model-type bpe if the "
+                "artifacts are truly BPE."
+            )
+        return "unigram"
+
+    if merges_path is None:
+        raise ValueError(
+            "Could not infer model type. Provide a merge history for BPE exports "
+            "or set --model-type unigram when evaluating SentencePiece outputs."
+        )
+
+    return "bpe"
+
+
+def _load_cli_vocab(path: Path, *, model_type: ModelType) -> dict[str, int]:
+    if model_type == "unigram" and path.suffix.lower() == ".vocab":
+        return _load_sentencepiece_vocab(path)
+    return export_artifacts.load_vocab(path)
+
+
 def _apply_merges(sequence: Sequence[int], rules: Sequence[MergeRule]) -> list[int]:
     if not sequence or not rules:
         return list(sequence)
@@ -335,6 +426,7 @@ def evaluate(
     vocab_path: Path,
     merges_path: Path | None = None,
     tokenizer_path: Path | None = None,
+    model_type: str | None = None,
     bos: int | None = None,
     eos: int | None = None,
     morphology: MorphologyPlugin | None = None,
@@ -349,7 +441,9 @@ def evaluate(
     if deterministic:
         random.seed(1337)
 
-    vocab = export_artifacts.load_vocab(vocab_path)
+    resolved_model = resolve_model_type(vocab_path, merges_path, model_type)
+
+    vocab = _load_cli_vocab(vocab_path, model_type=resolved_model)
     merges = _load_merges(merges_path, vocab) if merges_path else []
 
     if code_mode:
@@ -424,6 +518,7 @@ def evaluate(
             "merges": str(merges_path) if merges_path else None,
             "merge_rules": len(merges),
             "tokenizer": str(tokenizer_path) if tokenizer_path else None,
+            "model_type": resolved_model,
         },
         "corpus": {
             "documents": len(evaluated_sequences),
@@ -477,11 +572,15 @@ def evaluate_cli(options: EvaluateCLIOptions) -> EvaluateCLIResult:
 
     data_files = [Path(path) for path in options.data_files]
     language_filter = _normalise_cli_languages(options.code_languages)
+    merges_path = Path(options.merges_path) if options.merges_path else None
+    vocab_path = Path(options.vocab_path)
+    resolved_model = resolve_model_type(vocab_path, merges_path, options.model_type)
     report = evaluate(
         data_files,
-        vocab_path=Path(options.vocab_path),
-        merges_path=Path(options.merges_path) if options.merges_path else None,
+        vocab_path=vocab_path,
+        merges_path=merges_path,
         tokenizer_path=Path(options.tokenizer_path) if options.tokenizer_path else None,
+        model_type=resolved_model,
         bos=options.bos,
         eos=options.eos,
         morphology=options.morphology,
@@ -507,9 +606,16 @@ def evaluate_cli(options: EvaluateCLIOptions) -> EvaluateCLIResult:
         "tokens": report["corpus"].get("total_tokens"),
         "tokens_per_byte": report["compression"].get("tokens_per_byte"),
         "oov_rate": report["oov"].get("rate"),
+        "model_type": resolved_model,
     }
 
     return EvaluateCLIResult(report=report, summary=summary)
 
 
-__all__ = ["EvaluateCLIOptions", "EvaluateCLIResult", "evaluate", "evaluate_cli"]
+__all__ = [
+    "EvaluateCLIOptions",
+    "EvaluateCLIResult",
+    "evaluate",
+    "evaluate_cli",
+    "resolve_model_type",
+]
