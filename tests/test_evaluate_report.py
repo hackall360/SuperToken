@@ -12,7 +12,9 @@ from tests._stubs import install_torch_stub
 
 install_torch_stub()
 
-from gpu_tokenizer import evaluate as eval_mod  # noqa: E402  pylint: disable=wrong-import-position
+import importlib
+
+eval_mod = importlib.import_module("gpu_tokenizer.evaluate")  # noqa: E402  pylint: disable=wrong-import-position
 from gpu_tokenizer.morphology import (  # noqa: E402  pylint: disable=wrong-import-position
     MorphologyPlugin,
     MorphologySegment,

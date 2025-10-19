@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import glob
 import os
@@ -27,7 +28,6 @@ from gpu_tokenizer import (
     utils,
 )
 from gpu_tokenizer.augmentation import AugmentationMode, AugmentationPipeline, build_augmentation
-from gpu_tokenizer import evaluate as evaluate_module
 from gpu_tokenizer.export import artifacts as export_artifacts
 from gpu_tokenizer.code_mode import prepare_corpus
 from gpu_tokenizer.io import CorpusStreamer, MemoryMappedShard
@@ -39,6 +39,8 @@ from gpu_tokenizer.morphology import (
 from gpu_tokenizer.dtypes import length_storage_dtype
 from gpu_tokenizer.trainers.base import BaseTrainer, CheckpointPayload
 from benchmarks import benchmark_runner
+
+evaluate_module = importlib.import_module("gpu_tokenizer.evaluate")
 
 __all__ = [
     "AutoScaler",
@@ -867,28 +869,23 @@ def _cmd_evaluate(args: argparse.Namespace) -> None:
     morphology_plugin, morphology_config = _resolve_morphology(args)
     augmentation_pipeline = _resolve_augmentation(args)
 
-    report = evaluate_module.evaluate(
-        data_files,
+    evaluate_options = evaluate_module.EvaluateCLIOptions(
+        data_files=data_files,
         vocab_path=vocab_path,
         merges_path=merges_path,
         tokenizer_path=tokenizer_path,
         bos=args.bos,
         eos=args.eos,
         morphology=morphology_plugin,
+        morphology_config=morphology_config,
         code_mode=bool(getattr(args, "code_mode", False)),
-        code_languages=code_langs if code_langs else None,
+        code_languages=sorted(code_langs) if code_langs else None,
         meta_compress=bool(getattr(args, "meta_compress", False)),
         meta_max_length=getattr(args, "meta_max_length", 8),
         deterministic=bool(getattr(args, "deterministic", False)),
     )
-
-    report.setdefault("morphology", {})["config"] = morphology_config
-    report.setdefault("code_mode", {})["config"] = {
-        "enabled": bool(getattr(args, "code_mode", False)),
-        "languages_filter": sorted(code_langs) if code_langs else None,
-        "meta_compress": bool(getattr(args, "meta_compress", False)),
-        "meta_max_length": getattr(args, "meta_max_length", 8),
-    }
+    result = evaluate_module.evaluate_cli(evaluate_options)
+    report = result.report
 
     output_path = getattr(args, "output", None)
     if output_path:
@@ -901,13 +898,7 @@ def _cmd_evaluate(args: argparse.Namespace) -> None:
     else:
         print(json.dumps(report, indent=2, sort_keys=True))
 
-    summary = {
-        "documents": report["corpus"].get("documents"),
-        "tokens": report["corpus"].get("total_tokens"),
-        "tokens_per_byte": report["compression"].get("tokens_per_byte"),
-        "oov_rate": report["oov"].get("rate"),
-    }
-    print(f"[evaluate][summary] {json.dumps(summary, sort_keys=True)}")
+    print(f"[evaluate][summary] {json.dumps(result.summary, sort_keys=True)}")
 
 
 def _cmd_train_bpe(args: argparse.Namespace) -> None:

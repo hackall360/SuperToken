@@ -34,6 +34,33 @@ class MergeRule:
     new_id: int
 
 
+@dataclass(frozen=True)
+class EvaluateCLIOptions:
+    """Typed configuration that mirrors the CLI ``evaluate`` command."""
+
+    data_files: Sequence[Path]
+    vocab_path: Path
+    merges_path: Path | None = None
+    tokenizer_path: Path | None = None
+    bos: int | None = None
+    eos: int | None = None
+    morphology: MorphologyPlugin | None = None
+    morphology_config: Mapping[str, object] | None = None
+    code_mode: bool = False
+    code_languages: Sequence[str] | None = None
+    meta_compress: bool = False
+    meta_max_length: int = 8
+    deterministic: bool = False
+
+
+@dataclass(frozen=True)
+class EvaluateCLIResult:
+    """Structured response that mirrors CLI side-effects."""
+
+    report: dict[str, object]
+    summary: dict[str, object]
+
+
 def _expand_data_patterns(patterns: Sequence[str]) -> list[Path]:
     files: list[Path] = []
     for pattern in patterns:
@@ -397,4 +424,70 @@ def evaluate(
     return report
 
 
-__all__ = ["evaluate"]
+def _normalise_cli_languages(languages: Sequence[str] | None) -> list[str] | None:
+    if not languages:
+        return None
+    normalised: set[str] = set()
+    for entry in languages:
+        if entry is None:
+            continue
+        text = str(entry)
+        if not text:
+            continue
+        for piece in text.split(","):
+            norm = piece.strip().lower()
+            if norm:
+                normalised.add(norm)
+    if not normalised:
+        return None
+    return sorted(normalised)
+
+
+def _morphology_config_from_options(options: EvaluateCLIOptions) -> dict[str, object]:
+    if options.morphology_config is not None:
+        payload = dict(options.morphology_config)
+        payload.setdefault("enabled", bool(options.morphology))
+        return payload
+    return {"enabled": bool(options.morphology)}
+
+
+def evaluate_cli(options: EvaluateCLIOptions) -> EvaluateCLIResult:
+    if not options.data_files:
+        raise ValueError("EvaluateCLIOptions.data_files must not be empty")
+
+    data_files = [Path(path) for path in options.data_files]
+    language_filter = _normalise_cli_languages(options.code_languages)
+    report = evaluate(
+        data_files,
+        vocab_path=Path(options.vocab_path),
+        merges_path=Path(options.merges_path) if options.merges_path else None,
+        tokenizer_path=Path(options.tokenizer_path) if options.tokenizer_path else None,
+        bos=options.bos,
+        eos=options.eos,
+        morphology=options.morphology,
+        code_mode=bool(options.code_mode),
+        code_languages=set(language_filter) if language_filter else None,
+        meta_compress=bool(options.meta_compress),
+        meta_max_length=int(options.meta_max_length),
+        deterministic=bool(options.deterministic),
+    )
+
+    report.setdefault("morphology", {})["config"] = _morphology_config_from_options(options)
+    report.setdefault("code_mode", {})["config"] = {
+        "enabled": bool(options.code_mode),
+        "languages_filter": language_filter,
+        "meta_compress": bool(options.meta_compress),
+        "meta_max_length": int(options.meta_max_length),
+    }
+
+    summary = {
+        "documents": report["corpus"].get("documents"),
+        "tokens": report["corpus"].get("total_tokens"),
+        "tokens_per_byte": report["compression"].get("tokens_per_byte"),
+        "oov_rate": report["oov"].get("rate"),
+    }
+
+    return EvaluateCLIResult(report=report, summary=summary)
+
+
+__all__ = ["EvaluateCLIOptions", "EvaluateCLIResult", "evaluate", "evaluate_cli"]
