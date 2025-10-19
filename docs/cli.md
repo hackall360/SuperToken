@@ -6,6 +6,7 @@ SuperToken ships a single `main.py` entry point that exposes tokenizer training 
 - [Global flags](#global-flags)
 - [Code mode workflows](#code-mode-workflows)
 - [`train-bpe`](#train-bpe)
+- [`resume-bpe`](#resume-bpe)
 - [`train-unigram`](#train-unigram)
 - [`train-hybrid`](#train-hybrid)
 - [Privacy options](#privacy-options)
@@ -92,6 +93,20 @@ The additional flags configure the distributed runtime:
 | `--target-chunk-ms` | Desired processing time per chunk used to size leases dynamically. |
 
 Every few iterations the CLI prints a per-rank status table that surfaces GPU IDs, the most recent tokens/sec readings, current lease sizes, inflight work count, and stage-level timings. Monitoring the table helps operators confirm that faster GPUs keep receiving new leases, slower cards remain productive, and no rank stalls on communication or reduction phases.
+
+## `resume-bpe`
+
+Resume a previously interrupted BPE run without retyping the original arguments:
+
+```bash
+python main.py resume-bpe \
+  --data "data/**/*.txt" \
+  --merges 50000 \
+  --token-bytes 8192 \
+  --resume-from ./artifacts/bpe/checkpoints
+```
+
+The command mirrors every flag accepted by [`train-bpe`](#train-bpe)—including autoscaler knobs such as `--target-util`, batch limits (`--min-batch`/`--max-batch`), privacy guards, and checkpoint writers—so operators can tweak settings or hand a run off to another machine without rewriting scripts. The only additional requirement is `--resume-from`, which must point at the checkpoint directory created by `--checkpoint-dir`. The handler validates the presence of both `--resume-from` and the normal `--data` globs before delegating to the same training routine used by a fresh run.
 
 ## `train-unigram`
 Train a unigram tokenizer with GPU-accelerated expectation-maximization loops:
@@ -209,7 +224,7 @@ Both trainers support checkpointing so long-running runs can survive interruptio
 - `--checkpoint-every`: Step interval between snapshots.
 - `--resume-from`: Restore the latest checkpoint from a directory.
 
-When resuming, the CLI rebuilds trainers, reloads autoscaler state, and seeks the dataset streams accordingly. Implementation specifics live in the [API reference](api.md#checkpointing).
+When resuming, the CLI rebuilds trainers, reloads autoscaler state, and seeks the dataset streams accordingly. The dedicated [`resume-bpe`](#resume-bpe) subcommand wires these options into the same handler as `train-bpe`, making it easy to pick up an interrupted job or continue training on a different node. Implementation specifics live in the [API reference](api.md#checkpointing).
 
 ## Extending the CLI
 To add a new command:
