@@ -27,6 +27,8 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     dist_runtime = lease_queue = ngram_stats = utils = None  # type: ignore
 
+from .evaluate import EvaluateCLIOptions, EvaluateCLIResult, evaluate
+
 try:
     import torch as _torch  # pragma: no cover - optional dependency
     _TORCH_IS_STUB = bool(getattr(_torch, "__super_token_stub__", False))
@@ -66,6 +68,9 @@ __all__ = [
         "MemoryMappedShard",
         "CorpusStreamer",
         "AutoScaler",
+        "EvaluateCLIOptions",
+        "EvaluateCLIResult",
+        "evaluate",
         "dist_runtime",
         "lease_queue",
         "ngram_stats",

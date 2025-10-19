@@ -162,7 +162,51 @@ Supporting dataclasses used by the implementation are also exported for advanced
 - **`MergeRule(left, right, new_id)`** – typed representation of a merge pair applied during compression.
 - **`LoadedCorpus(documents, tokens, raw_bytes, summary)`** – in-memory view of the evaluated corpus including raw byte totals and per-sample metadata.
 
-Import the module with `from gpu_tokenizer import evaluate as eval_mod` to reuse the same logic that backs `python main.py evaluate`.
+Programmatic callers can now stick with the top-level convenience import:
+
+```python
+from pathlib import Path
+
+from gpu_tokenizer import evaluate
+
+report = evaluate([
+    Path("docs.txt"),
+], vocab_path=Path("artifacts/vocab.json"), deterministic=True)
+```
+
+When mirroring CLI output (including config bookkeeping and summary totals), use the typed wrapper that powers `python main.py evaluate`:
+
+- **`EvaluateCLIOptions(...)`** – dataclass that captures the CLI flags after parsing.
+- **`evaluate_cli(options)`** – executes :func:`evaluate`, injects the CLI metadata blocks, and returns an **`EvaluateCLIResult(report, summary)`** tuple-like structure for further processing.
+
+Example:
+
+```python
+from pathlib import Path
+
+from gpu_tokenizer import EvaluateCLIOptions
+from gpu_tokenizer.evaluate import evaluate_cli
+from gpu_tokenizer.morphology import create_plugin
+
+options = EvaluateCLIOptions(
+    data_files=[Path("corpus.txt")],
+    vocab_path=Path("artifacts/vocab.json"),
+    merges_path=Path("artifacts/merges.json"),
+    morphology=create_plugin("tr", case_markers=True, affix_tags=True),
+    morphology_config={
+        "enabled": True,
+        "language": "tr",
+        "case_markers": True,
+        "affix_tags": True,
+    },
+    deterministic=True,
+)
+
+result = evaluate_cli(options)
+print(result.summary)
+```
+
+Importing `gpu_tokenizer.evaluate` directly continues to expose the implementation details (`LoadedCorpus`, `_expand_data_patterns`, etc.) when extending the tooling.
 
 ## CLI Helpers
 Within [`main.py`](https://github.com/example/SuperToken/blob/main/main.py):
