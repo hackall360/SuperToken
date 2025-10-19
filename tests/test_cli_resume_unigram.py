@@ -79,8 +79,19 @@ def _stub_sequences(*args: Any, **kwargs: Any) -> list[list[int]]:
     return [[1, 2, 3]]
 
 
-def _stub_batches(sequences: Iterable[Iterable[int]], *args: Any, **kwargs: Any) -> list[list[int]]:
-    return [list(next(iter(sequences)))]
+def _stub_batches(
+    sequences: Iterable[Iterable[int]],
+    batch_size: int | None = None,
+    seed: int | None = None,
+    augmentation=None,
+    **_: Any,
+) -> list[list[int]]:
+    iterator = iter(sequences)
+    try:
+        first = next(iterator)
+    except StopIteration:
+        return []
+    return [list(first)]
 
 
 @pytest.fixture(autouse=True)

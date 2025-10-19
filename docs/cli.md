@@ -5,10 +5,12 @@ SuperToken ships a single `main.py` entry point that exposes tokenizer training 
 ## Quick Navigation
 - [Global flags](#global-flags)
 - [Code mode workflows](#code-mode-workflows)
+- [Augmentation options](#augmentation-options)
 - [`train-bpe`](#train-bpe)
 - [`resume-bpe`](#resume-bpe)
 - [`train-unigram`](#train-unigram)
 - [`train-hybrid`](#train-hybrid)
+- [Augmentation cookbook](#augmentation-cookbook)
 - [Privacy options](#privacy-options)
 - [`benchmark`](#benchmark)
 - [`evaluate`](#evaluate)
@@ -41,6 +43,22 @@ AST linearisation produces canonical placeholder tokens for identifiers and lite
 
 Because code-mode corpora are pre-packed in memory, the BPE trainer ignores autoscaler resize requests and disables `--resume-from` checkpoints for these runs. Checkpointing continues to work for unigram and hybrid trainers because their batches are replayed locally.
 
+## Augmentation options
+
+Training subcommands accept a pair of flags that inject lightweight data augmentation into the packing pipeline:
+
+| Flag | Description |
+| --- | --- |
+| `--augmentation` | Selects the augmentation policy. Valid values are `none` (default), `entropy`, and `diffusion`. |
+| `--aug-strength` | Floating-point knob that controls the intensity of the chosen policy; `0` disables augmentation. |
+
+Both parameters feed the shared augmentation module used by the pre-packed (`PackedBatcher`) and streaming (`StreamingPackedBatcher`) datasets. Augmentations respect the global `--seed`, ensuring that runs remain reproducible when deterministic shuffles are required. The current release includes two policies:
+
+- **entropy** randomly drops tokens with probability equal to `--aug-strength` (clamped to `[0, 1]`). At least one token always survives.
+- **diffusion** performs local token swaps; `--aug-strength` represents the fraction of the sequence that participates in swaps (again clamped to `[0, 1]`).
+
+Changing augmentation settings mid-run does not retroactively mutate batches restored from checkpoints—the CLI reuses the serialized data recorded on disk. Streaming jobs and freshly materialised batches honour the requested policy on their next pass through the dataset. High strengths can noticeably distort short documents, so start with conservative values (for example `0.1`) when experimenting.
+
 ## `train-bpe`
 Train a byte-pair encoding tokenizer backed by GPU kernels:
 
@@ -59,6 +77,7 @@ Key arguments:
 - `--token-bytes`: Maximum packed byte length per batch.
 - `--checkpoint-dir`: Directory for periodic checkpoints.
 - `--checkpoint-every`: Number of steps between checkpoints.
+- `--augmentation` / `--aug-strength`: Enable on-the-fly corpus augmentation for each packed sequence (see [Augmentation options](#augmentation-options)).
 - `--code-mode`: Preprocess structured code entries instead of byte streams. When enabled the trainer loads corpora eagerly and ignores autoscaler resize events.
 - `--code-langs`: Restrict code-mode runs to specific languages (for example `--code-langs python typescript`).
 - `--meta-compress`: Discover and apply meta-token compression on AST sequences.
@@ -128,6 +147,7 @@ Important options:
 - `--max-subword-len`: Maximum subword length considered when constructing the candidate lattice.
 - `--batch-size`: Number of packed documents replayed per batch.
 - `--seed`: Shuffle seed controlling batch materialisation order.
+- `--augmentation` / `--aug-strength`: Apply augmentation to each batch before it reaches the trainer (see [Augmentation options](#augmentation-options)).
 - `--dry-run`: Instantiate the trainer, log the resolved configuration, and exit without fitting epochs.
 - `--code-mode`: Enable the code-mode ingestion pipeline for JSON or source code repositories.
 - `--code-langs`: Optional allowlist applied when `--code-mode` is set.
@@ -164,10 +184,21 @@ Key arguments:
 - `--code-mode`: Run both phases on AST-linearised corpora.
 - `--code-langs`: Filter the code-mode corpus to specific languages.
 - `--meta-compress`: Share meta-token compression dictionaries across BPE and unigram phases.
+- `--augmentation` / `--aug-strength`: Apply the augmentation pipeline consistently across the BPE and unigram phases.
 - `--morphology-lang` / `--morphology-case-markers` / `--morphology-affix-tags`: Carry morphology preprocessing through both phases.
 - `--privacy` / `--privacy-salt` / `--tie-seed`: Apply the same privacy guard as the standalone BPE trainer to hybrid manifests.
 
 After training the command emits a `hybrid_manifest.json`, Hugging Face-compatible `merges.txt`/`tokenizer.json`, and a SentencePiece-style `unigram.prob`/`unigram.model` pair for downstream consumers. The [`HybridTrainer`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/trainers/hybrid.py) section of the API reference describes the orchestration hooks in more detail.
+
+## Augmentation cookbook
+
+Augmentation is opt-in; the examples below illustrate common scenarios:
+
+- **Stochastic masking for regularisation** – remove a small percentage of tokens to encourage robustness: `python main.py train-bpe --data "data/**/*.txt" --merges 50000 --augmentation entropy --aug-strength 0.1 --dry-run` (swap `train-bpe` for `train-unigram`/`train-hybrid` as needed).
+- **Order-robust shuffling** – soften the importance of local token order without destroying content: `python main.py train-unigram --data data/train.txt --augmentation diffusion --aug-strength 0.3 --epochs 3`.
+- **Disable augmentation** – omit both flags (or set `--augmentation none`) to retain the original corpus. This is the default behaviour for all commands.
+
+Remember that augmentation parameters combine with `--seed`; supply an explicit seed to reproduce the same stochastic transformations across reruns.
 
 ## Privacy options
 

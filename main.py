@@ -25,6 +25,7 @@ from gpu_tokenizer import (
     StreamingPackedBatcher,
     utils,
 )
+from gpu_tokenizer.augmentation import AugmentationMode, AugmentationPipeline, build_augmentation
 from gpu_tokenizer import evaluate as evaluate_module
 from gpu_tokenizer.export import artifacts as export_artifacts
 from gpu_tokenizer.code_mode import prepare_corpus
@@ -128,6 +129,23 @@ def _resolve_morphology(
         "case_markers": case_markers,
         "affix_tags": affix_tags,
     }
+
+
+def _resolve_augmentation(args: argparse.Namespace) -> AugmentationPipeline:
+    """Instantiate the requested augmentation pipeline from CLI options."""
+
+    mode_value = getattr(args, "augmentation", "none") or "none"
+    strength_raw = getattr(args, "aug_strength", 0.0)
+    try:
+        strength_value = float(strength_raw)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"--aug-strength must be a numeric value (got {strength_raw!r})") from exc
+    seed_value = getattr(args, "seed", None)
+    try:
+        pipeline = build_augmentation(mode_value, strength=strength_value, seed=seed_value)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    return pipeline
 
 
 def _detect_code_language(path: Path) -> str | None:
@@ -384,6 +402,8 @@ def _iter_packed_batches(
     sequences: Iterable[Iterable[int]],
     batch_size: int,
     seed: int,
+    *,
+    augmentation: AugmentationPipeline | None = None,
 ) -> Iterable[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Construct a streaming batch iterator backed by :class:`PackedBatcher`.
 
@@ -400,13 +420,20 @@ def _iter_packed_batches(
     Side Effects:
         None.
     """
-    return PackedBatcher(sequences, batch_size=batch_size, seed=seed)
+    return PackedBatcher(
+        sequences,
+        batch_size=batch_size,
+        seed=seed,
+        augmentation=augmentation,
+    )
 
 
 def _build_unigram_batches(
     sequences: Iterable[Iterable[int]],
     batch_size: int,
     seed: int,
+    *,
+    augmentation: AugmentationPipeline | None = None,
 ) -> list[torch.Tensor]:
     """Materialize packed token batches for the unigram trainer.
 
@@ -424,7 +451,12 @@ def _build_unigram_batches(
         Loads the entire packed representation into host memory so batches can
         be replayed across epochs without rebuilding.
     """
-    packed = PackedBatcher(sequences, batch_size=batch_size, seed=seed)
+    packed = PackedBatcher(
+        sequences,
+        batch_size=batch_size,
+        seed=seed,
+        augmentation=augmentation,
+    )
     return [x for (x, _mask, _lengths) in packed]
 
 
@@ -559,6 +591,8 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
     sequences: list[list[int]] = []
     sources: list[dict[str, object]] = []
     morphology_plugin, morphology_config = _resolve_morphology(args)
+    augmentation_pipeline = _resolve_augmentation(args)
+    augmentation_pipeline = _resolve_augmentation(args)
 
     if args.synthetic_docs > 0:
         synthetic = benchmark_runner.synthesize_corpus(
@@ -788,6 +822,7 @@ def _cmd_evaluate(args: argparse.Namespace) -> None:
 
     code_langs = _normalize_code_languages(getattr(args, "code_langs", None))
     morphology_plugin, morphology_config = _resolve_morphology(args)
+    augmentation_pipeline = _resolve_augmentation(args)
 
     report = evaluate_module.evaluate(
         data_files,
@@ -867,6 +902,7 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
     if code_langs:
         code_mode_config["languages"] = sorted(code_langs)
     morphology_plugin, morphology_config = _resolve_morphology(args)
+    augmentation_pipeline = _resolve_augmentation(args)
 
     config = dict(trainer_config)
     config.update(
@@ -879,6 +915,7 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
                 "compression": args.compression,
                 "io_workers": args.io_workers,
                 "prefetch_batches": args.prefetch_batches,
+                "augmentation": augmentation_pipeline.summary(),
             },
             "checkpointing": {
                 "checkpoint_dir": args.checkpoint_dir,
@@ -920,7 +957,12 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
             meta_enabled=bool(getattr(args, "meta_compress", False)),
             morphology=morphology_plugin,
         )
-        batches = PackedBatcher(sequences, batch_size=batch_size, seed=args.seed)
+        batches = PackedBatcher(
+            sequences,
+            batch_size=batch_size,
+            seed=args.seed,
+            augmentation=augmentation_pipeline.fork(),
+        )
         streamer = None
         dataset_tracker = None
     else:
@@ -1136,6 +1178,7 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
                 streamer,
                 packer.encode_view,
                 batch_size=batch_size,
+                augmentation=augmentation_pipeline.fork(),
             )
             dataset_tracker = batches if isinstance(batches, StreamingPackedBatcher) else None
             if dataset_tracker and resume_stream_state:
@@ -1255,6 +1298,7 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
     if code_langs:
         code_mode_config["languages"] = sorted(code_langs)
     morphology_plugin, morphology_config = _resolve_morphology(args)
+    augmentation_pipeline = _resolve_augmentation(args)
     config = dict(trainer_config)
     config.update(
         {
@@ -1263,6 +1307,7 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
                 "files": [str(path) for path in data_files],
                 "bos": args.bos,
                 "eos": args.eos,
+                "augmentation": augmentation_pipeline.summary(),
             },
             "output": args.out_dir,
             "dry_run": bool(getattr(args, "dry_run", False)),
@@ -1319,7 +1364,12 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
             epoch_label = f" at epoch {restored_epochs}"
         print(f"[checkpoint] Restored checkpoint from {args.resume_from}{epoch_label}")
 
-    batches = _build_unigram_batches(sequences, batch_size=args.batch_size, seed=args.seed)
+    batches = _build_unigram_batches(
+        sequences,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        augmentation=augmentation_pipeline.fork(),
+    )
     target_epochs = max(int(args.epochs), 0)
     checkpoint_root: Path | None = None
     checkpoint_dir_value = getattr(args, "checkpoint_dir", None) or getattr(
@@ -1417,6 +1467,7 @@ def _cmd_train_hybrid(args: argparse.Namespace) -> None:
         code_mode_config["languages"] = sorted(code_langs)
 
     morphology_plugin, morphology_config = _resolve_morphology(args)
+    augmentation_pipeline = _resolve_augmentation(args)
 
     privacy_label = str(getattr(args, "privacy", "none") or "none").lower()
     privacy_enabled = privacy_label != "none"
@@ -1446,6 +1497,7 @@ def _cmd_train_hybrid(args: argparse.Namespace) -> None:
             "files": [str(path) for path in data_files],
             "bos": args.bos,
             "eos": args.eos,
+            "augmentation": augmentation_pipeline.summary(),
         },
         "runtime": {
             "batch_size": args.batch_size,
@@ -1493,7 +1545,12 @@ def _cmd_train_hybrid(args: argparse.Namespace) -> None:
             morphology=morphology_plugin,
         )
     batches = list(
-        _iter_packed_batches(sequences, batch_size=args.batch_size, seed=args.seed)
+        _iter_packed_batches(
+            sequences,
+            batch_size=args.batch_size,
+            seed=args.seed,
+            augmentation=augmentation_pipeline.fork(),
+        )
     )
 
     if HybridTrainer is None:  # pragma: no cover - optional torch dependency
@@ -1628,7 +1685,13 @@ def _cmd_stream_batches(args: argparse.Namespace) -> None:
     )
     batch_size = getattr(args, "batch_size", 1024)
     seed = getattr(args, "seed", 1337)
-    batches = _iter_packed_batches(sequences, batch_size=batch_size, seed=seed)
+    augmentation_pipeline = _resolve_augmentation(args)
+    batches = _iter_packed_batches(
+        sequences,
+        batch_size=batch_size,
+        seed=seed,
+        augmentation=augmentation_pipeline.fork(),
+    )
     max_batches = getattr(args, "max_batches", None)
     for idx, (tokens, mask, lengths) in enumerate(batches):
         print(
@@ -1755,6 +1818,20 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
 
+    augmentation_parent = argparse.ArgumentParser(add_help=False)
+    augmentation_parent.add_argument(
+        "--augmentation",
+        type=str,
+        default="none",
+        choices=[mode.value for mode in AugmentationMode],
+        help="Data augmentation mode applied to training sequences",
+    )
+    augmentation_parent.add_argument(
+        "--aug-strength",
+        type=float,
+        default=0.0,
+        help="Strength parameter for the selected augmentation (0 disables)",
+    )
     bpe_parent = argparse.ArgumentParser(add_help=False)
     bpe_parent.add_argument("--merges", type=int, default=50_000)
     bpe_parent.add_argument("--base-vocab", type=int, default=256)
@@ -1818,19 +1895,23 @@ def _parser() -> argparse.ArgumentParser:
     )
 
     train_bpe = subparsers.add_parser(
-        "train-bpe", parents=[common, bpe_parent], help="Train a BPE model"
+        "train-bpe",
+        parents=[common, bpe_parent, augmentation_parent],
+        help="Train a BPE model",
     )
     train_bpe.set_defaults(func=_cmd_train_bpe)
 
     resume_bpe = subparsers.add_parser(
         "resume-bpe",
-        parents=[common, bpe_parent],
+        parents=[common, bpe_parent, augmentation_parent],
         help="Resume BPE training from a checkpoint directory",
     )
     resume_bpe.set_defaults(func=_cmd_resume_bpe)
 
     train_hybrid = subparsers.add_parser(
-        "train-hybrid", parents=[common], help="Train alternating BPE→unigram cycles"
+        "train-hybrid",
+        parents=[common, augmentation_parent],
+        help="Train alternating BPE→unigram cycles",
     )
     train_hybrid.set_defaults(func=_cmd_train_hybrid)
     train_hybrid.add_argument("--merges", type=int, default=50_000)
@@ -1905,7 +1986,9 @@ def _parser() -> argparse.ArgumentParser:
     )
 
     train_unigram = subparsers.add_parser(
-        "train-unigram", parents=[common], help="Train a unigram model"
+        "train-unigram",
+        parents=[common, augmentation_parent],
+        help="Train a unigram model",
     )
     train_unigram.set_defaults(func=_cmd_train_unigram)
     train_unigram.add_argument("--vocab-size", type=int, default=50_000)

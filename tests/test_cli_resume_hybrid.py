@@ -125,7 +125,13 @@ def _stub_sequences(*args: Any, **kwargs: Any) -> list[list[int]]:
     return [[1, 2, 3]]
 
 
-def _stub_iter_batches(*args: Any, **kwargs: Any) -> list[tuple[list[int], list[int], list[int]]]:
+def _stub_iter_batches(
+    sequences: Iterable[Iterable[int]],
+    batch_size: int | None = None,
+    seed: int | None = None,
+    augmentation=None,
+    **_: Any,
+) -> list[tuple[list[int], list[int], list[int]]]:
     return [([], [], [])]
 
 

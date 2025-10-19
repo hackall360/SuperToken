@@ -83,7 +83,73 @@ def test_train_bpe_dry_run_logs_config(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert '"resolved_batch_size"' in captured.out
     config = _extract_config_block(captured.out, "train-bpe")
     assert config.get("morphology") == {"enabled": False}
+    assert config["data"]["augmentation"] == {
+        "mode": "none",
+        "strength": 0.0,
+        "enabled": False,
+    }
     assert "[dry-run] train-bpe initialization complete" in captured.out
+
+
+def test_train_bpe_augmentation_flags_recorded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    class DummyTrainer:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        def fit(self, *args, **kwargs):  # pragma: no cover - defensive
+            raise AssertionError("fit should not run during dry-run")
+
+        def load_checkpoint(self, *args, **kwargs):  # pragma: no cover - defensive
+            raise AssertionError("load_checkpoint should not run during dry-run")
+
+        def save(self, *args, **kwargs):  # pragma: no cover - defensive
+            raise AssertionError("save should not run during dry-run")
+
+    class FailPacker:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("BytePacker should not be instantiated during dry-run")
+
+    class FailStreamer:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("CorpusStreamer should not be instantiated during dry-run")
+
+    monkeypatch.setattr(main, "GPUBPETrainer", DummyTrainer)
+    monkeypatch.setattr(main, "BytePacker", FailPacker)
+    monkeypatch.setattr(main, "CorpusStreamer", FailStreamer)
+
+    shard = tmp_path / "aug_shard.txt"
+    shard.write_text("hello world\n", encoding="utf-8")
+
+    main.main(
+        [
+            "train-bpe",
+            "--data",
+            str(shard),
+            "--merges",
+            "12",
+            "--min-batch",
+            "2",
+            "--max-batch",
+            "4",
+            "--token-bytes",
+            "32",
+            "--augmentation",
+            "entropy",
+            "--aug-strength",
+            "0.25",
+            "--dry-run",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    config = _extract_config_block(captured.out, "train-bpe")
+    assert config["data"]["augmentation"] == {
+        "mode": "entropy",
+        "strength": 0.25,
+        "enabled": True,
+        "seed": 1337,
+    }
 
 
 def test_train_unigram_dry_run_logs_config(
@@ -134,6 +200,11 @@ def test_train_unigram_dry_run_logs_config(
     assert '"batch_size": 16' in captured.out
     config = _extract_config_block(captured.out, "train-unigram")
     assert config.get("morphology") == {"enabled": False}
+    assert config["data"]["augmentation"] == {
+        "mode": "none",
+        "strength": 0.0,
+        "enabled": False,
+    }
     assert "[dry-run] train-unigram initialization complete" in captured.out
 
 
@@ -188,4 +259,9 @@ def test_train_hybrid_dry_run_logs_config(
     assert '"batch_size": 8' in captured.out
     config = _extract_config_block(captured.out, "train-hybrid")
     assert config.get("morphology") == {"enabled": False}
+    assert config["data"]["augmentation"] == {
+        "mode": "none",
+        "strength": 0.0,
+        "enabled": False,
+    }
     assert "[dry-run] train-hybrid initialization complete" in captured.out
