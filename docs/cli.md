@@ -133,6 +133,10 @@ Important options:
 - `--code-langs`: Optional allowlist applied when `--code-mode` is set.
 - `--meta-compress`: Toggle meta-token discovery while preparing code-mode corpora.
 - `--morphology-lang` / `--morphology-case-markers` / `--morphology-affix-tags`: Apply morphology segmentation before packing batches.
+- `--checkpoint-dir`: Directory where the trainer writes checkpoints. Combine with `--resume-from` to continue a run.
+- `--checkpoint-every`: Emit checkpoints every N epochs when `--checkpoint-dir` is set (defaults to final-only when zero).
+- `--resume-from`: Restore optimiser state and epoch history from a previous run. The remaining epochs honour the current CLI flags.
+- `--time-minutes`: Optional wall-clock budget that pauses training after the requested number of minutes, writing a checkpoint when configured.
 
 The [`GPUUnigramTrainer`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/unigram_trainer.py) reuses the same streaming and autoscaling primitives; refer to the [API reference](api.md#trainers) for extension hooks.
 
@@ -154,6 +158,9 @@ Key arguments:
 - `--unigram-epochs`: Epochs to run inside each unigram phase.
 - `--warm-start`: Optional path to a JSON manifest containing seeded merge pairs.
 - `--checkpoint-dir`: Directory where per-cycle checkpoints are stored.
+- `--checkpoint-every`: Write the hybrid checkpoint after every N cycles; when omitted or zero only the final state is saved.
+- `--resume-from`: Restore the previous cycle state and merge history before continuing with additional cycles.
+- `--time-minutes`: Optional wall-clock guard that stops training once the elapsed time reaches the requested number of minutes.
 - `--code-mode`: Run both phases on AST-linearised corpora.
 - `--code-langs`: Filter the code-mode corpus to specific languages.
 - `--meta-compress`: Share meta-token compression dictionaries across BPE and unigram phases.
@@ -261,11 +268,12 @@ Fine-tune ingestion to match storage and hardware characteristics:
 These flags interact with the dataset abstractions outlined in the [architecture overview](architecture.md#dataset-and-streaming-layers). Inspect the [API reference](api.md#datasets) for programmatic configuration.
 
 ## Checkpointing and Resume
-Both trainers support checkpointing so long-running runs can survive interruptions:
+All training commands support checkpointing so long-running runs can survive interruptions:
 
 - `--checkpoint-dir`: Location where checkpoints and autoscaler snapshots are stored.
-- `--checkpoint-every`: Step interval between snapshots.
+- `--checkpoint-every`: Step interval between snapshots (epochs for unigram, cycles for hybrid, merges for BPE).
 - `--resume-from`: Restore the latest checkpoint from a directory.
+- `--time-minutes`: Optional wall-clock guard that pauses training once the threshold is reached and leaves a checkpoint behind.
 
 When resuming, the CLI rebuilds trainers, reloads autoscaler state, and seeks the dataset streams accordingly. The dedicated [`resume-bpe`](#resume-bpe) subcommand wires these options into the same handler as `train-bpe`, making it easy to pick up an interrupted job or continue training on a different node. Implementation specifics live in the [API reference](api.md#checkpointing).
 

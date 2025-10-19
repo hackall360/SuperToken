@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "trainer": {
+    "model": {
+      "base_vocab": 16,
+      "target_vocab": 32,
+      "max_len": 4,
+      "device": "cpu"
+    },
+    "progress": {
+      "completed_epochs": 2,
+      "history": [
+        {"epoch": 1, "vocab": 20, "telemetry": {"tokens": 128}},
+        {"epoch": 2, "vocab": 24, "telemetry": {"tokens": 256}}
+      ]
+    }
+  },
+  "rng": {}
+}
