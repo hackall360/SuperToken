@@ -6,6 +6,7 @@ import argparse
 import json
 import glob
 import sys
+import time
 import types
 from dataclasses import asdict
 from pathlib import Path
@@ -1266,6 +1267,12 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
             "output": args.out_dir,
             "dry_run": bool(getattr(args, "dry_run", False)),
             "code_mode": code_mode_config,
+            "checkpointing": {
+                "checkpoint_dir": args.checkpoint_dir or args.resume_from,
+                "checkpoint_every": args.checkpoint_every,
+                "resume_from": str(args.resume_from) if args.resume_from else None,
+                "time_minutes": args.time_minutes,
+            },
         }
     )
     config["morphology"] = morphology_config
@@ -1292,10 +1299,95 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
             morphology=morphology_plugin,
         )
 
+    resume_state: dict[str, object] | None = None
+    if getattr(args, "resume_from", None):
+        resume_state = trainer.load_checkpoint(str(args.resume_from))
+        payload = resume_state.get("payload") if isinstance(resume_state, Mapping) else None
+        trainer_section = payload.get("trainer") if isinstance(payload, Mapping) else None
+        progress_meta = trainer_section.get("progress") if isinstance(trainer_section, Mapping) else None
+        restored_epochs = getattr(trainer, "completed_epochs", 0)
+        epoch_label = ""
+        if isinstance(progress_meta, Mapping):
+            completed = progress_meta.get("completed_epochs")
+            try:
+                completed_int = int(completed) if completed is not None else restored_epochs
+            except (TypeError, ValueError):
+                completed_int = restored_epochs
+            if completed_int:
+                epoch_label = f" at epoch {completed_int}"
+        elif restored_epochs:
+            epoch_label = f" at epoch {restored_epochs}"
+        print(f"[checkpoint] Restored checkpoint from {args.resume_from}{epoch_label}")
+
     batches = _build_unigram_batches(sequences, batch_size=args.batch_size, seed=args.seed)
-    for epoch in range(args.epochs):
+    target_epochs = max(int(args.epochs), 0)
+    checkpoint_root: Path | None = None
+    checkpoint_dir_value = getattr(args, "checkpoint_dir", None) or getattr(
+        args, "resume_from", None
+    )
+    if checkpoint_dir_value:
+        checkpoint_root = Path(checkpoint_dir_value)
+        checkpoint_root.mkdir(parents=True, exist_ok=True)
+        original_save_checkpoint = trainer.save_checkpoint
+
+        def _save_checkpoint_with_log(self, path: str, *cargs, **ckwargs):
+            state = original_save_checkpoint(path, *cargs, **ckwargs)
+            print(f"[checkpoint] Saved checkpoint → {path}")
+            return state
+
+        trainer.save_checkpoint = types.MethodType(_save_checkpoint_with_log, trainer)
+
+    checkpoint_interval = (
+        int(args.checkpoint_every)
+        if getattr(args, "checkpoint_every", 0)
+        and int(getattr(args, "checkpoint_every", 0)) > 0
+        else None
+    )
+
+    time_minutes_raw = getattr(args, "time_minutes", None)
+    time_limit_s: float | None = None
+    if time_minutes_raw is not None:
+        try:
+            minutes_val = float(time_minutes_raw)
+        except (TypeError, ValueError):
+            minutes_val = None
+        if minutes_val is not None:
+            if minutes_val <= 0:
+                time_limit_s = 0.0
+            else:
+                time_limit_s = minutes_val * 60.0
+
+    start_time = time.perf_counter()
+
+    def _time_exhausted() -> bool:
+        if time_limit_s is None:
+            return False
+        elapsed = time.perf_counter() - start_time
+        return elapsed >= time_limit_s
+
+    time_truncated = False
+    while getattr(trainer, "completed_epochs", 0) < target_epochs:
+        if _time_exhausted():
+            time_truncated = True
+            break
         stats = trainer.fit_epoch(batches)
-        print(f"epoch {epoch + 1}: {stats}")
+        current_epoch = getattr(trainer, "completed_epochs", 0)
+        print(f"epoch {current_epoch}: {stats}")
+        if checkpoint_root is not None and checkpoint_interval is not None:
+            if current_epoch > 0 and current_epoch % checkpoint_interval == 0:
+                trainer.save_checkpoint(str(checkpoint_root))
+
+    if checkpoint_root is not None:
+        trainer.save_checkpoint(str(checkpoint_root))
+
+    if time_truncated and time_limit_s is not None:
+        elapsed_minutes = (time.perf_counter() - start_time) / 60.0
+        print(
+            "[checkpoint] Time limit reached after "
+            f"{elapsed_minutes:.2f} minute(s); training paused at epoch "
+            f"{getattr(trainer, 'completed_epochs', 0)}"
+        )
+
     if args.out_dir:
         trainer.save(args.out_dir)
     if code_mode_summary:
@@ -1332,6 +1424,10 @@ def _cmd_train_hybrid(args: argparse.Namespace) -> None:
     tie_seed = getattr(args, "tie_seed", None)
     privacy_salt = getattr(args, "privacy_salt", None)
 
+    checkpoint_dir_value = getattr(args, "checkpoint_dir", None) or getattr(
+        args, "resume_from", None
+    )
+
     config = {
         "trainer": {
             "base_vocab": args.base_vocab,
@@ -1363,7 +1459,10 @@ def _cmd_train_hybrid(args: argparse.Namespace) -> None:
             else None,
         },
         "checkpointing": {
-            "checkpoint_dir": args.checkpoint_dir,
+            "checkpoint_dir": checkpoint_dir_value,
+            "checkpoint_every": args.checkpoint_every,
+            "resume_from": str(args.resume_from) if args.resume_from else None,
+            "time_minutes": args.time_minutes,
         },
         "output": args.out_dir,
         "dry_run": bool(getattr(args, "dry_run", False)),
@@ -1414,16 +1513,76 @@ def _cmd_train_hybrid(args: argparse.Namespace) -> None:
         bpe_init_kwargs={"device": args.device},
     )
 
+    if getattr(args, "resume_from", None):
+        resume_state = trainer.load_checkpoint(str(args.resume_from))
+        payload = resume_state.get("payload") if isinstance(resume_state, Mapping) else None
+        trainer_section = payload.get("trainer") if isinstance(payload, Mapping) else None
+        progress_meta = trainer_section.get("progress") if isinstance(trainer_section, Mapping) else None
+        restored_cycles = getattr(trainer, "completed_cycles", 0)
+        cycle_label = ""
+        if isinstance(progress_meta, Mapping):
+            completed = progress_meta.get("completed_cycles")
+            try:
+                completed_int = int(completed) if completed is not None else restored_cycles
+            except (TypeError, ValueError):
+                completed_int = restored_cycles
+            if completed_int:
+                cycle_label = f" after {completed_int} cycle(s)"
+        elif restored_cycles:
+            cycle_label = f" after {restored_cycles} cycle(s)"
+        print(f"[checkpoint] Restored checkpoint from {args.resume_from}{cycle_label}")
+
+    checkpoint_interval = (
+        int(args.checkpoint_every)
+        if getattr(args, "checkpoint_every", 0)
+        and int(getattr(args, "checkpoint_every", 0)) > 0
+        else None
+    )
+
+    checkpoint_target = checkpoint_dir_value
+    if checkpoint_target:
+        checkpoint_path = Path(checkpoint_target)
+        checkpoint_path.mkdir(parents=True, exist_ok=True)
+        original_save_checkpoint = trainer.save_checkpoint
+
+        def _hybrid_checkpoint_with_log(self, path: str, *cargs, **ckwargs):
+            state = original_save_checkpoint(path, *cargs, **ckwargs)
+            print(f"[checkpoint] Saved checkpoint → {path}")
+            return state
+
+        trainer.save_checkpoint = types.MethodType(_hybrid_checkpoint_with_log, trainer)
+
+    time_minutes_raw = getattr(args, "time_minutes", None)
+    time_limit_s: float | None = None
+    if time_minutes_raw is not None:
+        try:
+            minutes_val = float(time_minutes_raw)
+        except (TypeError, ValueError):
+            minutes_val = None
+        if minutes_val is not None:
+            if minutes_val <= 0:
+                time_limit_s = 0.0
+            else:
+                time_limit_s = minutes_val * 60.0
+
     bpe_fit_kwargs = {"log_every": args.bpe_log_every}
     summary = trainer.fit(
         batches,
         cycles=args.cycles,
         unigram_epochs=args.unigram_epochs,
         warm_start_merges=warm_start_merges,
-        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_dir=checkpoint_target,
+        checkpoint_interval=checkpoint_interval,
+        time_limit_s=time_limit_s,
         bpe_fit_kwargs=bpe_fit_kwargs,
     )
     print(summary)
+
+    if summary.get("stopped_early") and time_limit_s is not None:
+        print(
+            "[checkpoint] Hybrid time limit reached; paused after "
+            f"{trainer.completed_cycles} cycle(s)"
+        )
 
     if code_mode_summary:
         print(
@@ -1720,6 +1879,24 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="Directory where per-cycle checkpoints are written",
     )
+    train_hybrid.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=0,
+        help="Save the hybrid checkpoint after N cycles (0 disables periodic saves)",
+    )
+    train_hybrid.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Path to a hybrid checkpoint directory created by --checkpoint-dir",
+    )
+    train_hybrid.add_argument(
+        "--time-minutes",
+        type=float,
+        default=None,
+        help="Optional wall-clock budget (in minutes) before pausing hybrid cycles",
+    )
     train_hybrid.add_argument("--out-dir", type=str, default="./hybrid_out")
     train_hybrid.add_argument(
         "--dry-run",
@@ -1737,6 +1914,30 @@ def _parser() -> argparse.ArgumentParser:
     train_unigram.add_argument("--batch-size", type=int, default=1024)
     train_unigram.add_argument("--epochs", type=int, default=1)
     train_unigram.add_argument("--out-dir", type=str, default="./unigram_out")
+    train_unigram.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default=None,
+        help="Directory where unigram checkpoints are written",
+    )
+    train_unigram.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=0,
+        help="Write a checkpoint every N epochs (0 disables periodic checkpoints)",
+    )
+    train_unigram.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Resume training from a checkpoint directory created by --checkpoint-dir",
+    )
+    train_unigram.add_argument(
+        "--time-minutes",
+        type=float,
+        default=None,
+        help="Optional wall-clock budget (in minutes) before pausing training",
+    )
     train_unigram.add_argument(
         "--dry-run",
         action="store_true",

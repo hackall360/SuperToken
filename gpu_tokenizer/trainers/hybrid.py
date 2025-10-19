@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, MutableMapping, Sequence
 
@@ -419,6 +420,7 @@ class HybridTrainer(BaseTrainer):
         self._last_bpe_state: Mapping[str, Any] | None = None
         self._last_unigram_state: Mapping[str, Any] | None = None
         self._completed_cycles: int = 0
+        self._stopped_early: bool = False
 
     # ------------------------------------------------------------------
     # Lifecycle helpers
@@ -453,6 +455,8 @@ class HybridTrainer(BaseTrainer):
         unigram_epochs: int | None = None,
         warm_start_merges: Sequence[tuple[int, int]] | None = None,
         checkpoint_dir: str | os.PathLike[str] | None = None,
+        checkpoint_interval: int | None = None,
+        time_limit_s: float | None = None,
         bpe_fit_kwargs: Mapping[str, Any] | None = None,
         unigram_fit_kwargs: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -484,15 +488,29 @@ class HybridTrainer(BaseTrainer):
         if checkpoint_root is not None:
             checkpoint_root.mkdir(parents=True, exist_ok=True)
 
-        self._phase_history.clear()
-        self._final_merges = []
-        self._final_logp = None
-        self._final_id2piece = {}
-        self._completed_cycles = 0
+        resuming = self._completed_cycles > 0 and bool(self._phase_history)
+        if not resuming:
+            self._phase_history.clear()
+            self._final_merges = []
+            self._final_logp = None
+            self._final_id2piece = {}
+            self._completed_cycles = 0
 
         current_warm_start = warm_plan
+        if resuming and self._final_merges:
+            current_warm_start = [tuple(map(int, pair)) for pair in self._final_merges]
 
-        for cycle_idx in range(total_cycles):
+        start_cycle = self._completed_cycles if resuming else 0
+        target_cycles = max(total_cycles, start_cycle)
+        deadline = None
+        if time_limit_s is not None and time_limit_s > 0:
+            deadline = time.perf_counter() + time_limit_s
+        self._stopped_early = False
+
+        for cycle_idx in range(start_cycle, target_cycles):
+            if deadline is not None and time.perf_counter() >= deadline:
+                self._stopped_early = True
+                break
             bpe_trainer = self._bpe_factory(
                 base_vocab=self.base_vocab,
                 merges=self.bpe_merges,
@@ -563,8 +581,9 @@ class HybridTrainer(BaseTrainer):
                 unigram_result.get("telemetry")
             )
 
+            cycle_number = cycle_idx + 1
             phase_record = {
-                "cycle": cycle_idx + 1,
+                "cycle": cycle_number,
                 "bpe": {
                     "vocab_size": int(bpe_result.get("vocab_size", self.base_vocab)),
                     "merge_count": len(merges),
@@ -582,7 +601,19 @@ class HybridTrainer(BaseTrainer):
 
             self._final_merges = merges
             current_warm_start = merges
-            self._completed_cycles = cycle_idx + 1
+            self._completed_cycles = cycle_number
+
+            if (
+                checkpoint_root is not None
+                and checkpoint_interval is not None
+                and checkpoint_interval > 0
+                and cycle_number % checkpoint_interval == 0
+            ):
+                self.save_checkpoint(checkpoint_root)
+
+            if deadline is not None and time.perf_counter() >= deadline:
+                self._stopped_early = True
+                break
 
         summary = {
             "cycles": self._completed_cycles,
@@ -594,7 +625,10 @@ class HybridTrainer(BaseTrainer):
                 else []
             ),
             "phase_history": _sanitize_for_json(self._phase_history),
+            "stopped_early": bool(self._stopped_early),
         }
+        if checkpoint_root is not None:
+            self.save_checkpoint(checkpoint_root)
         return summary
 
     # ------------------------------------------------------------------
@@ -611,6 +645,11 @@ class HybridTrainer(BaseTrainer):
             "max_unigram_len": self.max_unigram_len,
         }
         trainer_section["privacy"] = self._privacy_summary()
+        trainer_section["progress"] = {
+            "completed_cycles": int(self._completed_cycles),
+            "history": _sanitize_for_json(self._phase_history),
+            "stopped_early": bool(self._stopped_early),
+        }
         payload = CheckpointPayload(
             version=CheckpointPayload.CURRENT_VERSION,
             trainer=trainer_section,
@@ -657,6 +696,22 @@ class HybridTrainer(BaseTrainer):
                     self.tie_seed = int(tie_seed_raw) if tie_seed_raw is not None else None
                 except (TypeError, ValueError):
                     self.tie_seed = None
+
+        progress_meta = trainer_meta.get("progress")
+        if isinstance(progress_meta, Mapping):
+            completed_meta = progress_meta.get("completed_cycles")
+            try:
+                self._completed_cycles = int(completed_meta)
+            except (TypeError, ValueError):
+                pass
+            history_meta = progress_meta.get("history")
+            if isinstance(history_meta, list):
+                self._phase_history = _sanitize_for_json(history_meta)
+            stopped_meta = progress_meta.get("stopped_early")
+            if stopped_meta is not None:
+                self._stopped_early = bool(stopped_meta)
+        else:
+            self._stopped_early = False
 
         tensors = state_dict.get("tensors") if isinstance(state_dict, Mapping) else None
         if isinstance(tensors, Mapping):
@@ -718,6 +773,18 @@ class HybridTrainer(BaseTrainer):
         }
         self.load_state_dict(state)
         return state
+
+    @property
+    def completed_cycles(self) -> int:
+        """Return the number of completed cycles captured in the trainer state."""
+
+        return self._completed_cycles
+
+    @property
+    def stopped_early(self) -> bool:
+        """Indicate whether the most recent fit invocation halted early."""
+
+        return self._stopped_early
 
     # ------------------------------------------------------------------
     # Artifact helpers

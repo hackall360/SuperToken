@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -68,6 +69,8 @@ class GPUUnigramTrainer(BaseTrainer):
         self._cpu_piece_cache: List[torch.Tensor] | None = None
         self._metrics = TrainerMetricsEWMA(enabled=False)
         self.register_metrics_tracker("throughput", self._metrics)
+        self._completed_epochs: int = 0
+        self._epoch_history: list[dict[str, object]] = []
         self.reset_rng(seed=seed, generator=generator)
 
         if self.device == "cuda" and torch.cuda.is_available():
@@ -221,6 +224,7 @@ class GPUUnigramTrainer(BaseTrainer):
                 id2piece = vocab_section.get("id2piece", {})
                 piece2id = vocab_section.get("piece2id", {})
                 tensor_payload = tensors_map if isinstance(tensors_map, Mapping) else {}
+                progress_section = trainer_meta.get("progress")
                 state_dict = {
                     "base_vocab": model_section.get("base_vocab", self.base_vocab),
                     "target_vocab": model_section.get("target_vocab", self.target_vocab),
@@ -229,6 +233,7 @@ class GPUUnigramTrainer(BaseTrainer):
                     "id2piece": id2piece,
                     "piece2id": piece2id,
                     "logp": tensor_payload.get("logp"),
+                    "progress": progress_section,
                 }
                 self._restore_rng_state(payload.rng)
             else:
@@ -262,6 +267,26 @@ class GPUUnigramTrainer(BaseTrainer):
             if decoded_rev:
                 self.piece2id = decoded_rev
 
+        progress_meta = state_dict.get("progress")
+        if isinstance(progress_meta, Mapping):
+            completed = progress_meta.get("completed_epochs")
+            try:
+                self._completed_epochs = int(completed)
+            except (TypeError, ValueError):
+                self._completed_epochs = 0
+            history = progress_meta.get("history")
+            if isinstance(history, list):
+                coerced_history: list[dict[str, object]] = []
+                for entry in history:
+                    if isinstance(entry, Mapping):
+                        coerced_history.append(copy.deepcopy(dict(entry)))
+                self._epoch_history = coerced_history
+            else:
+                self._epoch_history = []
+        else:
+            self._completed_epochs = 0
+            self._epoch_history = []
+
         logp = state_dict.get("logp")
         if isinstance(logp, torch.Tensor):
             self.logp = logp.to(self.device)
@@ -289,6 +314,8 @@ class GPUUnigramTrainer(BaseTrainer):
                     raise RuntimeError("torch tensor constructors unavailable") from exc
 
         self._mark_vocab_dirty()
+        if self._completed_epochs < len(self._epoch_history):
+            self._completed_epochs = len(self._epoch_history)
         if self.device == "cuda" and torch.cuda.is_available():
             self._rebuild_vocab_trie()
         return {"vocab": len(self.id2piece)}
@@ -778,19 +805,27 @@ class GPUUnigramTrainer(BaseTrainer):
         if epochs_int <= 0:
             epochs_int = 1
 
+        start_epoch = self._completed_epochs
+        start_history_len = len(self._epoch_history)
+
         history: list[dict[str, object]] = []
         last_result: dict[str, object] | None = None
-        for epoch_idx in range(epochs_int):
+        for _ in range(epochs_int):
             epoch_result = self.fit_epoch(cached_batches)
             last_result = epoch_result
-            history.append({"epoch": epoch_idx + 1, **epoch_result})
 
         if last_result is None:
             last_result = {"vocab": len(self.id2piece), "telemetry": {}}
 
+        if len(self._epoch_history) > start_history_len:
+            history = [
+                copy.deepcopy(entry)
+                for entry in self._epoch_history[start_history_len:]
+            ]
+
         summary = dict(last_result)
         summary.setdefault("telemetry", {})
-        summary["epochs_ran"] = epochs_int
+        summary["epochs_ran"] = self._completed_epochs - start_epoch
         summary["history"] = history
         return summary
 
@@ -900,7 +935,11 @@ class GPUUnigramTrainer(BaseTrainer):
                 if leases_rate is not None:
                     telemetry["lease_per_s"] = float(leases_rate)
 
-        return {"vocab": len(self.id2piece), "telemetry": telemetry}
+        result = {"vocab": len(self.id2piece), "telemetry": telemetry}
+        self._completed_epochs += 1
+        epoch_entry = copy.deepcopy({"epoch": self._completed_epochs, **result})
+        self._epoch_history.append(epoch_entry)
+        return result
 
     def save_artifacts(self, path: str | PathLike[str]) -> dict[str, object]:
         """Persist the trained unigram model and return its location."""
@@ -932,6 +971,11 @@ class GPUUnigramTrainer(BaseTrainer):
         tensors: dict[str, torch.Tensor] = {}
         if isinstance(self.logp, torch.Tensor):
             tensors["logp"] = self.logp.detach().clone().cpu()
+        progress_section = {
+            "completed_epochs": int(self._completed_epochs),
+            "history": [copy.deepcopy(entry) for entry in self._epoch_history],
+        }
+        trainer_payload["progress"] = progress_section
         payload = CheckpointPayload(
             version=CheckpointPayload.CURRENT_VERSION,
             trainer=trainer_payload,
@@ -959,7 +1003,21 @@ class GPUUnigramTrainer(BaseTrainer):
             loaded = torch.load(tensor_path, map_location="cpu")
             if isinstance(loaded, dict):
                 tensors = loaded
-        return {"payload": payload, "tensors": tensors}
+        state = {"payload": payload, "tensors": tensors}
+        self.load_state_dict(state)
+        return state
+
+    @property
+    def completed_epochs(self) -> int:
+        """Return the number of epochs completed across all runs."""
+
+        return self._completed_epochs
+
+    @property
+    def epoch_history(self) -> list[dict[str, object]]:
+        """Expose a shallow copy of the recorded epoch history."""
+
+        return [copy.deepcopy(entry) for entry in self._epoch_history]
 
     def save(self, path: str | PathLike[str]) -> Path:
         """Serialize the unigram model to a SentencePiece ``.model`` file.

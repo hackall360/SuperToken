@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "trainer": {
+    "base_vocab": 8,
+    "merges": [[0, 1], [1, 2]],
+    "phase_history": [
+      {
+        "cycle": 1,
+        "bpe": {"merge_count": 2, "checkpoint": "cycle_01_bpe"},
+        "unigram": {"epochs": 1, "checkpoint": "cycle_01_unigram"}
+      }
+    ],
+    "cycles": 1,
+    "unigram_epochs": 1,
+    "max_unigram_len": 4,
+    "progress": {
+      "completed_cycles": 1,
+      "history": [
+        {
+          "cycle": 1,
+          "bpe": {"merge_count": 2},
+          "unigram": {"epochs": 1}
+        }
+      ],
+      "stopped_early": false
+    }
+  }
+}
