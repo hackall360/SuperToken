@@ -19,8 +19,8 @@ Invoke the CLI with the same preprocessing flags used during training so morphol
 
 ```bash
 python main.py evaluate \
-  --data tests/data/evaluate/corpus.txt \
-  --artifacts tests/data/evaluate/artifacts \
+  --data tests/data/evaluate_corpus/plain.txt \
+  --artifacts tests/data/models/bpe \
   --morphology-lang tr \
   --deterministic \
   --output reports/evaluate.json

@@ -33,14 +33,15 @@ class _CountingPlugin(MorphologyPlugin):
 
 
 def _fixture_paths() -> dict[str, Path]:
-    data_root = Path("tests/data/evaluate")
+    data_root = Path("tests/data")
     return {
-        "corpus": data_root / "corpus.txt",
-        "artifacts": data_root / "artifacts",
-        "vocab": data_root / "artifacts" / "vocab.json",
-        "merges": data_root / "artifacts" / "merges.json",
-        "tokenizer": data_root / "artifacts" / "tokenizer.json",
-        "expected": data_root / "expected_report.json",
+        "corpus": data_root / "evaluate_corpus" / "plain.txt",
+        "code": data_root / "evaluate_corpus" / "code.jsonl",
+        "models": data_root / "models",
+        "vocab": data_root / "models" / "bpe" / "vocab.json",
+        "merges": data_root / "models" / "bpe" / "merges.json",
+        "tokenizer": data_root / "models" / "bpe" / "tokenizer.json",
+        "expected": data_root / "expected" / "evaluate_report.json",
     }
 
 
@@ -79,15 +80,15 @@ def test_evaluate_report_matches_fixture(tmp_path: Path) -> None:
         vocab_path=paths["vocab"],
         merges_path=paths["merges"],
         tokenizer_path=paths["tokenizer"],
-        morphology=create_plugin("tr", case_markers=False, affix_tags=False),
+        morphology=create_plugin("tr", case_markers=True, affix_tags=True),
         deterministic=True,
     )
 
     report.setdefault("morphology", {})["config"] = {
         "enabled": True,
         "language": "tr",
-        "case_markers": False,
-        "affix_tags": False,
+        "case_markers": True,
+        "affix_tags": True,
     }
     report.setdefault("code_mode", {})["config"] = {
         "enabled": False,
@@ -102,6 +103,37 @@ def test_evaluate_report_matches_fixture(tmp_path: Path) -> None:
     expected = json.loads(paths["expected"].read_text(encoding="utf-8"))
 
     assert report == expected
+
+
+def test_code_mode_report_summarises_meta_tokens() -> None:
+    """Evaluate the code-mode manifest and ensure aggregation stays stable."""
+
+    paths = _fixture_paths()
+    plugin = create_plugin("tr", case_markers=True, affix_tags=True)
+    report = eval_mod.evaluate(  # type: ignore[arg-type]
+        [paths["code"]],
+        vocab_path=paths["vocab"],
+        merges_path=paths["merges"],
+        tokenizer_path=paths["tokenizer"],
+        morphology=plugin,
+        code_mode=True,
+        meta_compress=True,
+        meta_max_length=6,
+        deterministic=True,
+    )
+
+    summary = report["code_mode"]
+
+    assert summary["mode"] == "code"
+    assert summary["documents"] == 3
+    assert summary["ast_samples"] == 2
+    assert summary["fallback_samples"] == 1
+    assert summary["languages"] == ["python", "typescript"]
+    assert summary["meta_enabled"] is True
+    assert summary["meta_max_length"] == 6
+    assert summary["meta_token_count"] == 33
+    assert "META0" in summary["meta_compress"]
+    assert all(name.startswith("META") for name in summary["meta_compress"])
 
 
 def test_cookbook_command_snippet_lists_required_flags() -> None:

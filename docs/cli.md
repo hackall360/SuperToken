@@ -261,8 +261,8 @@ Generate a deterministic JSON report that benchmarks trained artifacts against a
 
 ```bash
 python main.py evaluate \
-  --data tests/data/evaluate/corpus.txt \
-  --artifacts ./artifacts/bpe \
+  --data tests/data/evaluate_corpus/plain.txt \
+  --artifacts tests/data/models/bpe \
   --morphology-lang tr \
   --deterministic \
   --output ./reports/evaluate.json

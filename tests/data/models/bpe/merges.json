@@ -1,0 +1,20 @@
+[
+  {"left": 109, "right": 101, "id": 256},
+  {"left": 256, "right": 116, "id": 257},
+  {"left": 257, "right": 97, "id": 258},
+  {"left": 118, "right": 101, "id": 259},
+  {"left": 259, "right": 114, "id": 260},
+  {"left": 260, "right": 105, "id": 261},
+  {"left": 107, "right": 101, "id": 262},
+  {"left": 262, "right": 100, "id": 263},
+  {"left": 263, "right": 105, "id": 264},
+  {"left": 112, "right": 114, "id": 265},
+  {"left": 265, "right": 111, "id": 266},
+  {"left": 266, "right": 103, "id": 267},
+  {"left": 267, "right": 114, "id": 268},
+  {"left": 268, "right": 97, "id": 269},
+  {"left": 269, "right": 109, "id": 270},
+  {"left": 270, "right": 99, "id": 271},
+  {"left": 271, "right": 105, "id": 272},
+  {"left": 121, "right": 97, "id": 273}
+]
