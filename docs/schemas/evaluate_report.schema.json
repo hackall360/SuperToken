@@ -1,0 +1,146 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Tokenizer evaluation report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "artifacts",
+    "corpus",
+    "compression",
+    "oov",
+    "morphology",
+    "code_mode"
+  ],
+  "properties": {
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "vocab",
+        "vocab_size",
+        "merges",
+        "merge_rules",
+        "tokenizer"
+      ],
+      "properties": {
+        "vocab": {"type": "string"},
+        "vocab_size": {"type": "integer", "minimum": 0},
+        "merges": {
+          "anyOf": [
+            {"type": "string"},
+            {"type": "null"}
+          ]
+        },
+        "merge_rules": {"type": "integer", "minimum": 0},
+        "tokenizer": {
+          "anyOf": [
+            {"type": "string"},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "corpus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "documents",
+        "total_bytes",
+        "total_tokens",
+        "average_bytes",
+        "average_tokens"
+      ],
+      "properties": {
+        "documents": {"type": "integer", "minimum": 0},
+        "total_bytes": {"type": "integer", "minimum": 0},
+        "total_tokens": {"type": "integer", "minimum": 0},
+        "average_bytes": {"type": "number", "minimum": 0},
+        "average_tokens": {"type": "number", "minimum": 0}
+      }
+    },
+    "compression": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tokens_per_byte",
+        "bytes_per_token"
+      ],
+      "properties": {
+        "tokens_per_byte": {"type": "number", "minimum": 0},
+        "bytes_per_token": {"type": "number", "minimum": 0}
+      }
+    },
+    "oov": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "instances",
+        "rate",
+        "unique"
+      ],
+      "properties": {
+        "instances": {"type": "integer", "minimum": 0},
+        "rate": {"type": "number", "minimum": 0},
+        "unique": {
+          "type": "array",
+          "items": {
+            "anyOf": [
+              {"type": "integer"},
+              {"type": "string"}
+            ]
+          }
+        }
+      }
+    },
+    "morphology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "documents": {"type": "integer", "minimum": 0},
+        "total_segments": {"type": "integer", "minimum": 0},
+        "tagged_segments": {"type": "integer", "minimum": 0},
+        "average_segments": {"type": "number", "minimum": 0},
+        "roles": {
+          "type": "object",
+          "additionalProperties": {"type": "integer", "minimum": 0}
+        },
+        "config": {"type": "object"}
+      }
+    },
+    "code_mode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "documents",
+        "reduction"
+      ],
+      "properties": {
+        "mode": {"enum": ["plain", "code"]},
+        "documents": {"type": "integer", "minimum": 0},
+        "reduction": {"type": "number", "minimum": 0, "maximum": 1},
+        "ast_samples": {"type": "integer", "minimum": 0},
+        "fallback_samples": {"type": "integer", "minimum": 0},
+        "languages": {
+          "anyOf": [
+            {"type": "array", "items": {"type": "string"}},
+            {"type": "null"}
+          ]
+        },
+        "meta_compress": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {"type": "string"}
+          }
+        },
+        "meta_token_count": {"type": "integer", "minimum": 0},
+        "meta_enabled": {"type": "boolean"},
+        "meta_max_length": {"type": "integer", "minimum": 1},
+        "config": {"type": "object"}
+      }
+    }
+  }
+}
