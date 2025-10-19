@@ -2,6 +2,9 @@
 
 Use the embedding export CLI to generate a pruned vocabulary, embedding matrix, and manifest suitable for lightweight models.
 
+> **Note:** Flag names changed to `--stats`, `--dimension`, `--dtype`, and `--seed` during the latest CLI refresh. Update any
+> older scripts that still reference `--token-stats` or `--embedding-*` variants before re-running these recipes.
+
 1. Create a toy vocabulary and frequency file for demonstration:
    ```bash
    python - <<'PY'
@@ -27,13 +30,14 @@ Use the embedding export CLI to generate a pruned vocabulary, embedding matrix, 
    ```bash
    python main.py export-embeddings \
      --vocab artifacts/emb-demo/vocab.json \
-     --token-stats artifacts/emb-demo/stats.json \
+     --stats artifacts/emb-demo/stats.json \
      --dedupe-similarity 0.97 \
      --min-frequency 5 \
      --keep-token <pad> \
      --keep-token <unk> \
-     --embedding-dim 32 \
-     --embedding-seed 7 \
+     --dimension 32 \
+     --dtype float32 \
+     --seed 7 \
      --out-dir artifacts/emb-demo/export
    ```
 3. Summarise the manifest and pruning report to verify which tokens survived:
