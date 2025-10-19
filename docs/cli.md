@@ -11,6 +11,7 @@ SuperToken ships a single `main.py` entry point that exposes tokenizer training 
 - [`train-hybrid`](#train-hybrid)
 - [Privacy options](#privacy-options)
 - [`benchmark`](#benchmark)
+- [`evaluate`](#evaluate)
 - [Streaming options](#streaming-options)
 - [Checkpointing and resume](#checkpointing-and-resume)
 - [Extending the CLI](#extending-the-cli)
@@ -200,6 +201,39 @@ Key switches:
 - `--dimension` / `--dtype` / `--seed`: Control the shape and initialization of synthesized vectors.
 
 The command writes four artifacts—`vocab.json`, `embeddings.json`, `manifest.json`, and `pruning.json`—and logs a summary describing how many tokens were deduplicated, how many were pruned after deduplication, and which specials were preserved. Deduplication runs before pruning, honours `--keep-token`, and the resulting pruning log interleaves merged-token metadata with frequency-based removals so downstream tooling can distinguish between the two actions. See [docs/api.md](api.md#embedding-exports) for programmatic access to the export helpers.
+
+## `evaluate`
+
+Generate a deterministic JSON report that benchmarks trained artifacts against a reference corpus:
+
+```bash
+python main.py evaluate \
+  --data tests/data/evaluate/corpus.txt \
+  --artifacts ./artifacts/bpe \
+  --morphology-lang tr \
+  --deterministic \
+  --output ./reports/evaluate.json
+```
+
+Key switches:
+
+- `--artifacts`: Directory containing `vocab.json`, `merges.(json|txt)`, and optionally `tokenizer.json`. Override any component via `--vocab`, `--merges`, or `--tokenizer`.
+- `--output`: File path where the structured report should be written. When omitted the full JSON payload is printed to stdout.
+- `--deterministic`: Sort OOV listings and meta-token summaries so repeated runs remain byte-identical.
+- `--meta-max-length`: Upper bound on meta-token discovery length when `--code-mode` corpora are evaluated.
+- `--code-mode` / `--code-langs` / `--meta-compress`: Reuse the AST-aware pipeline described in [Code mode workflows](#code-mode-workflows) when evaluating source code manifests.
+- `--morphology-*`: The same segmentation toggles exposed by the training commands. When enabled the report records both the aggregate statistics and the resolved morphology configuration.
+
+The command writes a JSON object with several top-level sections:
+
+- `artifacts`: Canonical paths, vocabulary size, and the number of merge rules applied while compressing byte sequences.
+- `corpus`: Document counts, total bytes processed, and per-document averages.
+- `compression`: Derived ratios such as `tokens_per_byte` and its reciprocal `bytes_per_token` after merge application.
+- `oov`: Raw and relative out-of-vocabulary counts alongside the set of offending token ids or strings.
+- `morphology`: Segment counts (and optional role/tag summaries) plus the captured CLI configuration.
+- `code_mode`: The active ingestion mode (`plain` or `code`), sample breakdown, and the resolved code-mode configuration including meta-token statistics.
+
+Downstream workflows can load the JSON directly (for example with `json.load`) to integrate evaluation metrics into dashboards or CI assertions. Deterministic mode guarantees that identical corpora, artifacts, and flags produce identical files—ideal for golden snapshot testing.
 
 ## `benchmark`
 Compare trainers using real and synthetic corpora in a single run:
