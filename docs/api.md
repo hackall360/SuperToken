@@ -144,6 +144,8 @@ Export helpers live in [`gpu_tokenizer/export/artifacts.py`](https://github.com/
 
 The [`export-embeddings` CLI command](cli.md#export-embeddings) composes these helpers. Downstream applications can import `gpu_tokenizer.export` directly to embed SuperToken vocabularies into custom pipelines or notebooks.
 
+When invoking the CLI, the helper arguments surface as `--stats`, `--dimension`, `--dtype`, and `--seed` so scripting aligns with the programmatic API. Prior drafts of the documentation referenced legacy `--token-stats`/`--embedding-*` flags; consult the [CLI usage guide](cli.md#export-embeddings) for the current spellings.
+
 ## CLI Helpers
 Within [`main.py`](https://github.com/example/SuperToken/blob/main/main.py):
 

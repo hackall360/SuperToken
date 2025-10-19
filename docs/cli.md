@@ -123,7 +123,11 @@ Important options:
 
 - `--vocab-size`: Target vocabulary size after pruning.
 - `--epochs`: Number of passes over the corpus.
-- `--min-prob`: Optional probability floor for retention.
+- `--base-vocab`: Size of the seed alphabet supplied to the trainer.
+- `--max-subword-len`: Maximum subword length considered when constructing the candidate lattice.
+- `--batch-size`: Number of packed documents replayed per batch.
+- `--seed`: Shuffle seed controlling batch materialisation order.
+- `--dry-run`: Instantiate the trainer, log the resolved configuration, and exit without fitting epochs.
 - `--code-mode`: Enable the code-mode ingestion pipeline for JSON or source code repositories.
 - `--code-langs`: Optional allowlist applied when `--code-mode` is set.
 - `--meta-compress`: Toggle meta-token discovery while preparing code-mode corpora.
@@ -174,21 +178,26 @@ Transform a trained vocabulary into an embedding package, optionally pruning rar
 ```bash
 python main.py export-embeddings \
   --vocab artifacts/bpe/vocab.json \
-  --token-stats artifacts/bpe/stats.json \
+  --stats artifacts/bpe/stats.json \
   --dedupe-similarity 0.98 \
   --min-frequency 5 \
-  --embedding-dim 256 \
+  --dimension 256 \
+  --dtype float32 \
+  --seed 7 \
   --out-dir artifacts/bpe/embeddings
 ```
+
+> **Heads up:** Earlier documentation referenced `--token-stats`, `--embedding-dim`, and `--embedding-seed`. These options were
+> renamed to `--stats`, `--dimension`, and `--seed` respectively. Update any saved scripts to keep exports reproducible.
 
 Key switches:
 
 - `--vocab`: Path to a tokenizer vocabulary JSON file (the CLI accepts both BPE and unigram outputs).
-- `--token-stats`: Optional token usage statistics gathered during co-training; counts drive pruning and weight seeding.
+- `--stats`: Optional token usage statistics gathered during co-training; counts drive pruning and weight seeding.
 - `--dedupe-similarity`: Cosine similarity threshold used to merge redundant tokens before pruning. Identical or near-identical vectors collapse into a single canonical token, and the pruning report records each merge alongside traditional removals.
 - `--min-frequency`: Drop tokens whose observed frequency falls below the provided threshold (set to `0` to disable pruning).
 - `--keep-token`: Repeatable flag that pins tokens regardless of frequency (for example `--keep-token <pad>`).
-- `--embedding-dim` / `--embedding-dtype` / `--embedding-seed`: Control the shape and initialization of synthesized vectors.
+- `--dimension` / `--dtype` / `--seed`: Control the shape and initialization of synthesized vectors.
 
 The command writes four artifacts—`vocab.json`, `embeddings.json`, `manifest.json`, and `pruning.json`—and logs a summary describing how many tokens were deduplicated, how many were pruned after deduplication, and which specials were preserved. Deduplication runs before pruning, honours `--keep-token`, and the resulting pruning log interleaves merged-token metadata with frequency-based removals so downstream tooling can distinguish between the two actions. See [docs/api.md](api.md#embedding-exports) for programmatic access to the export helpers.
 
