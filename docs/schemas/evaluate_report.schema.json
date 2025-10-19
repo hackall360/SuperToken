@@ -37,7 +37,8 @@
             {"type": "string"},
             {"type": "null"}
           ]
-        }
+        },
+        "model_type": {"enum": ["bpe", "unigram"]}
       }
     },
     "corpus": {
@@ -106,6 +107,7 @@
           "type": "object",
           "additionalProperties": {"type": "integer", "minimum": 0}
         },
+        "purity": {"type": "number", "minimum": 0},
         "config": {"type": "object"}
       }
     },

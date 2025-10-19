@@ -192,6 +192,7 @@ options = EvaluateCLIOptions(
     data_files=[Path("corpus.txt")],
     vocab_path=Path("artifacts/vocab.json"),
     merges_path=Path("artifacts/merges.json"),
+    model_type="bpe",
     morphology=create_plugin("tr", case_markers=True, affix_tags=True),
     morphology_config={
         "enabled": True,
@@ -205,6 +206,8 @@ options = EvaluateCLIOptions(
 result = evaluate_cli(options)
 print(result.summary)
 ```
+
+`result.summary` mirrors the CLI banner and now includes the resolved `model_type` (``"bpe"`` or ``"unigram"``) alongside document, token, and compression metrics.
 
 Importing `gpu_tokenizer.evaluate` directly continues to expose the implementation details (`LoadedCorpus`, `_expand_data_patterns`, etc.) when extending the tooling.
 

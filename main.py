@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-import argparse
-import importlib
-import json
 import glob
 import os
 import sys
 import time
 import types
+import argparse
+import importlib
+import json
+import textwrap
 from dataclasses import asdict
 from pathlib import Path
 from contextlib import ExitStack
@@ -59,6 +60,8 @@ __all__ = [
 
 
 SKIP_EVALUATION_ENV = "SUPERTOKEN_SKIP_EVALUATION"
+DEFAULT_EVALUATE_OUTPUT = Path("reports/evaluate.json")
+EVALUATE_SUMMARY_FORMATS = ("table", "json", "none")
 
 
 def _env_flag(name: str, *, default: bool = False) -> bool:
@@ -75,6 +78,45 @@ def _should_skip_evaluation(force: bool = False) -> bool:
     if force:
         return False
     return _env_flag(SKIP_EVALUATION_ENV)
+
+
+def _format_human_evaluate_summary(summary: Mapping[str, object]) -> str:
+    """Render a compact table describing key evaluation metrics."""
+
+    def _fmt(value: object) -> str:
+        if value is None:
+            return "n/a"
+        if isinstance(value, float):
+            return f"{value:.6f}"
+        if isinstance(value, (int, str)):
+            return str(value)
+        return json.dumps(value)
+
+    rows = [
+        ("model", str(summary.get("model_type") or "?").upper()),
+        ("documents", summary.get("documents")),
+        ("tokens", summary.get("tokens")),
+        ("tokens/byte", summary.get("tokens_per_byte")),
+        ("oov rate", summary.get("oov_rate")),
+    ]
+
+    lines = ["[evaluate][summary]"]
+    for label, value in rows:
+        lines.append(f"  {label:<13}{_fmt(value)}")
+    return "\n".join(lines)
+
+
+def _emit_evaluate_summary(summary: Mapping[str, object], *, fmt: str) -> None:
+    fmt = (fmt or "table").strip().lower()
+    if fmt == "none":
+        return
+    if fmt == "json":
+        print(f"[evaluate][summary] {json.dumps(summary, sort_keys=True)}")
+        return
+    if fmt == "table":
+        print(_format_human_evaluate_summary(summary))
+        return
+    raise ValueError(f"Unsupported summary format: {fmt}")
 
 
 def _load_sequences(
@@ -841,33 +883,54 @@ def _cmd_evaluate(args: argparse.Namespace) -> None:
         if getattr(args, "artifacts", None)
         else None
     )
-    vocab_path = Path(args.vocab) if getattr(args, "vocab", None) else None
-    merges_path = Path(args.merges) if getattr(args, "merges", None) else None
+    vocab_path = Path(args.vocab).expanduser() if getattr(args, "vocab", None) else None
+    merges_path = (
+        Path(args.merges).expanduser() if getattr(args, "merges", None) else None
+    )
     tokenizer_path = (
-        Path(args.tokenizer) if getattr(args, "tokenizer", None) else None
+        Path(args.tokenizer).expanduser()
+        if getattr(args, "tokenizer", None)
+        else None
     )
 
     if artifacts_dir and not artifacts_dir.exists():
         raise SystemExit(f"Artifact directory not found: {artifacts_dir}")
 
     if vocab_path is None and artifacts_dir is not None:
-        candidate = artifacts_dir / "vocab.json"
-        if candidate.exists():
-            vocab_path = candidate
+        for candidate_name in ("vocab.json", "unigram.vocab", "sentencepiece.vocab"):
+            candidate = (artifacts_dir / candidate_name).expanduser()
+            if candidate.exists():
+                vocab_path = candidate
+                break
     if vocab_path is None:
-        raise SystemExit("--vocab or --artifacts must point at a vocabulary JSON file")
+        raise SystemExit(
+            "--vocab or --artifacts must supply a vocabulary file (vocab.json or unigram.vocab)"
+        )
+    if not vocab_path.exists():
+        raise SystemExit(f"Vocabulary file not found: {vocab_path}")
 
     if merges_path is None and artifacts_dir is not None:
         for name in ("merges.json", "merges.txt", "bpe_merges.json"):
-            candidate = artifacts_dir / name
+            candidate = (artifacts_dir / name).expanduser()
             if candidate.exists():
                 merges_path = candidate
                 break
+    if merges_path is not None and not merges_path.exists():
+        raise SystemExit(f"Merge history not found: {merges_path}")
 
     if tokenizer_path is None and artifacts_dir is not None:
-        candidate = artifacts_dir / "tokenizer.json"
+        candidate = (artifacts_dir / "tokenizer.json").expanduser()
         if candidate.exists():
             tokenizer_path = candidate
+
+    try:
+        resolved_model_type = evaluate_module.resolve_model_type(
+            vocab_path,
+            merges_path,
+            getattr(args, "model_type", None),
+        )
+    except ValueError as exc:
+        raise SystemExit(f"[evaluate] {exc}") from exc
 
     code_langs = _normalize_code_languages(getattr(args, "code_langs", None))
     morphology_plugin, morphology_config = _resolve_morphology(args)
@@ -878,6 +941,7 @@ def _cmd_evaluate(args: argparse.Namespace) -> None:
         vocab_path=vocab_path,
         merges_path=merges_path,
         tokenizer_path=tokenizer_path,
+        model_type=resolved_model_type,
         bos=args.bos,
         eos=args.eos,
         morphology=morphology_plugin,
@@ -899,9 +963,17 @@ def _cmd_evaluate(args: argparse.Namespace) -> None:
     except EvaluateReportValidationError as exc:
         raise SystemExit(f"[evaluate] generated report failed schema validation: {exc}") from exc
 
-    output_path = getattr(args, "output", None)
-    if output_path:
-        destination = Path(output_path)
+    output_arg = getattr(args, "output", None)
+    destination: Path | None
+    if output_arg is None:
+        destination = DEFAULT_EVALUATE_OUTPUT
+    elif str(output_arg).strip() == "-":
+        destination = None
+    else:
+        destination = Path(output_arg)
+
+    if destination is not None:
+        destination = destination.expanduser()
         destination.parent.mkdir(parents=True, exist_ok=True)
         with destination.open("w", encoding="utf-8") as handle:
             handle.write(serialized_report)
@@ -910,7 +982,9 @@ def _cmd_evaluate(args: argparse.Namespace) -> None:
     else:
         print(serialized_report)
 
-    print(f"[evaluate][summary] {json.dumps(result.summary, sort_keys=True)}")
+    summary = dict(result.summary)
+    summary.setdefault("model_type", resolved_model_type)
+    _emit_evaluate_summary(summary, fmt=getattr(args, "summary_format", "table"))
 
 
 def _cmd_train_bpe(args: argparse.Namespace) -> None:
@@ -2201,38 +2275,90 @@ def _parser() -> argparse.ArgumentParser:
     evaluate_cmd = subparsers.add_parser(
         "evaluate",
         parents=[common],
-        help="Evaluate tokenizer artifacts against a reference corpus",
+        help="Score tokenizer artifacts against a reference corpus",
+        description=textwrap.dedent(
+            """
+            Score exported BPE or unigram tokenizer artifacts against a held-out
+            corpus. Provide one or more --data globs that mirror your training
+            pre-processing flags (--code-mode, --morphology-*) so compression,
+            OOV, and morphology metrics remain comparable.
+
+            Inputs
+              • Supply --artifacts to point at an export directory or override
+                individual files with --vocab/--merges/--tokenizer.
+              • Pair code-mode corpora with --code-mode/--code-langs and reuse
+                morphology toggles when evaluating segmented text.
+
+            Outputs
+              • A JSON report capturing artifact metadata, compression ratios,
+                OOV breakdowns, morphology coverage, and optional code-mode
+                summaries.
+              • A post-run summary controlled via --summary-format.
+            """
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent(
+            f"""
+            Reports are written to {DEFAULT_EVALUATE_OUTPUT} when --output is
+            omitted. Pass --output - to stream the JSON to stdout instead, and
+            adjust --summary-format (table|json|none) to control the banner.
+            """
+        ),
     )
     evaluate_cmd.set_defaults(func=_cmd_evaluate)
     evaluate_cmd.add_argument(
         "--artifacts",
         type=str,
         default=None,
-        help="Directory containing exported vocab/merge/tokenizer artifacts",
+        help=(
+            "Directory containing exported artifacts. For BPE expect vocab.json"
+            " and merges.(json|txt); SentencePiece unigram exports typically"
+            " expose unigram.vocab. Individual files may be overridden below."
+        ),
     )
     evaluate_cmd.add_argument(
         "--vocab",
         type=str,
         default=None,
-        help="Override path to the vocabulary JSON (defaults to <artifacts>/vocab.json)",
+        help=(
+            "Override the vocabulary path. Defaults to <artifacts>/vocab.json or"
+            " <artifacts>/unigram.vocab when --artifacts is supplied."
+        ),
     )
     evaluate_cmd.add_argument(
         "--merges",
         type=str,
         default=None,
-        help="Optional path to merge metadata (JSON or text)",
+        help=(
+            "Optional merge history used by BPE exports (JSON or text). Required"
+            " unless --model-type unigram is selected."
+        ),
     )
     evaluate_cmd.add_argument(
         "--tokenizer",
         type=str,
         default=None,
-        help="Optional tokenizer.json reference recorded in the report",
+        help="Optional tokenizer.json manifest to record in the artifacts block",
+    )
+    evaluate_cmd.add_argument(
+        "--model-type",
+        type=str,
+        default="auto",
+        choices=["auto", "bpe", "unigram"],
+        help=(
+            "Explicitly declare the export flavour. Auto-detection inspects"
+            " --merges and the vocabulary suffix; force 'unigram' for"
+            " SentencePiece-style packages without merges."
+        ),
     )
     evaluate_cmd.add_argument(
         "--output",
         type=str,
         default=None,
-        help="File path where the JSON report should be written",
+        help=(
+            f"Destination for the JSON report. Defaults to {DEFAULT_EVALUATE_OUTPUT}"
+            " when omitted; use '-' to print the payload to stdout."
+        ),
     )
     evaluate_cmd.add_argument(
         "--meta-max-length",
@@ -2243,13 +2369,24 @@ def _parser() -> argparse.ArgumentParser:
     evaluate_cmd.add_argument(
         "--deterministic",
         action="store_true",
-        help="Stabilise evaluation ordering for reproducible reports",
+        help="Stabilise OOV listings and summaries for reproducible reports",
     )
     evaluate_cmd.add_argument(
         "--force-evaluation",
         action="store_true",
         help=(
             "Ignore the SUPERTOKEN_SKIP_EVALUATION environment flag and run anyway"
+        ),
+    )
+    evaluate_cmd.add_argument(
+        "--summary-format",
+        type=str,
+        default="table",
+        choices=EVALUATE_SUMMARY_FORMATS,
+        help=(
+            "Controls the post-run banner: 'table' renders human-readable"
+            " metrics, 'json' mirrors the legacy structured output, and 'none'"
+            " suppresses the summary."
         ),
     )
     benchmark.add_argument(
