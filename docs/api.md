@@ -134,10 +134,13 @@ Export helpers live in [`gpu_tokenizer/export/artifacts.py`](https://github.com/
 
 - **`load_vocab(path)`**: Reads a tokenizer vocabulary JSON (token→id mapping) from disk.
 - **`load_token_stats(path)`**: Loads optional token usage metadata produced during co-training. Counts and per-token vectors inform pruning and embedding seeding.
-- **`prune_vocabulary(vocab, stats, *, min_frequency, keep_tokens)`**: Produces a renumbered vocabulary while collecting pruned token metadata.
+- **`dedupe_vocabulary(vocab, stats, *, similarity_threshold, dimension, seed, keep_tokens)`**: Clusters tokens whose usage vectors (or synthesized embeddings when vectors are absent) exceed the cosine similarity threshold. Returns a `DedupeResult` containing the merged vocabulary, aggregated statistics, and a log of deduplicated tokens.
+- **`prune_vocabulary(vocab, stats, *, min_frequency, keep_tokens, original_size=None)`**: Produces a renumbered vocabulary while collecting pruned token metadata. The optional `original_size` parameter ensures downstream manifests retain visibility into the vocabulary size before deduplication.
 - **`generate_embedding_matrix(vocab, stats, *, dimension, seed, dtype)`**: Synthesizes an embedding matrix aligned with the surviving vocabulary, reusing stored vectors when available.
 - **`build_manifest(...)`**: Summarises export parameters (dimension, dtype, seed, min frequency, preserved tokens) for logging and reproducibility.
 - **`write_export_package(out_dir, embeddings, vocab, manifest, pruned)`**: Persists the embeddings, pruned vocabulary, manifest, and bookkeeping JSON sidecars.
+
+`dedupe_vocabulary` runs ahead of pruning so any merged tokens disappear from the exported vocabulary, yet the combined pruning log records both the deduplicated entries and subsequent frequency-based removals. Consumers that only care about frequency pruning can ignore entries whose `action` equals `deduped`.
 
 The [`export-embeddings` CLI command](cli.md#export-embeddings) composes these helpers. Downstream applications can import `gpu_tokenizer.export` directly to embed SuperToken vocabularies into custom pipelines or notebooks.
 

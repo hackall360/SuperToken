@@ -28,6 +28,7 @@ Use the embedding export CLI to generate a pruned vocabulary, embedding matrix, 
    python main.py export-embeddings \
      --vocab artifacts/emb-demo/vocab.json \
      --token-stats artifacts/emb-demo/stats.json \
+     --dedupe-similarity 0.97 \
      --min-frequency 5 \
      --keep-token <pad> \
      --keep-token <unk> \
@@ -51,4 +52,4 @@ Use the embedding export CLI to generate a pruned vocabulary, embedding matrix, 
    PY
    ```
 
-You can feed the resulting `vocab.json` and `embeddings.json` into downstream trainers knowing which tokens were removed and why.
+The dedupe threshold runs before pruning, so similar tokens collapse into a canonical entry before the frequency filter executes. Merged tokens show up in `pruning.json` with an `action` of `deduped`, while low-frequency removals retain the historical schema. You can feed the resulting `vocab.json` and `embeddings.json` into downstream trainers knowing which tokens were removed and why.
