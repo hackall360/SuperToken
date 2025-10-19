@@ -11,6 +11,12 @@ from typing import Iterable, Mapping, Sequence
 
 from .cpu_packer import BytePacker
 from .code_mode import prepare_corpus
+from .evaluate_metrics import (
+    compute_code_mode_reduction,
+    compute_compression_ratio,
+    compute_morphology_purity,
+    compute_oov_rate,
+)
 from .export import artifacts as export_artifacts
 from .morphology import MorphologyPlugin
 
@@ -374,7 +380,8 @@ def evaluate(
             evaluated_sequences.append(list(sequence))
 
     for sequence in evaluated_sequences:
-        total_tokens += len(sequence)
+        length = len(sequence)
+        total_tokens += length
         for token in sequence:
             if isinstance(token, int):
                 if token not in vocab_ids:
@@ -386,13 +393,28 @@ def evaluate(
                     oov_items.add(token)
 
     total_bytes = corpus.raw_bytes
+    compression = compute_compression_ratio(total_tokens, total_bytes)
     avg_tokens = total_tokens / len(evaluated_sequences) if evaluated_sequences else 0.0
     avg_bytes = total_bytes / len(evaluated_sequences) if evaluated_sequences else 0.0
-    tokens_per_byte = total_tokens / total_bytes if total_bytes else 0.0
-    bytes_per_token = total_bytes / total_tokens if total_tokens else 0.0
-    oov_rate = oov_instances / total_tokens if total_tokens else 0.0
+    oov_rate = compute_oov_rate(oov_instances, total_tokens)
 
     morphology_summary = _aggregate_morphology(corpus.documents, plugin=morphology)
+    morphology_summary.setdefault("tagged_segments", 0)
+    morphology_summary.setdefault("total_segments", 0)
+    morphology_summary["purity"] = compute_morphology_purity(
+        morphology_summary.get("tagged_segments"),
+        morphology_summary.get("total_segments"),
+    )
+
+    code_mode_summary = dict(corpus.summary)
+    if code_mode_summary.get("mode") == "code":
+        meta = code_mode_summary.get("meta_compress")
+        code_mode_summary["reduction"] = compute_code_mode_reduction(
+            evaluated_sequences,
+            meta if isinstance(meta, Mapping) else {},
+        )
+    else:
+        code_mode_summary.setdefault("reduction", 0.0)
 
     report = {
         "artifacts": {
@@ -409,17 +431,14 @@ def evaluate(
             "average_bytes": avg_bytes,
             "average_tokens": avg_tokens,
         },
-        "compression": {
-            "tokens_per_byte": tokens_per_byte,
-            "bytes_per_token": bytes_per_token,
-        },
+        "compression": compression,
         "oov": {
             "instances": oov_instances,
             "rate": oov_rate,
             "unique": sorted(oov_items, key=lambda item: (str(type(item)), item)),
         },
         "morphology": morphology_summary,
-        "code_mode": corpus.summary,
+        "code_mode": code_mode_summary,
     }
     return report
 
