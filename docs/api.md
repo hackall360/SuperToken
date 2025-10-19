@@ -13,6 +13,7 @@ This reference collects the most commonly extended classes and functions in Supe
 - [Checkpointing](#checkpointing)
 - [Privacy controls](#privacy-controls)
 - [Embedding exports](#embedding-exports)
+- [Evaluation reports](#evaluation-reports)
 - [CLI helpers](#cli-helpers)
 - [Benchmarking utilities](#benchmarking-utilities)
 - [Related guides](#related-guides)
@@ -145,6 +146,23 @@ Export helpers live in [`gpu_tokenizer/export/artifacts.py`](https://github.com/
 The [`export-embeddings` CLI command](cli.md#export-embeddings) composes these helpers. Downstream applications can import `gpu_tokenizer.export` directly to embed SuperToken vocabularies into custom pipelines or notebooks.
 
 When invoking the CLI, the helper arguments surface as `--stats`, `--dimension`, `--dtype`, and `--seed` so scripting aligns with the programmatic API. Prior drafts of the documentation referenced legacy `--token-stats`/`--embedding-*` flags; consult the [CLI usage guide](cli.md#export-embeddings) for the current spellings.
+
+## Evaluation reports
+
+The evaluation helpers live in [`gpu_tokenizer/evaluate.py`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/evaluate.py).
+
+- **`evaluate(data_files, *, vocab_path, merges_path=None, tokenizer_path=None, bos=None, eos=None, morphology=None, code_mode=False, code_languages=None, meta_compress=False, meta_max_length=8, deterministic=False)`**
+  - Loads the provided corpus (plain text or code manifests), applies optional morphology preprocessing, and materialises token sequences.
+  - Applies merge rules to integer token streams when a merge file is supplied and computes aggregate metrics such as total tokens, `tokens_per_byte`, and out-of-vocabulary counts.
+  - Returns a dictionary with the sections documented in [docs/cookbook/evaluate.md](cookbook/evaluate.md): `artifacts`, `corpus`, `compression`, `oov`, `morphology`, and `code_mode`. Each block is serialisable with `json.dump` and matches the CLI output.
+  - Respecting `deterministic=True` seeds the random module so OOV listings and meta-token summaries remain stable—ideal for regression tests or golden reports.
+
+Supporting dataclasses used by the implementation are also exported for advanced integrations:
+
+- **`MergeRule(left, right, new_id)`** – typed representation of a merge pair applied during compression.
+- **`LoadedCorpus(documents, tokens, raw_bytes, summary)`** – in-memory view of the evaluated corpus including raw byte totals and per-sample metadata.
+
+Import the module with `from gpu_tokenizer import evaluate as eval_mod` to reuse the same logic that backs `python main.py evaluate`.
 
 ## CLI Helpers
 Within [`main.py`](https://github.com/example/SuperToken/blob/main/main.py):

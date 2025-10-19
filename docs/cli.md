@@ -3,6 +3,7 @@
 SuperToken ships a single `main.py` entry point that exposes tokenizer training and benchmarking workflows. This guide expands on the quick-start snippets from the [README](https://github.com/example/SuperToken/blob/main/README.md#quick-start) and connects them to the system design described in the [architecture overview](architecture.md).
 
 ## Quick Navigation
+- [Command matrix](#command-matrix)
 - [Global flags](#global-flags)
 - [Code mode workflows](#code-mode-workflows)
 - [Augmentation options](#augmentation-options)
@@ -18,6 +19,20 @@ SuperToken ships a single `main.py` entry point that exposes tokenizer training 
 - [Checkpointing and resume](#checkpointing-and-resume)
 - [Extending the CLI](#extending-the-cli)
 - [Related guides](#related-guides)
+
+## Command matrix
+
+| Command | Primary workflow | Notable flags |
+| --- | --- | --- |
+| `train-bpe` | Fit a merge-based vocabulary with GPU acceleration. | `--merges`, `--token-bytes`, `--checkpoint-dir`, `--augmentation`, `--code-mode`, `--morphology-*`, `--privacy*` |
+| `resume-bpe` | Continue a previous BPE run using stored checkpoints. | `--resume-from`, `--checkpoint-dir`, `--augmentation`, `--code-mode`, `--morphology-*` |
+| `train-unigram` | Optimise unigram vocabularies with EM loops. | `--vocab-size`, `--epochs`, `--base-vocab`, `--max-subword-len`, `--augmentation`, `--code-mode`, `--morphology-*` |
+| `train-hybrid` | Alternate between BPE warm-up and unigram refinement. | `--cycles`, `--unigram-epochs`, `--warm-start`, `--checkpoint-dir`, `--augmentation`, `--code-mode`, `--morphology-*`, `--privacy*` |
+| `export-embeddings` | Convert vocabularies into embedding packages with pruning. | `--vocab`, `--stats`, `--dedupe-similarity`, `--min-frequency`, `--keep-token`, `--dimension`, `--dtype`, `--seed` |
+| `evaluate` | Produce JSON reports that score artifacts against a reference corpus. | `--data`, `--artifacts`/`--vocab`/`--merges`/`--tokenizer`, `--deterministic`, `--meta-max-length`, `--code-mode`, `--code-langs`, `--meta-compress`, `--morphology-*`, `--output` |
+| `benchmark` | Compare trainers on synthetic and real corpora. | `--scenarios`, `--gpus`, `--steps`, `--profile`, `--dist`, `--unigram-*`, `--hybrid-*` |
+
+Use the matrix to spot which CLI options overlap across workflows. Each command also inherits the [global flags](#global-flags) listed below.
 
 ## Global Flags
 Each subcommand inherits a shared set of options that configure inputs, autoscaling, and logging:
