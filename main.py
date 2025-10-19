@@ -1510,17 +1510,16 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
 
-    train_bpe = subparsers.add_parser("train-bpe", parents=[common], help="Train a BPE model")
-    train_bpe.set_defaults(func=_cmd_train_bpe)
-    train_bpe.add_argument("--merges", type=int, default=50_000)
-    train_bpe.add_argument("--base-vocab", type=int, default=256)
-    train_bpe.add_argument("--target-util", type=float, default=0.80)
-    train_bpe.add_argument("--min-batch", type=int, default=512)
-    train_bpe.add_argument("--max-batch", type=int, default=4096)
-    train_bpe.add_argument("--token-bytes", type=int, default=8 * 1024)
-    train_bpe.add_argument("--log-every", type=int, default=100)
-    train_bpe.add_argument("--out-dir", type=str, default="./bpe_out")
-    train_bpe.add_argument(
+    bpe_parent = argparse.ArgumentParser(add_help=False)
+    bpe_parent.add_argument("--merges", type=int, default=50_000)
+    bpe_parent.add_argument("--base-vocab", type=int, default=256)
+    bpe_parent.add_argument("--target-util", type=float, default=0.80)
+    bpe_parent.add_argument("--min-batch", type=int, default=512)
+    bpe_parent.add_argument("--max-batch", type=int, default=4096)
+    bpe_parent.add_argument("--token-bytes", type=int, default=8 * 1024)
+    bpe_parent.add_argument("--log-every", type=int, default=100)
+    bpe_parent.add_argument("--out-dir", type=str, default="./bpe_out")
+    bpe_parent.add_argument(
         "--privacy",
         type=str,
         default="none",
@@ -1531,7 +1530,7 @@ def _parser() -> argparse.ArgumentParser:
             "parity across devices unless you also provide --tie-seed."
         ),
     )
-    train_bpe.add_argument(
+    bpe_parent.add_argument(
         "--privacy-salt",
         type=str,
         default=None,
@@ -1540,7 +1539,7 @@ def _parser() -> argparse.ArgumentParser:
             "The salt itself is never written to manifests."
         ),
     )
-    train_bpe.add_argument(
+    bpe_parent.add_argument(
         "--tie-seed",
         type=int,
         default=None,
@@ -1549,29 +1548,41 @@ def _parser() -> argparse.ArgumentParser:
             "to make stochastic runs reproducible."
         ),
     )
-    train_bpe.add_argument(
+    bpe_parent.add_argument(
         "--checkpoint-dir",
         type=str,
         default=None,
         help="Directory where periodic training checkpoints are written",
     )
-    train_bpe.add_argument(
+    bpe_parent.add_argument(
         "--checkpoint-every",
         type=int,
         default=0,
         help="Frequency (in merges) for checkpoint writes; disabled when set to 0",
     )
-    train_bpe.add_argument(
+    bpe_parent.add_argument(
         "--resume-from",
         type=str,
         default=None,
         help="Path to a checkpoint directory created by --checkpoint-dir",
     )
-    train_bpe.add_argument(
+    bpe_parent.add_argument(
         "--dry-run",
         action="store_true",
         help="Instantiate the trainer, log resolved configuration, and exit",
     )
+
+    train_bpe = subparsers.add_parser(
+        "train-bpe", parents=[common, bpe_parent], help="Train a BPE model"
+    )
+    train_bpe.set_defaults(func=_cmd_train_bpe)
+
+    resume_bpe = subparsers.add_parser(
+        "resume-bpe",
+        parents=[common, bpe_parent],
+        help="Resume BPE training from a checkpoint directory",
+    )
+    resume_bpe.set_defaults(func=_cmd_resume_bpe)
 
     train_hybrid = subparsers.add_parser(
         "train-hybrid", parents=[common], help="Train alternating BPE→unigram cycles"
