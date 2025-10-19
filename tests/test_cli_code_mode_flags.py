@@ -46,6 +46,7 @@ def test_unigram_code_mode_loads_alt_pipeline(monkeypatch: pytest.MonkeyPatch, t
 
         def fit_epoch(self, batches):
             assert list(batches) == ["batch"], "expected stubbed batches"
+            self.completed_epochs = getattr(self, "completed_epochs", 0) + 1
             return {"loss": 0.0}
 
         def save(self, *args, **kwargs):
@@ -54,7 +55,11 @@ def test_unigram_code_mode_loads_alt_pipeline(monkeypatch: pytest.MonkeyPatch, t
     monkeypatch.setattr(main, "GPUUnigramTrainer", DummyTrainer)
     monkeypatch.setattr(main, "_load_code_mode_sequences", fake_loader)
     monkeypatch.setattr(main, "_load_sequences", fail_loader)
-    monkeypatch.setattr(main, "_build_unigram_batches", lambda seqs, batch_size, seed: ["batch"])
+    monkeypatch.setattr(
+        main,
+        "_build_unigram_batches",
+        lambda seqs, batch_size, seed, augmentation=None: ["batch"],
+    )
 
     shard = tmp_path / "code.jsonl"
     shard.write_text("{}\n", encoding="utf-8")
@@ -102,7 +107,11 @@ def test_hybrid_code_mode_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     monkeypatch.setattr(main, "HybridTrainer", DummyHybridTrainer)
     monkeypatch.setattr(main, "_load_code_mode_sequences", fake_loader)
     monkeypatch.setattr(main, "_load_sequences", fail_loader)
-    monkeypatch.setattr(main, "_iter_packed_batches", lambda seqs, batch_size, seed: ["packed"])
+    monkeypatch.setattr(
+        main,
+        "_iter_packed_batches",
+        lambda seqs, batch_size, seed, augmentation=None: ["packed"],
+    )
 
     shard = tmp_path / "hybrid.json"
     shard.write_text("{}", encoding="utf-8")
@@ -138,7 +147,7 @@ def test_bpe_code_mode_uses_packed_batches(monkeypatch: pytest.MonkeyPatch, tmp_
         raise AssertionError("_load_sequences should not be reached in code mode")
 
     class DummyBatcher:
-        def __init__(self, sequences, batch_size, seed):
+        def __init__(self, sequences, batch_size, seed, augmentation=None):
             calls["batcher"] = sequences
 
         def __iter__(self):

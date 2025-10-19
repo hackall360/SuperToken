@@ -10,6 +10,7 @@ import torch
 
 _PIN_MEMORY = torch.cuda.is_available()
 
+from .augmentation import AugmentationPipeline
 from .dtypes import length_storage_dtype
 from .io import CorpusStreamer, DecodedShard
 
@@ -22,8 +23,11 @@ class PackedBatcher:
         sequences: Iterable[Sequence[int]] | Sequence[Sequence[int]],
         batch_size: int = 1024,
         seed: int = 1337,
+        *,
+        augmentation: AugmentationPipeline | None = None,
     ):
-        self.sequences: List[List[int]] = [list(seq) for seq in sequences]
+        self._augment = augmentation
+        self.sequences: List[List[int]] = [self._process_sequence(seq) for seq in sequences]
         self.bs = batch_size
         rng = random.Random(seed)
         rng.shuffle(self.sequences)
@@ -88,6 +92,12 @@ class PackedBatcher:
             )
             buf_idx = 1 - buf_idx
 
+    def _process_sequence(self, sequence: Iterable[int]) -> List[int]:
+        materialised = list(sequence)
+        if self._augment is not None and self._augment.enabled:
+            return self._augment(materialised)
+        return materialised
+
     def iter_device(
         self,
         device: torch.device | str,
@@ -114,6 +124,7 @@ class StreamingPackedBatcher:
         encode_view: Callable[[memoryview], Iterator[int]],
         *,
         batch_size: int = 1024,
+        augmentation: AugmentationPipeline | None = None,
     ) -> None:
         self.streamer = streamer
         self.encode_view = encode_view
@@ -122,6 +133,7 @@ class StreamingPackedBatcher:
         self._length_dtype = length_storage_dtype(self._storage_width)
         self._buffers = [self._allocate_buffer() for _ in range(2)]
         self._stream_state: dict[str, object] = {}
+        self._augment = augmentation
 
     def _allocate_buffer(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         tokens = torch.full(
@@ -154,6 +166,8 @@ class StreamingPackedBatcher:
         shards: list[DecodedShard] = []
         for decoded in self.streamer:
             seq = list(self.encode_view(decoded.view))
+            if self._augment is not None and self._augment.enabled:
+                seq = self._augment(seq)
             rows.append(seq)
             shards.append(decoded)
             if len(rows) == self.bs:
