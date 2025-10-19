@@ -9,7 +9,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, Iterator, Sequence
+from typing import TYPE_CHECKING, Iterable, Iterator, Mapping, Sequence
 
 import torch
 
@@ -1030,6 +1030,7 @@ def serialize_run(
     bpe: dict[str, object],
     unigram: dict[str, object],
     bpe_runs: dict[str, object] | None = None,
+    evaluation: Mapping[str, object] | None = None,
 ) -> Path:
     """Persist benchmark inputs and outputs to JSON for later analysis.
 
@@ -1045,6 +1046,10 @@ def serialize_run(
         Result dictionary from :func:`run_bpe_benchmark`.
     unigram:
         Result dictionary from :func:`run_unigram_benchmark`.
+
+    evaluation:
+        Optional evaluation report payload that will be embedded under the
+        ``"evaluation"`` key of the serialized JSON when provided.
 
     Returns
     -------
@@ -1080,6 +1085,8 @@ def serialize_run(
     }
     if bpe_runs is not None:
         payload["bpe_runs"] = bpe_runs.get("runs") if isinstance(bpe_runs, dict) else bpe_runs
+    if evaluation is not None:
+        payload["evaluation"] = evaluation
     validate_benchmark_output(payload)
     path = output_dir / f"benchmark_{timestamp}.json"
     path.write_text(json.dumps(payload, indent=2, default=_json_default), encoding="utf-8")

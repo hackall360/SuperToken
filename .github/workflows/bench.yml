@@ -17,6 +17,7 @@ jobs:
       benchmark-json: ${{ steps.collect.outputs.json_path }}
       benchmark-table: ${{ steps.collect.outputs.table_path }}
       benchmark-plot: ${{ steps.collect.outputs.plot_path }}
+      evaluation-json: ${{ steps.collect.outputs.evaluation_path }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,6 +55,30 @@ jobs:
             --output-dir "$ARTIFACT_DIR" \
             --device cpu | tee "$ARTIFACT_DIR/latest_summary.txt"
 
+      - name: Run evaluation smoke test
+        env:
+          ARTIFACT_DIR: artifacts/evaluations
+        run: |
+          set -euo pipefail
+          mkdir -p "$ARTIFACT_DIR"
+          python main.py evaluate \
+            --data tests/data/evaluate_corpus/plain.txt \
+            --artifacts tests/data/models/bpe \
+            --morphology-lang tr \
+            --morphology-case-markers \
+            --morphology-affix-tags \
+            --deterministic \
+            --force-evaluation \
+            --output "$ARTIFACT_DIR/ci_evaluation.json"
+          python - <<'PY'
+import json, pathlib
+report_path = pathlib.Path("artifacts/evaluations/ci_evaluation.json")
+data = json.loads(report_path.read_text(encoding="utf-8"))
+compression = data.get("compression", {})
+oov = data.get("oov", {})
+print(f"[evaluate][ci] tokens_per_byte={compression.get('tokens_per_byte')} oov_rate={oov.get('rate')}")
+PY
+
       - name: Generate trend report
         run: |
           python benchmarks/trend_report.py \
@@ -74,11 +99,15 @@ jobs:
           table_path=artifacts/benchmarks/trends/trend_table.md
           plot_path=artifacts/benchmarks/trends/trend_plot.png
           summary_path=artifacts/benchmarks/latest_summary.txt
+          evaluation_path=artifacts/evaluations/ci_evaluation.json
 
           echo "json_path=${json_path}" >> "$GITHUB_OUTPUT"
           echo "table_path=${table_path}" >> "$GITHUB_OUTPUT"
           echo "plot_path=${plot_path}" >> "$GITHUB_OUTPUT"
           echo "summary_path=${summary_path}" >> "$GITHUB_OUTPUT"
+          if [ -f "$evaluation_path" ]; then
+            echo "evaluation_path=${evaluation_path}" >> "$GITHUB_OUTPUT"
+          fi
 
           {
             echo '### Latest benchmark summary'
@@ -86,6 +115,19 @@ jobs:
             echo
             echo '### Trend table'
             cat "$table_path"
+            if [ -f "$evaluation_path" ]; then
+              echo
+              echo '### Evaluation snapshot'
+              python - "$evaluation_path" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+report = json.loads(path.read_text(encoding="utf-8"))
+compression = report.get("compression", {})
+oov = report.get("oov", {})
+print(f"- tokens_per_byte: {compression.get('tokens_per_byte')}")
+print(f"- oov_rate: {oov.get('rate')}")
+PY
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload benchmark artifacts
@@ -98,3 +140,4 @@ jobs:
             artifacts/benchmarks/trends/trend_table.md
             artifacts/benchmarks/trends/trend_plot.png
             artifacts/benchmarks/trends/trend_manifest.json
+            artifacts/evaluations/ci_evaluation.json

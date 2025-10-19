@@ -118,6 +118,7 @@ BENCHMARK_OUTPUT_SCHEMA: dict[str, Any] = {
                 },
             },
         },
+        "evaluation": {"type": "object"},
     },
 }
 
