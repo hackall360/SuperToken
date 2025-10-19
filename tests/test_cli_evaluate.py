@@ -11,9 +11,9 @@ main = importlib.import_module("main")
 
 
 def test_evaluate_cli_generates_report(tmp_path: Path) -> None:
-    data_root = Path(__file__).resolve().parent / "data" / "evaluate"
-    corpus = data_root / "corpus.txt"
-    artifacts = data_root / "artifacts"
+    data_root = Path(__file__).resolve().parent / "data"
+    corpus = data_root / "evaluate_corpus" / "plain.txt"
+    artifacts = data_root / "models" / "bpe"
     output = tmp_path / "report.json"
 
     cwd = Path.cwd()
@@ -29,6 +29,8 @@ def test_evaluate_cli_generates_report(tmp_path: Path) -> None:
             artifacts_arg,
             "--morphology-lang",
             "tr",
+            "--morphology-case-markers",
+            "--morphology-affix-tags",
             "--deterministic",
             "--output",
             str(output),
@@ -37,6 +39,6 @@ def test_evaluate_cli_generates_report(tmp_path: Path) -> None:
 
     assert output.exists()
     report = json.loads(output.read_text(encoding="utf-8"))
-    expected_path = data_root / "expected_report.json"
+    expected_path = data_root / "expected" / "evaluate_report.json"
     expected = json.loads(expected_path.read_text(encoding="utf-8"))
     assert report == expected
