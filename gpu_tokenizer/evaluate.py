@@ -17,6 +17,7 @@ from .evaluate_metrics import (
     compute_morphology_purity,
     compute_oov_rate,
 )
+from .evaluate_report import validate_evaluate_report
 from .export import artifacts as export_artifacts
 from .morphology import MorphologyPlugin
 
@@ -498,6 +499,8 @@ def evaluate_cli(options: EvaluateCLIOptions) -> EvaluateCLIResult:
         "meta_compress": bool(options.meta_compress),
         "meta_max_length": int(options.meta_max_length),
     }
+
+    validate_evaluate_report(report)
 
     summary = {
         "documents": report["corpus"].get("documents"),

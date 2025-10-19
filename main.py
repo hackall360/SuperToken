@@ -38,6 +38,10 @@ from gpu_tokenizer.morphology import (
 )
 from gpu_tokenizer.dtypes import length_storage_dtype
 from gpu_tokenizer.trainers.base import BaseTrainer, CheckpointPayload
+from gpu_tokenizer.evaluate_report import (
+    EvaluateReportValidationError,
+    serialize_evaluate_report,
+)
 from benchmarks import benchmark_runner
 
 evaluate_module = importlib.import_module("gpu_tokenizer.evaluate")
@@ -884,19 +888,27 @@ def _cmd_evaluate(args: argparse.Namespace) -> None:
         meta_max_length=getattr(args, "meta_max_length", 8),
         deterministic=bool(getattr(args, "deterministic", False)),
     )
-    result = evaluate_module.evaluate_cli(evaluate_options)
+    try:
+        result = evaluate_module.evaluate_cli(evaluate_options)
+    except EvaluateReportValidationError as exc:
+        raise SystemExit(f"[evaluate] generated report failed schema validation: {exc}") from exc
     report = result.report
+
+    try:
+        serialized_report = serialize_evaluate_report(report)
+    except EvaluateReportValidationError as exc:
+        raise SystemExit(f"[evaluate] generated report failed schema validation: {exc}") from exc
 
     output_path = getattr(args, "output", None)
     if output_path:
         destination = Path(output_path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         with destination.open("w", encoding="utf-8") as handle:
-            json.dump(report, handle, indent=2, sort_keys=True)
+            handle.write(serialized_report)
             handle.write("\n")
         print(f"[evaluate] wrote report → {destination}")
     else:
-        print(json.dumps(report, indent=2, sort_keys=True))
+        print(serialized_report)
 
     print(f"[evaluate][summary] {json.dumps(result.summary, sort_keys=True)}")
 

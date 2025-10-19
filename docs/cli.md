@@ -286,6 +286,59 @@ The command writes a JSON object with several top-level sections:
 - `morphology`: Segment counts (and optional role/tag summaries) plus the captured CLI configuration.
 - `code_mode`: The active ingestion mode (`plain` or `code`), sample breakdown, and the resolved code-mode configuration including meta-token statistics.
 
+Schema-validated output ensures downstream consumers can rely on these sections. The canonical JSON schema lives at
+[`docs/schemas/evaluate_report.schema.json`](schemas/evaluate_report.schema.json) and the CLI refuses to emit reports that do
+not conform to it. A compact example looks like this:
+
+```json
+{
+  "artifacts": {
+    "merge_rules": 10,
+    "merges": null,
+    "tokenizer": "tokenizer.json",
+    "vocab": "vocab.json",
+    "vocab_size": 42000
+  },
+  "code_mode": {
+    "config": {
+      "enabled": false,
+      "languages_filter": null,
+      "meta_compress": false,
+      "meta_max_length": 8
+    },
+    "documents": 2,
+    "fallback_samples": 0,
+    "languages": ["python"],
+    "meta_compress": {},
+    "meta_enabled": false,
+    "meta_max_length": 8,
+    "meta_token_count": 0,
+    "mode": "plain",
+    "reduction": 0.0
+  },
+  "compression": {
+    "bytes_per_token": 1.23,
+    "tokens_per_byte": 0.81
+  },
+  "corpus": {
+    "average_bytes": 123.0,
+    "average_tokens": 99.0,
+    "documents": 2,
+    "total_bytes": 246,
+    "total_tokens": 198
+  },
+  "morphology": {
+    "config": {"enabled": false},
+    "enabled": false
+  },
+  "oov": {
+    "instances": 0,
+    "rate": 0.0,
+    "unique": []
+  }
+}
+```
+
 Downstream workflows can load the JSON directly (for example with `json.load`) to integrate evaluation metrics into dashboards or CI assertions. Deterministic mode guarantees that identical corpora, artifacts, and flags produce identical files—ideal for golden snapshot testing.
 
 ## `benchmark`
