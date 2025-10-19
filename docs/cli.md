@@ -160,6 +160,7 @@ Transform a trained vocabulary into an embedding package, optionally pruning rar
 python main.py export-embeddings \
   --vocab artifacts/bpe/vocab.json \
   --token-stats artifacts/bpe/stats.json \
+  --dedupe-similarity 0.98 \
   --min-frequency 5 \
   --embedding-dim 256 \
   --out-dir artifacts/bpe/embeddings
@@ -169,11 +170,12 @@ Key switches:
 
 - `--vocab`: Path to a tokenizer vocabulary JSON file (the CLI accepts both BPE and unigram outputs).
 - `--token-stats`: Optional token usage statistics gathered during co-training; counts drive pruning and weight seeding.
+- `--dedupe-similarity`: Cosine similarity threshold used to merge redundant tokens before pruning. Identical or near-identical vectors collapse into a single canonical token, and the pruning report records each merge alongside traditional removals.
 - `--min-frequency`: Drop tokens whose observed frequency falls below the provided threshold (set to `0` to disable pruning).
 - `--keep-token`: Repeatable flag that pins tokens regardless of frequency (for example `--keep-token <pad>`).
 - `--embedding-dim` / `--embedding-dtype` / `--embedding-seed`: Control the shape and initialization of synthesized vectors.
 
-The command writes four artifacts—`vocab.json`, `embeddings.json`, `manifest.json`, and `pruning.json`—and logs a summary describing how many tokens were pruned alongside the preserved specials. See [docs/api.md](api.md#embedding-exports) for programmatic access to the export helpers.
+The command writes four artifacts—`vocab.json`, `embeddings.json`, `manifest.json`, and `pruning.json`—and logs a summary describing how many tokens were deduplicated, how many were pruned after deduplication, and which specials were preserved. Deduplication runs before pruning, honours `--keep-token`, and the resulting pruning log interleaves merged-token metadata with frequency-based removals so downstream tooling can distinguish between the two actions. See [docs/api.md](api.md#embedding-exports) for programmatic access to the export helpers.
 
 ## `benchmark`
 Compare trainers using real and synthetic corpora in a single run:

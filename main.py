@@ -680,11 +680,28 @@ def _cmd_export_embeddings(args: argparse.Namespace) -> None:
 
     vocab = export_artifacts.load_vocab(args.vocab)
     stats = export_artifacts.load_token_stats(args.stats) if args.stats else {}
+    dedupe = export_artifacts.dedupe_vocabulary(
+        vocab,
+        stats,
+        similarity_threshold=getattr(args, "dedupe_similarity", 0.0),
+        dimension=args.dimension,
+        seed=args.seed,
+        keep_tokens=args.keep_token,
+    )
+    vocab = dedupe.vocab
+    stats = dedupe.stats
     prune = export_artifacts.prune_vocabulary(
         vocab,
         stats,
         min_frequency=args.min_frequency,
         keep_tokens=args.keep_token,
+        original_size=dedupe.original_size,
+    )
+    combined_pruned = [*dedupe.deduped, *prune.pruned]
+    prune = export_artifacts.PruneResult(
+        vocab=prune.vocab,
+        pruned=combined_pruned,
+        original_size=dedupe.original_size,
     )
     dtype = export_artifacts.resolve_dtype(args.dtype)
     filtered_stats = {token: stats[token] for token in prune.vocab if token in stats}
@@ -710,11 +727,15 @@ def _cmd_export_embeddings(args: argparse.Namespace) -> None:
         manifest=manifest,
         pruned=prune.pruned,
     )
+    deduped_count = len(dedupe.deduped)
+    pruned_only_count = max(len(prune.pruned) - deduped_count, 0)
     summary = {
         "dimension": manifest.dimension,
         "dtype": manifest.dtype,
+        "deduped_tokens": deduped_count,
         "exported_tokens": manifest.exported_token_count,
-        "pruned_tokens": len(prune.pruned),
+        "pruned_tokens": pruned_only_count,
+        "pruning_log_entries": len(prune.pruned),
         "output_dir": str(args.output_dir),
     }
     print(f"[export][export-embeddings] {json.dumps(summary, sort_keys=True)}")
@@ -1722,6 +1743,15 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Minimum observed frequency required to retain a token",
+    )
+    export_embeddings.add_argument(
+        "--dedupe-similarity",
+        type=float,
+        default=0.0,
+        help=(
+            "Merge tokens whose usage vectors or synthesized embeddings meet or exceed"
+            " this cosine similarity threshold before pruning"
+        ),
     )
     export_embeddings.add_argument(
         "--keep-token",
