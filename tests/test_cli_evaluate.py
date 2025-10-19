@@ -42,3 +42,52 @@ def test_evaluate_cli_generates_report(tmp_path: Path) -> None:
     expected_path = data_root / "expected" / "evaluate_report.json"
     expected = json.loads(expected_path.read_text(encoding="utf-8"))
     assert report == expected
+
+
+def test_evaluate_cli_skip_flag(monkeypatch, tmp_path: Path) -> None:
+    data_root = Path(__file__).resolve().parent / "data"
+    corpus = data_root / "evaluate_corpus" / "plain.txt"
+    artifacts = data_root / "models" / "bpe"
+    output = tmp_path / "skip.json"
+
+    monkeypatch.setenv("SUPERTOKEN_SKIP_EVALUATION", "1")
+
+    cwd = Path.cwd()
+    main.main(
+        [
+            "evaluate",
+            "--data",
+            str(corpus.relative_to(cwd)),
+            "--artifacts",
+            str(artifacts.relative_to(cwd)),
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert not output.exists()
+
+
+def test_evaluate_cli_force_overrides_skip(monkeypatch, tmp_path: Path) -> None:
+    data_root = Path(__file__).resolve().parent / "data"
+    corpus = data_root / "evaluate_corpus" / "plain.txt"
+    artifacts = data_root / "models" / "bpe"
+    output = tmp_path / "forced.json"
+
+    monkeypatch.setenv("SUPERTOKEN_SKIP_EVALUATION", "true")
+
+    cwd = Path.cwd()
+    main.main(
+        [
+            "evaluate",
+            "--data",
+            str(corpus.relative_to(cwd)),
+            "--artifacts",
+            str(artifacts.relative_to(cwd)),
+            "--force-evaluation",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert output.exists()

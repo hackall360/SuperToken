@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import glob
+import os
 import sys
 import time
 import types
@@ -49,6 +50,25 @@ __all__ = [
     "utils",
     "main",
 ]
+
+
+SKIP_EVALUATION_ENV = "SUPERTOKEN_SKIP_EVALUATION"
+
+
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip().lower()
+    if raw in {"", "0", "false", "no", "off"}:
+        return False
+    return True
+
+
+def _should_skip_evaluation(force: bool = False) -> bool:
+    if force:
+        return False
+    return _env_flag(SKIP_EVALUATION_ENV)
 
 
 def _load_sequences(
@@ -684,6 +704,21 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
     # Persist full benchmark metadata so checkpointing infrastructure can re-use
     # the exact same corpora, hyper-parameters, and timing metrics in later
     # automation runs.
+    evaluation_report: dict[str, object] | None = None
+    evaluation_path_raw = getattr(args, "evaluation_report", None)
+    if evaluation_path_raw:
+        evaluation_path = Path(evaluation_path_raw)
+        if not evaluation_path.exists():
+            raise SystemExit(f"Evaluation report not found: {evaluation_path}")
+        try:
+            evaluation_report = json.loads(
+                evaluation_path.read_text(encoding="utf-8")
+            )
+        except json.JSONDecodeError as exc:
+            raise SystemExit(
+                f"Failed to parse evaluation report {evaluation_path}: {exc}"
+            ) from exc
+
     output_path = benchmark_runner.serialize_run(
         Path(args.output_dir),
         corpus=corpus,
@@ -707,6 +742,7 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
         bpe=bpe,
         unigram=unigram,
         bpe_runs=bpe_suite,
+        evaluation=evaluation_report,
     )
     print(f"Saved benchmark metadata → {output_path}")
 
@@ -782,6 +818,13 @@ def _cmd_export_embeddings(args: argparse.Namespace) -> None:
 
 
 def _cmd_evaluate(args: argparse.Namespace) -> None:
+    if _should_skip_evaluation(force=bool(getattr(args, "force_evaluation", False))):
+        print(
+            f"[evaluate] Skipping evaluation because {SKIP_EVALUATION_ENV} is set",
+            flush=True,
+        )
+        return
+
     data_patterns = getattr(args, "data", None)
     if not data_patterns:
         raise SystemExit("evaluate requires at least one --data glob pattern")
@@ -2077,6 +2120,14 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional JSON config describing heterogeneous BPE benchmark runs",
     )
+    benchmark.add_argument(
+        "--evaluation-report",
+        type=str,
+        default=None,
+        help=(
+            "Optional evaluation JSON report to merge into the benchmark metadata"
+        ),
+    )
 
     export_embeddings = subparsers.add_parser(
         "export-embeddings",
@@ -2190,6 +2241,13 @@ def _parser() -> argparse.ArgumentParser:
         "--deterministic",
         action="store_true",
         help="Stabilise evaluation ordering for reproducible reports",
+    )
+    evaluate_cmd.add_argument(
+        "--force-evaluation",
+        action="store_true",
+        help=(
+            "Ignore the SUPERTOKEN_SKIP_EVALUATION environment flag and run anyway"
+        ),
     )
     benchmark.add_argument(
         "--unigram-base-vocab",

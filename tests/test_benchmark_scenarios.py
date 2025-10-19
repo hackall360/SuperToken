@@ -140,3 +140,21 @@ def test_schema_validation_detects_missing_section() -> None:
     }
     with pytest.raises(SchemaValidationError):
         validate_benchmark_output(payload, BENCHMARK_OUTPUT_SCHEMA)
+
+
+def test_serialize_run_includes_optional_evaluation(tmp_path: Path) -> None:
+    corpus = CorpusSummary(sequences=2, tokens=32, max_length=16, sources=[])
+    bpe, unigram = _build_stub_results()
+    evaluation = {"corpus": {"documents": 3}}
+
+    path = serialize_run(
+        tmp_path,
+        corpus=corpus,
+        config={},
+        bpe=bpe,
+        unigram=unigram,
+        evaluation=evaluation,
+    )
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["evaluation"] == evaluation
