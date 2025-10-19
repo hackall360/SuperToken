@@ -17,6 +17,7 @@ nav:
       - Hybrid schedule: cookbook/hybrid_workflow.md
       - Code-aware training: cookbook/code_mode.md
       - Morphology workflow: cookbook/morphology.md
+      - Evaluation reports: cookbook/evaluate.md
       - Embedding pruning: cookbook/embedding_pruning.md
 
 markdown_extensions:

@@ -1,0 +1,51 @@
+{
+  "artifacts": {
+    "merge_rules": 8,
+    "merges": "tests/data/evaluate/artifacts/merges.json",
+    "tokenizer": "tests/data/evaluate/artifacts/tokenizer.json",
+    "vocab": "tests/data/evaluate/artifacts/vocab.json",
+    "vocab_size": 16
+  },
+  "code_mode": {
+    "config": {
+      "enabled": false,
+      "languages_filter": null,
+      "meta_compress": false,
+      "meta_max_length": 8
+    },
+    "documents": 2,
+    "mode": "plain"
+  },
+  "compression": {
+    "bytes_per_token": 1.4,
+    "tokens_per_byte": 0.7142857142857143
+  },
+  "corpus": {
+    "average_bytes": 14.0,
+    "average_tokens": 10.0,
+    "documents": 2,
+    "total_bytes": 28,
+    "total_tokens": 20
+  },
+  "morphology": {
+    "average_segments": 3.0,
+    "config": {
+      "affix_tags": false,
+      "case_markers": false,
+      "enabled": true,
+      "language": "tr"
+    },
+    "documents": 2,
+    "enabled": true,
+    "roles": {},
+    "tagged_segments": 0,
+    "total_segments": 6
+  },
+  "oov": {
+    "instances": 1,
+    "rate": 0.05,
+    "unique": [
+      188
+    ]
+  }
+}

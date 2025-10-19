@@ -24,6 +24,7 @@ from gpu_tokenizer import (
     StreamingPackedBatcher,
     utils,
 )
+from gpu_tokenizer import evaluate as evaluate_module
 from gpu_tokenizer.export import artifacts as export_artifacts
 from gpu_tokenizer.code_mode import prepare_corpus
 from gpu_tokenizer.io import CorpusStreamer, MemoryMappedShard
@@ -743,6 +744,91 @@ def _cmd_export_embeddings(args: argparse.Namespace) -> None:
         "Exported embeddings → "
         f"{paths['embeddings']} ({manifest.exported_token_count} tokens)"
     )
+
+
+def _cmd_evaluate(args: argparse.Namespace) -> None:
+    data_patterns = getattr(args, "data", None)
+    if not data_patterns:
+        raise SystemExit("evaluate requires at least one --data glob pattern")
+    data_files = _expand_data_patterns(data_patterns)
+
+    artifacts_dir = (
+        Path(getattr(args, "artifacts"))
+        if getattr(args, "artifacts", None)
+        else None
+    )
+    vocab_path = Path(args.vocab) if getattr(args, "vocab", None) else None
+    merges_path = Path(args.merges) if getattr(args, "merges", None) else None
+    tokenizer_path = (
+        Path(args.tokenizer) if getattr(args, "tokenizer", None) else None
+    )
+
+    if artifacts_dir and not artifacts_dir.exists():
+        raise SystemExit(f"Artifact directory not found: {artifacts_dir}")
+
+    if vocab_path is None and artifacts_dir is not None:
+        candidate = artifacts_dir / "vocab.json"
+        if candidate.exists():
+            vocab_path = candidate
+    if vocab_path is None:
+        raise SystemExit("--vocab or --artifacts must point at a vocabulary JSON file")
+
+    if merges_path is None and artifacts_dir is not None:
+        for name in ("merges.json", "merges.txt", "bpe_merges.json"):
+            candidate = artifacts_dir / name
+            if candidate.exists():
+                merges_path = candidate
+                break
+
+    if tokenizer_path is None and artifacts_dir is not None:
+        candidate = artifacts_dir / "tokenizer.json"
+        if candidate.exists():
+            tokenizer_path = candidate
+
+    code_langs = _normalize_code_languages(getattr(args, "code_langs", None))
+    morphology_plugin, morphology_config = _resolve_morphology(args)
+
+    report = evaluate_module.evaluate(
+        data_files,
+        vocab_path=vocab_path,
+        merges_path=merges_path,
+        tokenizer_path=tokenizer_path,
+        bos=args.bos,
+        eos=args.eos,
+        morphology=morphology_plugin,
+        code_mode=bool(getattr(args, "code_mode", False)),
+        code_languages=code_langs if code_langs else None,
+        meta_compress=bool(getattr(args, "meta_compress", False)),
+        meta_max_length=getattr(args, "meta_max_length", 8),
+        deterministic=bool(getattr(args, "deterministic", False)),
+    )
+
+    report.setdefault("morphology", {})["config"] = morphology_config
+    report.setdefault("code_mode", {})["config"] = {
+        "enabled": bool(getattr(args, "code_mode", False)),
+        "languages_filter": sorted(code_langs) if code_langs else None,
+        "meta_compress": bool(getattr(args, "meta_compress", False)),
+        "meta_max_length": getattr(args, "meta_max_length", 8),
+    }
+
+    output_path = getattr(args, "output", None)
+    if output_path:
+        destination = Path(output_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        print(f"[evaluate] wrote report → {destination}")
+    else:
+        print(json.dumps(report, indent=2, sort_keys=True))
+
+    summary = {
+        "documents": report["corpus"].get("documents"),
+        "tokens": report["corpus"].get("total_tokens"),
+        "tokens_per_byte": report["compression"].get("tokens_per_byte"),
+        "oov_rate": report["oov"].get("rate"),
+    }
+    print(f"[evaluate][summary] {json.dumps(summary, sort_keys=True)}")
 
 
 def _cmd_train_bpe(args: argparse.Namespace) -> None:
@@ -1772,6 +1858,54 @@ def _parser() -> argparse.ArgumentParser:
             "Token string to always preserve during pruning; repeat the flag to"
             " keep multiple tokens"
         ),
+    )
+
+    evaluate_cmd = subparsers.add_parser(
+        "evaluate",
+        parents=[common],
+        help="Evaluate tokenizer artifacts against a reference corpus",
+    )
+    evaluate_cmd.set_defaults(func=_cmd_evaluate)
+    evaluate_cmd.add_argument(
+        "--artifacts",
+        type=str,
+        default=None,
+        help="Directory containing exported vocab/merge/tokenizer artifacts",
+    )
+    evaluate_cmd.add_argument(
+        "--vocab",
+        type=str,
+        default=None,
+        help="Override path to the vocabulary JSON (defaults to <artifacts>/vocab.json)",
+    )
+    evaluate_cmd.add_argument(
+        "--merges",
+        type=str,
+        default=None,
+        help="Optional path to merge metadata (JSON or text)",
+    )
+    evaluate_cmd.add_argument(
+        "--tokenizer",
+        type=str,
+        default=None,
+        help="Optional tokenizer.json reference recorded in the report",
+    )
+    evaluate_cmd.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="File path where the JSON report should be written",
+    )
+    evaluate_cmd.add_argument(
+        "--meta-max-length",
+        type=int,
+        default=8,
+        help="Maximum meta-token length when evaluating code-mode corpora",
+    )
+    evaluate_cmd.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Stabilise evaluation ordering for reproducible reports",
     )
     benchmark.add_argument(
         "--unigram-base-vocab",
