@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 
 import pytest
 
@@ -19,6 +20,7 @@ def sample_report() -> dict[str, object]:
             "merges": None,
             "tokenizer": "tokenizer.json",
             "vocab": "vocab.json",
+            "model_type": "bpe",
             "vocab_size": 42,
         },
         "corpus": {
@@ -68,72 +70,7 @@ def sample_report() -> dict[str, object]:
 
 
 def test_serialize_report_is_deterministic(sample_report: dict[str, object]) -> None:
-    expected = (
-        "{\n"
-        "  \"artifacts\": {\n"
-        "    \"merge_rules\": 10,\n"
-        "    \"merges\": null,\n"
-        "    \"tokenizer\": \"tokenizer.json\",\n"
-        "    \"vocab\": \"vocab.json\",\n"
-        "    \"vocab_size\": 42\n"
-        "  },\n"
-        "  \"code_mode\": {\n"
-        "    \"ast_samples\": 1,\n"
-        "    \"config\": {\n"
-        "      \"enabled\": false,\n"
-        "      \"languages_filter\": null,\n"
-        "      \"meta_compress\": false,\n"
-        "      \"meta_max_length\": 8\n"
-        "    },\n"
-        "    \"documents\": 2,\n"
-        "    \"fallback_samples\": 1,\n"
-        "    \"languages\": [\n"
-        "      \"python\"\n"
-        "    ],\n"
-        "    \"meta_compress\": {\n"
-        "      \"META_0\": [\n"
-        "        \"def\",\n"
-        "        \"foo\"\n"
-        "      ]\n"
-        "    },\n"
-        "    \"meta_enabled\": false,\n"
-        "    \"meta_max_length\": 8,\n"
-        "    \"meta_token_count\": 1,\n"
-        "    \"mode\": \"code\",\n"
-        "    \"reduction\": 0.25\n"
-        "  },\n"
-        "  \"compression\": {\n"
-        "    \"bytes_per_token\": 1.5625,\n"
-        "    \"tokens_per_byte\": 0.64\n"
-        "  },\n"
-        "  \"corpus\": {\n"
-        "    \"average_bytes\": 12.5,\n"
-        "    \"average_tokens\": 8.0,\n"
-        "    \"documents\": 2,\n"
-        "    \"total_bytes\": 25,\n"
-        "    \"total_tokens\": 16\n"
-        "  },\n"
-        "  \"morphology\": {\n"
-        "    \"average_segments\": 3.0,\n"
-        "    \"config\": {\n"
-        "      \"enabled\": false\n"
-        "    },\n"
-        "    \"documents\": 2,\n"
-        "    \"enabled\": false,\n"
-        "    \"roles\": {},\n"
-        "    \"tagged_segments\": 0,\n"
-        "    \"total_segments\": 6\n"
-        "  },\n"
-        "  \"oov\": {\n"
-        "    \"instances\": 1,\n"
-        "    \"rate\": 0.0625,\n"
-        "    \"unique\": [\n"
-        "      \"<unk>\",\n"
-        "      512\n"
-        "    ]\n"
-        "  }\n"
-        "}"
-    )
+    expected = json.dumps(sample_report, indent=2, sort_keys=True)
     serialized = serialize_evaluate_report(sample_report)
     assert serialized == expected
     # A second call confirms that ordering is stable regardless of mapping iteration
@@ -158,3 +95,41 @@ def test_invalid_item_type_is_reported(sample_report: dict[str, object]) -> None
         match=r"\$\.oov\.unique\[0\]: value 0\.5 does not satisfy anyOf constraints",
     ):
         validate_evaluate_report(broken)
+
+
+def test_artifact_model_type_enum_enforced(sample_report: dict[str, object]) -> None:
+    broken = copy.deepcopy(sample_report)
+    broken["artifacts"]["model_type"] = "bytepair"
+    with pytest.raises(
+        EvaluateReportValidationError,
+        match=r"\$\.artifacts\.model_type: value 'bytepair' not in enum \['bpe', 'unigram'\]",
+    ):
+        validate_evaluate_report(broken)
+
+
+def test_morphology_config_required(sample_report: dict[str, object]) -> None:
+    broken = copy.deepcopy(sample_report)
+    del broken["morphology"]["config"]
+    with pytest.raises(
+        EvaluateReportValidationError,
+        match=r"\$\.morphology: missing required property 'config'",
+    ):
+        validate_evaluate_report(broken)
+
+
+def test_code_mode_languages_filter_type(sample_report: dict[str, object]) -> None:
+    broken = copy.deepcopy(sample_report)
+    broken["code_mode"]["config"]["languages_filter"] = "python"
+    with pytest.raises(
+        EvaluateReportValidationError,
+        match=r"\$\.code_mode\.config\.languages_filter: value 'python' does not satisfy anyOf constraints",
+    ):
+        validate_evaluate_report(broken)
+
+
+def test_serializer_materialises_sequences(sample_report: dict[str, object]) -> None:
+    report = copy.deepcopy(sample_report)
+    report["oov"]["unique"] = ("<unk>", 512)
+    serialized = serialize_evaluate_report(report)
+    payload = json.loads(serialized)
+    assert payload["oov"]["unique"] == ["<unk>", 512]

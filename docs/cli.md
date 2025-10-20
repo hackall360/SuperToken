@@ -282,7 +282,7 @@ Key switches:
 
 The command writes a JSON object with several top-level sections:
 
-- `artifacts`: Canonical paths, vocabulary size, and the number of merge rules applied while compressing byte sequences.
+- `artifacts`: Canonical paths, vocabulary size, resolved `model_type`, and the number of merge rules applied while compressing byte sequences.
 - `corpus`: Document counts, total bytes processed, and per-document averages.
 - `compression`: Derived ratios such as `tokens_per_byte` and its reciprocal `bytes_per_token` after merge application.
 - `oov`: Raw and relative out-of-vocabulary counts alongside the set of offending token ids or strings.
@@ -291,7 +291,8 @@ The command writes a JSON object with several top-level sections:
 
 Schema-validated output ensures downstream consumers can rely on these sections. The canonical JSON schema lives at
 [`docs/schemas/evaluate_report.schema.json`](schemas/evaluate_report.schema.json) and the CLI refuses to emit reports that do
-not conform to it. A compact example looks like this:
+not conform to it. The schema requires explicit configuration mirrors such as `morphology.config.enabled` and
+`code_mode.config.languages_filter`, so dashboards can audit which toggles were active. A compact example looks like this:
 
 ```json
 {

@@ -46,6 +46,73 @@ def test_evaluate_cli_generates_report(tmp_path: Path) -> None:
     assert report == expected
 
 
+def test_evaluate_cli_aborts_on_schema_violation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    data_root = Path(__file__).resolve().parent / "data"
+    corpus = data_root / "evaluate_corpus" / "plain.txt"
+    artifacts = data_root / "models" / "bpe"
+    output = tmp_path / "invalid.json"
+
+    invalid_report = {
+        "artifacts": {
+            "vocab": "tests/data/models/bpe/vocab.json",
+            "vocab_size": 10,
+            "merges": None,
+            "merge_rules": 0,
+            "tokenizer": None,
+            "model_type": "bpe",
+        },
+        "corpus": {
+            "documents": 1,
+            "total_bytes": 1,
+            "total_tokens": 1,
+            "average_bytes": 1.0,
+            "average_tokens": 1.0,
+        },
+        "oov": {"instances": 0, "rate": 0.0, "unique": []},
+        "morphology": {"enabled": False, "config": {"enabled": False}},
+        "code_mode": {
+            "mode": "plain",
+            "documents": 1,
+            "reduction": 0.0,
+            "config": {
+                "enabled": False,
+                "languages_filter": None,
+                "meta_compress": False,
+                "meta_max_length": 8,
+            },
+        },
+    }
+
+    class _InvalidResult:
+        def __init__(self) -> None:
+            self.report = invalid_report
+            self.summary: dict[str, object] = {}
+
+    def _fake_evaluate_cli(options):  # pragma: no cover - exercised via CLI
+        return _InvalidResult()
+
+    monkeypatch.setattr(main.evaluate_module, "evaluate_cli", _fake_evaluate_cli)
+
+    cwd = Path.cwd()
+    with pytest.raises(SystemExit) as excinfo:
+        main.main(
+            [
+                "evaluate",
+                "--data",
+                str(corpus.relative_to(cwd)),
+                "--artifacts",
+                str(artifacts.relative_to(cwd)),
+                "--output",
+                str(output),
+            ]
+        )
+
+    assert "failed schema validation" in str(excinfo.value)
+    assert not output.exists()
+
+
 def test_evaluate_help_describes_new_flags(capsys: pytest.CaptureFixture[str]) -> None:
     parser = main._parser()
     with pytest.raises(SystemExit):
