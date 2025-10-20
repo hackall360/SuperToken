@@ -118,8 +118,10 @@ def test_evaluate_help_describes_new_flags(capsys: pytest.CaptureFixture[str]) -
     with pytest.raises(SystemExit):
         parser.parse_args(["evaluate", "--help"])
     help_text = capsys.readouterr().out
-    assert "Score exported BPE or unigram" in help_text
-    assert "--model-type" in help_text
+    assert "schema-validated JSON report" in help_text
+    assert "Required inputs" in help_text
+    assert "Artifact flavours" in help_text
+    assert "table/json/none" in help_text
     assert "reports/evaluate.json" in help_text
 
 
