@@ -257,7 +257,7 @@ The command writes four artifacts—`vocab.json`, `embeddings.json`, `manifest.j
 
 ## `evaluate`
 
-Generate a deterministic JSON report that benchmarks trained artifacts against a reference corpus:
+Generate a deterministic JSON report that benchmarks trained artifacts against a reference corpus. The command mirrors the CLI help banner by spelling out the required inputs, supported artifact layouts, and resulting outputs:
 
 ```bash
 python main.py evaluate \
@@ -265,7 +265,6 @@ python main.py evaluate \
   --artifacts tests/data/models/bpe \
   --morphology-lang tr \
   --deterministic \
-  --output ./reports/evaluate.json \
   --summary-format table
 ```
 

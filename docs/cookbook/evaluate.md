@@ -23,13 +23,12 @@ python main.py evaluate \
   --artifacts tests/data/models/bpe \
   --morphology-lang tr \
   --deterministic \
-  --output reports/evaluate.json \
   --summary-format table
 ```
 
 If you evaluate structured code manifests, forward the same `--code-mode`, `--code-langs`, and `--meta-compress` flags that were active during training. Use `--meta-max-length` to cap the length of discovered meta-tokens when AST compression is enabled.
 
-When working with SentencePiece exports supply `--model-type unigram` (or point `--vocab` at `unigram.vocab`) and omit `--merges`. The CLI auto-detects common layouts, writes the full JSON report to `reports/evaluate.json` by default, and prints a human-readable banner. Switch to `--summary-format json` if you prefer a machine-friendly post-run summary.
+When working with SentencePiece exports supply `--model-type unigram` (or point `--vocab` at `unigram.vocab`) and omit `--merges`. The CLI auto-detects common layouts, writes the full JSON report to `reports/evaluate.json` by default, and prints a human-readable banner. Switch to `--summary-format json` if you prefer a machine-friendly post-run summary or `none` to suppress the banner entirely.
 
 ## 3. Read the report
 

@@ -64,6 +64,12 @@ DEFAULT_EVALUATE_OUTPUT = Path("reports/evaluate.json")
 EVALUATE_SUMMARY_FORMATS = ("table", "json", "none")
 
 
+class EvaluateHelpFormatter(
+    argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter
+):
+    """Formatter that preserves manual layout while surfacing defaults."""
+
+
 def _env_flag(name: str, *, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -875,7 +881,9 @@ def _cmd_evaluate(args: argparse.Namespace) -> None:
 
     data_patterns = getattr(args, "data", None)
     if not data_patterns:
-        raise SystemExit("evaluate requires at least one --data glob pattern")
+        raise SystemExit(
+            "[evaluate] provide at least one --data glob pattern describing the corpus"
+        )
     data_files = _expand_data_patterns(data_patterns)
 
     artifacts_dir = (
@@ -894,7 +902,11 @@ def _cmd_evaluate(args: argparse.Namespace) -> None:
     )
 
     if artifacts_dir and not artifacts_dir.exists():
-        raise SystemExit(f"Artifact directory not found: {artifacts_dir}")
+        raise SystemExit(
+            f"[evaluate] artifact directory not found: {artifacts_dir}."
+            " Check the --artifacts path or point --vocab/--merges directly at"
+            " the exported files."
+        )
 
     if vocab_path is None and artifacts_dir is not None:
         for candidate_name in ("vocab.json", "unigram.vocab", "sentencepiece.vocab"):
@@ -904,10 +916,14 @@ def _cmd_evaluate(args: argparse.Namespace) -> None:
                 break
     if vocab_path is None:
         raise SystemExit(
-            "--vocab or --artifacts must supply a vocabulary file (vocab.json or unigram.vocab)"
+            "[evaluate] supply --artifacts or --vocab pointing at vocab.json or"
+            " unigram.vocab"
         )
     if not vocab_path.exists():
-        raise SystemExit(f"Vocabulary file not found: {vocab_path}")
+        raise SystemExit(
+            f"[evaluate] vocabulary file not found: {vocab_path}."
+            " Double-check the export path or adjust --vocab."
+        )
 
     if merges_path is None and artifacts_dir is not None:
         for name in ("merges.json", "merges.txt", "bpe_merges.json"):
@@ -916,7 +932,11 @@ def _cmd_evaluate(args: argparse.Namespace) -> None:
                 merges_path = candidate
                 break
     if merges_path is not None and not merges_path.exists():
-        raise SystemExit(f"Merge history not found: {merges_path}")
+        raise SystemExit(
+            f"[evaluate] merge history not found: {merges_path}."
+            " Provide a valid --merges path or remove the flag when"
+            " evaluating unigram exports."
+        )
 
     if tokenizer_path is None and artifacts_dir is not None:
         candidate = (artifacts_dir / "tokenizer.json").expanduser()
@@ -2279,29 +2299,36 @@ def _parser() -> argparse.ArgumentParser:
         description=textwrap.dedent(
             """
             Score exported BPE or unigram tokenizer artifacts against a held-out
-            corpus. Provide one or more --data globs that mirror your training
-            pre-processing flags (--code-mode, --morphology-*) so compression,
+            corpus and emit a schema-validated JSON report. Provide one or more
+            --data globs that mirror the preprocessing flags used during
+            training (--code-mode, --code-langs, --morphology-*) so compression,
             OOV, and morphology metrics remain comparable.
 
-            Inputs
-              • Supply --artifacts to point at an export directory or override
-                individual files with --vocab/--merges/--tokenizer.
-              • Pair code-mode corpora with --code-mode/--code-langs and reuse
-                morphology toggles when evaluating segmented text.
+            Required inputs
+              • Supply --data one or more times to point at UTF-8 text shards or
+                structured code manifests.
+              • Use --artifacts to scan an export directory or override the
+                resolved files with --vocab/--merges/--tokenizer for bespoke
+                layouts.
+
+            Artifact flavours
+              • BPE exports must provide a vocabulary plus a merge table.
+              • SentencePiece unigram exports rely solely on a *.vocab file and
+                ignore merge tables.
 
             Outputs
-              • A JSON report capturing artifact metadata, compression ratios,
-                OOV breakdowns, morphology coverage, and optional code-mode
-                summaries.
-              • A post-run summary controlled via --summary-format.
+              • JSON written to --output (defaults to reports/evaluate.json) or
+                streamed to stdout when --output - is selected.
+              • A human-readable banner controlled via --summary-format
+                (table/json/none) that mirrors key metrics from the report.
             """
         ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=EvaluateHelpFormatter,
         epilog=textwrap.dedent(
             f"""
-            Reports are written to {DEFAULT_EVALUATE_OUTPUT} when --output is
-            omitted. Pass --output - to stream the JSON to stdout instead, and
-            adjust --summary-format (table|json|none) to control the banner.
+            The JSON payload captures artifact metadata, compression ratios, OOV
+            counts, morphology coverage, and optional code-mode summaries. Pass
+            --deterministic to stabilise ordering for reproducible diffs.
             """
         ),
     )
