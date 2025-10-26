@@ -98,7 +98,9 @@ Key arguments:
 - `--meta-compress`: Discover and apply meta-token compression on AST sequences.
 - `--morphology-lang` / `--morphology-case-markers` / `--morphology-affix-tags`: Opt into language-aware segmentation and optional annotations.
 - `--privacy` / `--privacy-salt` / `--tie-seed`: Opt into merge redaction and tie randomization (see [Privacy options](#privacy-options)).
-- `--warm-start`: Prime the trainer with merges described by a JSON manifest or a TikToken bundle (`merges.tiktoken`).
+- `--warm-start`: Prime the trainer with merges described by a JSON manifest, a TikToken bundle (`merges.tiktoken`), or Hugging Face tokenizer artifacts (`tokenizer.json` or `vocab.json`/`merges.txt`).
+
+Both `--warm-start` and `--resume-from` recognise Hugging Face tokenizer bundles, allowing existing vocabularies to bootstrap or continue GPU training runs without manual conversion.
 
 The `train-bpe` command writes Hugging Face compatible `vocab.json`, `merges.txt`, and `tokenizer.json` files alongside a TikToken-formatted `merges.tiktoken` table that can be consumed by the [`tiktoken`](https://github.com/openai/tiktoken) package or reused as a warm-start seed.
 
@@ -144,7 +146,7 @@ python main.py resume-bpe \
   --resume-from ./artifacts/bpe/checkpoints
 ```
 
-The command mirrors every flag accepted by [`train-bpe`](#train-bpe)—including autoscaler knobs such as `--target-util`, batch limits (`--min-batch`/`--max-batch`), privacy guards, and checkpoint writers—so operators can tweak settings or hand a run off to another machine without rewriting scripts. The only additional requirement is `--resume-from`, which must point at the checkpoint directory created by `--checkpoint-dir`. The handler validates the presence of both `--resume-from` and the normal `--data` globs before delegating to the same training routine used by a fresh run.
+The command mirrors every flag accepted by [`train-bpe`](#train-bpe)—including autoscaler knobs such as `--target-util`, batch limits (`--min-batch`/`--max-batch`), privacy guards, and checkpoint writers—so operators can tweak settings or hand a run off to another machine without rewriting scripts. The only additional requirement is `--resume-from`, which may point at a checkpoint directory created by `--checkpoint-dir` or a Hugging Face tokenizer bundle containing `tokenizer.json` or `vocab.json`/`merges.txt`. The handler validates the presence of both `--resume-from` and the normal `--data` globs before delegating to the same training routine used by a fresh run.
 
 ## `train-unigram`
 Train a unigram tokenizer with GPU-accelerated expectation-maximization loops:
@@ -173,7 +175,8 @@ Important options:
 - `--morphology-lang` / `--morphology-case-markers` / `--morphology-affix-tags`: Apply morphology segmentation before packing batches.
 - `--checkpoint-dir`: Directory where the trainer writes checkpoints. Combine with `--resume-from` to continue a run.
 - `--checkpoint-every`: Emit checkpoints every N epochs when `--checkpoint-dir` is set (defaults to final-only when zero).
-- `--resume-from`: Restore optimiser state and epoch history from a previous run. The remaining epochs honour the current CLI flags.
+- `--warm-start`: Seed the trainer from a SentencePiece `.model` or `.vocab`/`.prob` bundle.
+- `--resume-from`: Restore optimiser state and epoch history from a previous run or import a SentencePiece model before continuing. The remaining epochs honour the current CLI flags.
 - `--time-minutes`: Optional wall-clock budget that pauses training after the requested number of minutes, writing a checkpoint when configured.
 
 The [`GPUUnigramTrainer`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/unigram_trainer.py) reuses the same streaming and autoscaling primitives; refer to the [API reference](api.md#trainers) for extension hooks.

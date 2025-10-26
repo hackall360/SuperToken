@@ -14,6 +14,38 @@ from typing import Iterable, Mapping, Sequence
 
 
 @dataclass(frozen=True)
+class HFBPEImport:
+    """Reconstructed Hugging Face BPE artifacts."""
+
+    vocab: dict[str, int]
+    merges: list[tuple[int, int]]
+    added_tokens: tuple[str, ...]
+    sources: tuple[str, ...]
+
+    @property
+    def base_vocab(self) -> int:
+        """Infer the number of seed symbols that preceded learned merges."""
+
+        return max(len(self.vocab) - len(self.merges) - len(self.added_tokens), 0)
+
+
+@dataclass(frozen=True)
+class SentencePieceUnigramImport:
+    """Artifacts parsed from SentencePiece unigram bundles."""
+
+    pieces: dict[int, bytes]
+    scores: list[float]
+    metadata: dict[str, object]
+    sources: tuple[str, ...]
+
+    @property
+    def vocab_size(self) -> int:
+        """Return the number of unique pieces contained in the import."""
+
+        return len(self.pieces)
+
+
+@dataclass(frozen=True)
 class TokenStats:
     """Aggregated statistics for a token gathered during co-training."""
 
@@ -108,6 +140,204 @@ def load_token_stats(path: str | os.PathLike[str]) -> dict[str, TokenStats]:
     for token, value in payload.items():
         stats[str(token)] = _coerce_stats_entry(value)
     return stats
+
+
+def _coerce_vocab_mapping(mapping: Mapping[str, object]) -> dict[str, int]:
+    vocab: dict[str, int] = {}
+    for token, index in mapping.items():
+        if not isinstance(token, str):
+            token = str(token)
+        try:
+            vocab[token] = int(index)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid vocabulary id for token {token!r}: {index!r}") from exc
+    return vocab
+
+
+def _parse_hf_merges(merges: Sequence[object], vocab: Mapping[str, int]) -> list[tuple[int, int]]:
+    pairs: list[tuple[int, int]] = []
+    vocab_map = dict(vocab)
+    for raw in merges:
+        if isinstance(raw, str):
+            pieces = raw.strip().split()
+        elif isinstance(raw, Sequence):
+            pieces = [str(part) for part in raw]
+        else:
+            raise ValueError(f"Unsupported merge entry: {raw!r}")
+        if len(pieces) != 2:
+            raise ValueError(f"Merge entries must contain exactly two symbols: {raw!r}")
+        left, right = pieces
+        if left not in vocab_map or right not in vocab_map:
+            raise ValueError(f"Merge references unknown tokens: {(left, right)!r}")
+        pairs.append((int(vocab_map[left]), int(vocab_map[right])))
+    return pairs
+
+
+def _normalize_added_tokens(payload: Sequence[Mapping[str, object]] | None) -> tuple[str, ...]:
+    if not payload:
+        return ()
+    entries: list[str] = []
+    for item in payload:
+        if not isinstance(item, Mapping):
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            entries.append(content)
+    return tuple(entries)
+
+
+def load_hf_bpe_artifacts(
+    *,
+    vocab_path: str | os.PathLike[str] | None = None,
+    merges_path: str | os.PathLike[str] | None = None,
+    tokenizer_path: str | os.PathLike[str] | None = None,
+) -> HFBPEImport:
+    """Load Hugging Face BPE artifacts from JSON bundles."""
+
+    sources: list[str] = []
+    vocab_map: dict[str, int] | None = None
+    merges_raw: Sequence[object] | None = None
+    added_tokens: tuple[str, ...] = ()
+
+    if tokenizer_path is not None:
+        with open(tokenizer_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, Mapping):
+            raise ValueError("tokenizer.json must contain a mapping")
+        model = payload.get("model")
+        if not isinstance(model, Mapping):
+            raise ValueError("tokenizer.json missing 'model' section")
+        model_type = model.get("type")
+        if str(model_type or "").upper() != "BPE":
+            raise ValueError(
+                "tokenizer.json must describe a BPE model when importing warm-start merges"
+            )
+        vocab_section = model.get("vocab")
+        if not isinstance(vocab_section, Mapping):
+            raise ValueError("tokenizer.json missing BPE vocabulary")
+        vocab_map = _coerce_vocab_mapping(vocab_section)
+        merges_section = model.get("merges")
+        if not isinstance(merges_section, Sequence):
+            raise ValueError("tokenizer.json missing 'merges' list")
+        merges_raw = list(merges_section)
+        added_tokens = _normalize_added_tokens(payload.get("added_tokens"))
+        sources.append(os.fspath(tokenizer_path))
+
+    if vocab_path is not None:
+        vocab_payload = load_vocab(vocab_path)
+        if vocab_map is not None and vocab_payload != vocab_map:
+            raise ValueError("Provided vocab.json does not match tokenizer.json contents")
+        vocab_map = vocab_payload
+        sources.append(os.fspath(vocab_path))
+
+    if merges_path is not None:
+        merges_payload: list[str] = []
+        with open(merges_path, "r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                merges_payload.append(line)
+        if merges_raw is not None and merges_payload != list(merges_raw):
+            raise ValueError("Provided merges.txt does not match tokenizer.json contents")
+        merges_raw = merges_payload
+        sources.append(os.fspath(merges_path))
+
+    if vocab_map is None or merges_raw is None:
+        raise ValueError("Both vocabulary and merges must be provided to import Hugging Face BPE artifacts")
+
+    merges = _parse_hf_merges(merges_raw, vocab_map)
+    return HFBPEImport(vocab=vocab_map, merges=merges, added_tokens=added_tokens, sources=tuple(sources))
+
+
+def _decode_sentencepiece_text(text: str) -> bytes:
+    normalized = text.replace("▁", " ")
+    try:
+        return normalized.encode("utf-8")
+    except UnicodeEncodeError:
+        return normalized.encode("latin-1", errors="ignore")
+
+
+def load_sentencepiece_unigram(
+    *,
+    model_path: str | os.PathLike[str] | None = None,
+    vocab_path: str | os.PathLike[str] | None = None,
+) -> SentencePieceUnigramImport:
+    """Load SentencePiece unigram scores from binary or text bundles."""
+
+    pieces: dict[int, bytes] = {}
+    scores: list[float] = []
+    metadata: dict[str, object] = {}
+    sources: list[str] = []
+
+    if model_path is not None:
+        try:  # pragma: no cover - exercised when dependency missing
+            from sentencepiece import sentencepiece_model_pb2 as sp_pb2  # type: ignore
+        except Exception as exc:  # pragma: no cover - optional dependency guard
+            raise RuntimeError(
+                "Parsing SentencePiece model files requires the `sentencepiece` package"
+            ) from exc
+
+        proto = sp_pb2.ModelProto()
+        with open(model_path, "rb") as handle:
+            proto.ParseFromString(handle.read())
+        for idx, piece in enumerate(proto.pieces):
+            pieces[idx] = _decode_sentencepiece_text(piece.piece)
+            scores.append(float(piece.score))
+        metadata["model_type"] = proto.model_type
+        trainer_spec = proto.trainer_spec
+        metadata["trainer_spec"] = {
+            "model_type": trainer_spec.model_type,
+            "vocab_size": trainer_spec.vocab_size,
+            "character_coverage": trainer_spec.character_coverage,
+            "byte_fallback": trainer_spec.byte_fallback,
+            "max_sentencepiece_length": trainer_spec.max_sentencepiece_length,
+        }
+        sources.append(os.fspath(model_path))
+
+    if vocab_path is not None:
+        with open(vocab_path, "r", encoding="utf-8") as handle:
+            for idx, raw_line in enumerate(handle):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if "\t" in line:
+                    token, score = line.split("\t", 1)
+                else:
+                    parts = line.split()
+                    if len(parts) != 2:
+                        raise ValueError(f"Malformed SentencePiece vocab line: {raw_line!r}")
+                    token, score = parts
+                if not pieces:
+                    pieces[idx] = _decode_sentencepiece_text(token)
+                else:
+                    pieces.setdefault(idx, _decode_sentencepiece_text(token))
+                try:
+                    score_val = float(score)
+                except ValueError as exc:
+                    raise ValueError(f"Invalid probability score on line {idx + 1}: {score!r}") from exc
+                if len(scores) <= idx:
+                    scores.append(score_val)
+                else:
+                    scores[idx] = score_val
+        sources.append(os.fspath(vocab_path))
+
+    if not pieces:
+        raise ValueError("SentencePiece import requires a .model or .vocab file")
+
+    # Ensure scores length matches pieces
+    if len(scores) < len(pieces):
+        scores.extend([float(scores[-1]) if scores else 0.0] * (len(pieces) - len(scores)))
+
+    score_map = {idx: float(value) for idx, value in enumerate(scores)}
+    ordered_pieces = dict(sorted(pieces.items(), key=lambda item: int(item[0])))
+    ordered_scores = [score_map.get(idx, 0.0) for idx in ordered_pieces.keys()]
+    return SentencePieceUnigramImport(
+        pieces=ordered_pieces,
+        scores=ordered_scores,
+        metadata=metadata,
+        sources=tuple(sources),
+    )
 
 
 def _cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
@@ -629,6 +859,8 @@ def load_tiktoken_merges(
 
 
 __all__ = [
+    "HFBPEImport",
+    "SentencePieceUnigramImport",
     "byte_level_decoder",
     "byte_level_encoder",
     "DedupeResult",
@@ -638,6 +870,8 @@ __all__ = [
     "build_manifest",
     "dedupe_vocabulary",
     "generate_embedding_matrix",
+    "load_hf_bpe_artifacts",
+    "load_sentencepiece_unigram",
     "load_tiktoken_bpe",
     "load_tiktoken_merges",
     "load_token_stats",
