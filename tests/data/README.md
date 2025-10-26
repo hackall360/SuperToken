@@ -6,12 +6,18 @@ safe to redistribute under the repository licence.
 
 ## `evaluate_corpus/`
 
-* `plain.txt` – Three short Turkish-influenced sentences chosen to exercise
-  compression ratios, byte-level merges, and morphology tagging.
-* `code.jsonl` – Three structured code snippets (two Python entries and one
-  TypeScript sample). The TypeScript entry intentionally triggers the
-  byte-fallback path when the TypeScript frontend is unavailable so
-  `fallback_samples` metrics remain covered in tests.
+* `plain.txt` – Turkish-influenced base shard that keeps morphology coverage
+  stable for compression and OOV regression tests.
+* `emoji.txt` – Short sentences containing multi-codepoint emoji (including
+  ZWJ sequences) to exercise byte-level normalization.
+* `rtl.txt` – Mixed Arabic/Hebrew text that includes explicit directionality
+  markers so RTL handling remains covered.
+* `cjk.txt` – Simplified Chinese and Japanese lines to ensure wide glyphs
+  tokenize deterministically.
+* `indic.txt` – Devanagari and Bengali phrases covering Indic scripts.
+* `code.jsonl` – Four structured entries: a Python AST sample, an invalid
+  Python snippet that forces byte fallback, a TypeScript example, and a
+  `toml` manifest to ensure unsupported languages exercise the fallback path.
 
 ## `models/`
 
@@ -50,6 +56,7 @@ adding hybrid-specific metadata:
 ## `expected/`
 
 * `evaluate_report.json` – Golden JSON produced by calling
-  `gpu_tokenizer.evaluate()` with deterministic settings against
-  `evaluate_corpus/plain.txt` and the BPE artifacts above. The report includes
-  morphology, compression, and OOV metrics and mirrors the CLI test output.
+  `gpu_tokenizer.evaluate()` with deterministic settings against all
+  `evaluate_corpus/*.txt` shards and the BPE artifacts above. The report
+  includes morphology, compression, and OOV metrics and mirrors the CLI test
+  output.

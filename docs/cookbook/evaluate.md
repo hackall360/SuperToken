@@ -19,12 +19,18 @@ Invoke the CLI with the same preprocessing flags used during training so morphol
 
 ```bash
 python main.py evaluate \
-  --data tests/data/evaluate_corpus/plain.txt \
+  --data tests/data/evaluate_corpus/*.txt \
   --artifacts tests/data/models/bpe \
   --morphology-lang tr \
   --deterministic \
+  --output reports/evaluate.json \
   --summary-format table
 ```
+
+The repository ships a multi-shard regression suite covering emoji (including
+ZWJ sequences), right-to-left text, CJK and Indic scripts, and structured code
+manifests. Point `--data` at the wildcard above to include every shard when
+regenerating the golden report.
 
 If you evaluate structured code manifests, forward the same `--code-mode`, `--code-langs`, and `--meta-compress` flags that were active during training. Use `--meta-max-length` to cap the length of discovered meta-tokens when AST compression is enabled.
 

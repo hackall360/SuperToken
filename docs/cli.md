@@ -267,12 +267,17 @@ Generate a deterministic JSON report that benchmarks trained artifacts against a
 
 ```bash
 python main.py evaluate \
-  --data tests/data/evaluate_corpus/plain.txt \
+  --data tests/data/evaluate_corpus/*.txt \
   --artifacts tests/data/models/bpe \
   --morphology-lang tr \
   --deterministic \
+  --output reports/evaluate.json \
   --summary-format table
 ```
+
+The regression corpus bundles emoji/ZWJ samples, RTL text, CJK and Indic
+phrases, and structured code manifests (with intentional parser fallbacks) so
+the evaluator exercises every normalization path.
 
 Key switches:
 

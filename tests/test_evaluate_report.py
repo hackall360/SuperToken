@@ -34,10 +34,11 @@ class _CountingPlugin(MorphologyPlugin):
             yield MorphologySegment(sequence, tags=("ROOT",), role="root")
 
 
-def _fixture_paths() -> dict[str, Path]:
+def _fixture_paths() -> dict[str, object]:
     data_root = Path("tests/data")
+    corpus_dir = data_root / "evaluate_corpus"
     return {
-        "corpus": data_root / "evaluate_corpus" / "plain.txt",
+        "corpora": sorted(corpus_dir.glob("*.txt")),
         "code": data_root / "evaluate_corpus" / "code.jsonl",
         "models": data_root / "models",
         "vocab": data_root / "models" / "bpe" / "vocab.json",
@@ -78,7 +79,7 @@ def test_evaluate_report_matches_fixture(tmp_path: Path) -> None:
 
     paths = _fixture_paths()
     report = eval_mod.evaluate(  # type: ignore[arg-type]
-        [paths["corpus"]],
+        paths["corpora"],
         vocab_path=paths["vocab"],
         merges_path=paths["merges"],
         tokenizer_path=paths["tokenizer"],
@@ -127,16 +128,16 @@ def test_code_mode_report_summarises_meta_tokens() -> None:
     summary = report["code_mode"]
 
     assert summary["mode"] == "code"
-    assert summary["documents"] == 3
-    assert summary["ast_samples"] == 2
-    assert summary["fallback_samples"] == 1
-    assert summary["languages"] == ["python", "typescript"]
+    assert summary["documents"] == 4
+    assert summary["ast_samples"] == 1
+    assert summary["fallback_samples"] == 3
+    assert summary["languages"] == ["python", "toml", "typescript"]
     assert summary["meta_enabled"] is True
     assert summary["meta_max_length"] == 6
-    assert summary["meta_token_count"] == 33
-    assert "META0" in summary["meta_compress"]
+    assert summary["meta_token_count"] == 4
+    assert set(summary["meta_compress"]) == {"META0", "META1", "META2", "META3"}
     assert all(name.startswith("META") for name in summary["meta_compress"])
-    assert 0.0 <= summary["reduction"] < 1.0
+    assert 0.0 < summary["reduction"] < 1.0
 
     morphology = report["morphology"]
     assert morphology["purity"] == pytest.approx(morphology["tagged_segments"] / morphology["total_segments"])

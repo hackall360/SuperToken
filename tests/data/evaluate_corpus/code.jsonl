@@ -1,3 +1,4 @@
-{"language": "python", "source": "def fib(n):\n    if n <= 1:\n        return n\n    return fib(n-1) + fib(n-2)\n"}
-{"language": "python", "source": "class Greeter:\n    def __init__(self, name):\n        self.name = name\n\n    def greet(self):\n        return f'hello {self.name}'\n"}
-{"language": "typescript", "source": "export function title(value: string): string {\n  return value.trim().toUpperCase();\n}\n"}
+{"language": "python", "source": "def wave(cat: str) -> str:\n    return f\"🐾 {cat}\"\n"}
+{"language": "python", "source": "def broken(:\n    pass\n"}
+{"language": "typescript", "source": "export const title = (value: string): string => value.trim().toUpperCase();\n"}
+{"language": "toml", "source": "[pipeline]\nstep = \"aggregate\"\n"}

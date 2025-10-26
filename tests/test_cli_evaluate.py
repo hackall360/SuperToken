@@ -12,21 +12,31 @@ install_torch_stub()
 main = importlib.import_module("main")
 
 
+def _relative_paths(paths: list[Path]) -> list[str]:
+    cwd = Path.cwd()
+    return [str(path.relative_to(cwd)) for path in paths]
+
+
+def _corpus_files() -> list[Path]:
+    data_root = Path(__file__).resolve().parent / "data"
+    corpus_dir = data_root / "evaluate_corpus"
+    return sorted(corpus_dir.glob("*.txt"))
+
+
 def test_evaluate_cli_generates_report(tmp_path: Path) -> None:
     data_root = Path(__file__).resolve().parent / "data"
-    corpus = data_root / "evaluate_corpus" / "plain.txt"
+    corpus_files = _corpus_files()
     artifacts = data_root / "models" / "bpe"
     output = tmp_path / "report.json"
 
     cwd = Path.cwd()
-    corpus_arg = str(corpus.relative_to(cwd))
     artifacts_arg = str(artifacts.relative_to(cwd))
 
     main.main(
         [
             "evaluate",
             "--data",
-            corpus_arg,
+            *_relative_paths(corpus_files),
             "--artifacts",
             artifacts_arg,
             "--morphology-lang",
@@ -50,7 +60,7 @@ def test_evaluate_cli_aborts_on_schema_violation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     data_root = Path(__file__).resolve().parent / "data"
-    corpus = data_root / "evaluate_corpus" / "plain.txt"
+    corpus_files = _corpus_files()
     artifacts = data_root / "models" / "bpe"
     output = tmp_path / "invalid.json"
 
@@ -101,7 +111,7 @@ def test_evaluate_cli_aborts_on_schema_violation(
             [
                 "evaluate",
                 "--data",
-                str(corpus.relative_to(cwd)),
+                *_relative_paths(corpus_files),
                 "--artifacts",
                 str(artifacts.relative_to(cwd)),
                 "--output",
@@ -127,7 +137,7 @@ def test_evaluate_help_describes_new_flags(capsys: pytest.CaptureFixture[str]) -
 
 def test_evaluate_cli_skip_flag(monkeypatch, tmp_path: Path) -> None:
     data_root = Path(__file__).resolve().parent / "data"
-    corpus = data_root / "evaluate_corpus" / "plain.txt"
+    corpus_files = _corpus_files()
     artifacts = data_root / "models" / "bpe"
     output = tmp_path / "skip.json"
 
@@ -138,7 +148,7 @@ def test_evaluate_cli_skip_flag(monkeypatch, tmp_path: Path) -> None:
         [
             "evaluate",
             "--data",
-            str(corpus.relative_to(cwd)),
+            *_relative_paths(corpus_files),
             "--artifacts",
             str(artifacts.relative_to(cwd)),
             "--output",
@@ -151,7 +161,7 @@ def test_evaluate_cli_skip_flag(monkeypatch, tmp_path: Path) -> None:
 
 def test_evaluate_cli_force_overrides_skip(monkeypatch, tmp_path: Path) -> None:
     data_root = Path(__file__).resolve().parent / "data"
-    corpus = data_root / "evaluate_corpus" / "plain.txt"
+    corpus_files = _corpus_files()
     artifacts = data_root / "models" / "bpe"
     output = tmp_path / "forced.json"
 
@@ -162,7 +172,7 @@ def test_evaluate_cli_force_overrides_skip(monkeypatch, tmp_path: Path) -> None:
         [
             "evaluate",
             "--data",
-            str(corpus.relative_to(cwd)),
+            *_relative_paths(corpus_files),
             "--artifacts",
             str(artifacts.relative_to(cwd)),
             "--force-evaluation",
@@ -176,7 +186,7 @@ def test_evaluate_cli_force_overrides_skip(monkeypatch, tmp_path: Path) -> None:
 
 def test_evaluate_cli_accepts_unigram_exports(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     data_root = Path(__file__).resolve().parent / "data"
-    corpus = data_root / "evaluate_corpus" / "plain.txt"
+    corpus_files = _corpus_files()
     unigram_vocab = data_root / "models" / "unigram" / "unigram.vocab"
     output = tmp_path / "unigram.json"
 
@@ -185,7 +195,7 @@ def test_evaluate_cli_accepts_unigram_exports(tmp_path: Path, capsys: pytest.Cap
         [
             "evaluate",
             "--data",
-            str(corpus.relative_to(cwd)),
+            *_relative_paths(corpus_files),
             "--vocab",
             str(unigram_vocab.relative_to(cwd)),
             "--model-type",
