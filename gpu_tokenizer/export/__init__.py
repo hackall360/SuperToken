@@ -1,27 +1,43 @@
 """Helpers for exporting embedding artifacts derived from tokenizer vocabularies."""
 
 from .artifacts import (
+    byte_level_decoder,
+    byte_level_encoder,
     ExportManifest,
     PruneResult,
     TokenStats,
     build_manifest,
     generate_embedding_matrix,
+    load_tiktoken_bpe,
+    load_tiktoken_merges,
     load_token_stats,
     load_vocab,
+    mergeable_ranks_to_merges,
     prune_vocabulary,
     resolve_dtype,
+    serialize_tiktoken_bpe,
+    vocab_to_tiktoken_mergeable_ranks,
     write_export_package,
+    write_tiktoken_bpe,
 )
 
 __all__ = [
+    "byte_level_decoder",
+    "byte_level_encoder",
     "ExportManifest",
     "PruneResult",
     "TokenStats",
     "build_manifest",
     "generate_embedding_matrix",
+    "load_tiktoken_bpe",
+    "load_tiktoken_merges",
     "load_token_stats",
     "load_vocab",
+    "mergeable_ranks_to_merges",
     "prune_vocabulary",
     "resolve_dtype",
+    "serialize_tiktoken_bpe",
+    "vocab_to_tiktoken_mergeable_ranks",
     "write_export_package",
+    "write_tiktoken_bpe",
 ]

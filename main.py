@@ -437,8 +437,29 @@ def _load_warm_start_merges(source: str | None) -> list[tuple[int, int]] | None:
     if not path.exists():
         raise SystemExit(f"Warm-start plan not found at {path}")
 
+    if path.is_dir():
+        candidates = [
+            path / "merges.tiktoken",
+            path / "tokenizer.tiktoken",
+            path / "bpe_merges.json",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return _load_warm_start_merges(str(candidate))
+        raise SystemExit(
+            "Warm-start directories must contain merges.tiktoken or bpe_merges.json"
+        )
+
+    if path.suffix.lower() == ".tiktoken":
+        try:
+            return export_artifacts.load_tiktoken_merges(path)
+        except Exception as exc:
+            raise SystemExit(f"Failed to parse TikToken merges from {path}: {exc}") from exc
+
     if path.suffix.lower() not in {".json", ".jsonl"}:
-        raise SystemExit("Warm-start plans must be JSON manifests containing a 'merges' list")
+        raise SystemExit(
+            "Warm-start plans must be JSON manifests or TikToken bundles containing a 'merges' list"
+        )
 
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
@@ -2040,6 +2061,12 @@ def _parser() -> argparse.ArgumentParser:
         help="Train a BPE model",
     )
     train_bpe.set_defaults(func=_cmd_train_bpe)
+    train_bpe.add_argument(
+        "--warm-start",
+        type=str,
+        default=None,
+        help="Optional JSON manifest or TikToken bundle containing seed merges",
+    )
 
     resume_bpe = subparsers.add_parser(
         "resume-bpe",
@@ -2065,7 +2092,7 @@ def _parser() -> argparse.ArgumentParser:
         "--warm-start",
         type=str,
         default=None,
-        help="Optional JSON manifest containing seed merges",
+        help="Optional JSON manifest or TikToken bundle containing seed merges",
     )
     train_hybrid.add_argument(
         "--privacy",

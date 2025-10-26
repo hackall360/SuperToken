@@ -98,6 +98,9 @@ Key arguments:
 - `--meta-compress`: Discover and apply meta-token compression on AST sequences.
 - `--morphology-lang` / `--morphology-case-markers` / `--morphology-affix-tags`: Opt into language-aware segmentation and optional annotations.
 - `--privacy` / `--privacy-salt` / `--tie-seed`: Opt into merge redaction and tie randomization (see [Privacy options](#privacy-options)).
+- `--warm-start`: Prime the trainer with merges described by a JSON manifest or a TikToken bundle (`merges.tiktoken`).
+
+The `train-bpe` command writes Hugging Face compatible `vocab.json`, `merges.txt`, and `tokenizer.json` files alongside a TikToken-formatted `merges.tiktoken` table that can be consumed by the [`tiktoken`](https://github.com/openai/tiktoken) package or reused as a warm-start seed.
 
 Behind the scenes the [`GPUBPETrainer`](https://github.com/example/SuperToken/blob/main/gpu_tokenizer/bpe_trainer.py) collaborates with the autoscaler, dataset readers, and checkpoint writers described in the [architecture overview](architecture.md#trainer-pipeline).
 
@@ -191,7 +194,7 @@ Key arguments:
 
 - `--cycles`: Number of BPE→unigram handoff rounds to execute.
 - `--unigram-epochs`: Epochs to run inside each unigram phase.
-- `--warm-start`: Optional path to a JSON manifest containing seeded merge pairs.
+- `--warm-start`: Optional path to a JSON manifest or TikToken bundle containing seeded merge pairs.
 - `--checkpoint-dir`: Directory where per-cycle checkpoints are stored.
 - `--checkpoint-every`: Write the hybrid checkpoint after every N cycles; when omitted or zero only the final state is saved.
 - `--resume-from`: Restore the previous cycle state and merge history before continuing with additional cycles.

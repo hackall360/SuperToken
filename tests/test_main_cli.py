@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from gpu_tokenizer.export import artifacts as export_artifacts
+
 from tests._stubs import install_torch_stub
 
 install_torch_stub()
@@ -265,3 +267,17 @@ def test_train_hybrid_dry_run_logs_config(
         "enabled": False,
     }
     assert "[dry-run] train-hybrid initialization complete" in captured.out
+def test_load_warm_start_merges_from_tiktoken(tmp_path: Path) -> None:
+    pytest.importorskip("tiktoken")
+
+    vocab = {"a": 0, "b": 1, "ab": 2}
+    mergeable = export_artifacts.vocab_to_tiktoken_mergeable_ranks(vocab)
+    tiktoken_path = tmp_path / "merges.tiktoken"
+    export_artifacts.write_tiktoken_bpe(tiktoken_path, mergeable)
+
+    merges = main._load_warm_start_merges(str(tiktoken_path))
+    assert merges == [(0, 1)]
+
+    from_dir = main._load_warm_start_merges(str(tmp_path))
+    assert from_dir == merges
+

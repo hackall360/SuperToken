@@ -7,6 +7,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from gpu_tokenizer.bpe_trainer import GPUBPETrainer
+from gpu_tokenizer.export import artifacts as export_artifacts
 from gpu_tokenizer.trainers.hybrid import HybridTrainer, _build_piece_tables
 
 try:
@@ -26,10 +27,12 @@ def test_save_emits_huggingface_artifacts(tmp_path: Path) -> None:
     vocab_path = tmp_path / "vocab.json"
     merges_path = tmp_path / "merges.txt"
     tokenizer_path = tmp_path / "tokenizer.json"
+    tiktoken_path = tmp_path / "merges.tiktoken"
 
     assert vocab_path.exists()
     assert merges_path.exists()
     assert tokenizer_path.exists()
+    assert tiktoken_path.exists()
 
     with vocab_path.open("r", encoding="utf-8") as handle:
         vocab = json.load(handle)
@@ -47,6 +50,34 @@ def test_save_emits_huggingface_artifacts(tmp_path: Path) -> None:
     encoding = tokenizer.encode(sample)
     assert tokenizer.decode(encoding.ids) == sample
     assert tokenizer.get_vocab_size(with_added_tokens=True) == trainer.vocab_size
+
+    ranks = export_artifacts.load_tiktoken_bpe(tiktoken_path)
+    assert ranks
+    assert export_artifacts.mergeable_ranks_to_merges(ranks) == trainer.merges
+
+
+@pytest.mark.skipif(Tokenizer is None, reason="tokenizers library is unavailable")
+def test_tiktoken_roundtrip_matches_reference(tmp_path: Path) -> None:
+    tiktoken = pytest.importorskip("tiktoken")
+
+    trainer = GPUBPETrainer(base_vocab=256, merges=2, device="cpu")
+    trainer.merges = [
+        (ord("h"), ord("i")),
+        (trainer.base_vocab, ord("!")),
+    ]
+    trainer.vocab_size = trainer.base_vocab + len(trainer.merges)
+
+    artifacts = trainer.save_artifacts(tmp_path)
+
+    tiktoken_path = Path(artifacts["tiktoken_merges"])
+    assert tiktoken_path.exists()
+
+    ours = export_artifacts.load_tiktoken_bpe(tiktoken_path)
+    theirs = tiktoken.load.load_tiktoken_bpe(str(tiktoken_path))
+    assert ours == theirs
+
+    merges = export_artifacts.load_tiktoken_merges(tiktoken_path)
+    assert merges == trainer.merges
 
 
 @pytest.mark.skipif(Tokenizer is None, reason="tokenizers library is unavailable")
@@ -71,12 +102,14 @@ def test_hybrid_save_emits_combined_artifacts(tmp_path: Path) -> None:
     unigram_prob_path = tmp_path / "unigram.prob"
     unigram_model_path = tmp_path / "unigram.model"
     manifest_path = tmp_path / "hybrid_manifest.json"
+    tiktoken_path = tmp_path / "merges.tiktoken"
 
     assert merges_path.exists()
     assert tokenizer_path.exists()
     assert unigram_prob_path.exists()
     assert manifest_path.exists()
     assert unigram_model_path.exists()
+    assert tiktoken_path.exists()
 
     tokenizer = Tokenizer.from_file(str(tokenizer_path))
     encoding = tokenizer.encode("hi")
@@ -90,3 +123,4 @@ def test_hybrid_save_emits_combined_artifacts(tmp_path: Path) -> None:
 
     assert artifacts["merges"] == str(merges_path)
     assert artifacts["unigram_prob"] == str(unigram_prob_path)
+    assert artifacts["tiktoken_merges"] == str(tiktoken_path)
