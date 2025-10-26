@@ -14,6 +14,7 @@ import torch
 from ..bpe_trainer import GPUBPETrainer
 from ..unigram_trainer import GPUUnigramTrainer
 from ..utils import hash_merge_pair
+from ..export import artifacts as export_artifacts
 from .base import BaseTrainer, CheckpointPayload
 
 
@@ -70,20 +71,12 @@ def _build_piece_tables(
 def _bytes_to_unicode() -> dict[int, str]:
     """Mirror the byte→unicode mapping used by Hugging Face BPE tokenizers."""
 
-    bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
-    cs = bs[:]
-    n = 0
-    for b in range(256):
-        if b not in bs:
-            bs.append(b)
-            cs.append(256 + n)
-            n += 1
-    return {b: chr(c) for b, c in zip(bs, cs)}
+    return export_artifacts.byte_level_encoder()
 
 
 def _build_bpe_tokenizer_artifacts(
     base_vocab: int, merges: Sequence[tuple[int, int]]
-) -> tuple[dict[str, int], list[str], dict[str, object]]:
+) -> tuple[dict[str, int], list[str], dict[str, object], dict[bytes, int]]:
     """Construct vocab/merges/config triples compatible with Hugging Face."""
 
     byte_encoder = _bytes_to_unicode()
@@ -156,7 +149,16 @@ def _build_bpe_tokenizer_artifacts(
         },
     }
 
-    return vocab, merge_strings, tokenizer_config
+    special_tokens = {
+        entry["content"]
+        for entry in added_tokens
+        if entry.get("special") and isinstance(entry.get("content"), str)
+    }
+    mergeable_ranks = export_artifacts.vocab_to_tiktoken_mergeable_ranks(
+        vocab, skip_tokens=special_tokens
+    )
+
+    return vocab, merge_strings, tokenizer_config, mergeable_ranks
 
 
 def _write_bpe_tokenizer_files(
@@ -164,6 +166,7 @@ def _write_bpe_tokenizer_files(
     vocab: Mapping[str, int],
     merges: Sequence[str],
     tokenizer_config: Mapping[str, object],
+    mergeable_ranks: Mapping[bytes, int],
 ) -> dict[str, str]:
     """Persist Hugging Face compatible tokenizer artifacts."""
 
@@ -171,6 +174,7 @@ def _write_bpe_tokenizer_files(
     vocab_path = output_dir / "vocab.json"
     merges_path = output_dir / "merges.txt"
     tokenizer_path = output_dir / "tokenizer.json"
+    tiktoken_path = output_dir / "merges.tiktoken"
 
     with open(vocab_path, "w", encoding="utf-8") as handle:
         json.dump(dict(vocab), handle, ensure_ascii=False)
@@ -183,10 +187,13 @@ def _write_bpe_tokenizer_files(
     with open(tokenizer_path, "w", encoding="utf-8") as handle:
         json.dump(dict(tokenizer_config), handle, ensure_ascii=False)
 
+    export_artifacts.write_tiktoken_bpe(tiktoken_path, mergeable_ranks)
+
     return {
         "vocab": os.fspath(vocab_path),
         "merges": os.fspath(merges_path),
         "tokenizer": os.fspath(tokenizer_path),
+        "tiktoken_merges": os.fspath(tiktoken_path),
     }
 
 
@@ -838,10 +845,12 @@ class HybridTrainer(BaseTrainer):
         output_path.mkdir(parents=True, exist_ok=True)
 
         artifacts = self.save_artifacts(output_path)
-        vocab, merges, tokenizer_config = _build_bpe_tokenizer_artifacts(
+        vocab, merges, tokenizer_config, mergeable_ranks = _build_bpe_tokenizer_artifacts(
             self.base_vocab, self._final_merges
         )
-        bpe_paths = _write_bpe_tokenizer_files(output_path, vocab, merges, tokenizer_config)
+        bpe_paths = _write_bpe_tokenizer_files(
+            output_path, vocab, merges, tokenizer_config, mergeable_ranks
+        )
 
         logp = self._final_logp.detach().clone().cpu()
         unigram_prob_path = _write_unigram_probabilities(

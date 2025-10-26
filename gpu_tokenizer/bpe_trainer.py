@@ -39,6 +39,7 @@ from .dtypes import (
     length_storage_dtype,
     promote_length_sum_dtype,
 )
+from .export import artifacts as export_artifacts
 from .trainers.base import BaseTrainer, CheckpointPayload
 
 logger = logging.getLogger(__name__)
@@ -4406,19 +4407,11 @@ class GPUBPETrainer(BaseTrainer):
     def _bytes_to_unicode() -> dict[int, str]:
         """Mirror the mapping used by Hugging Face's ByteLevel BPE."""
 
-        bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
-        cs = bs[:]
-        n = 0
-        for b in range(256):
-            if b not in bs:
-                bs.append(b)
-                cs.append(256 + n)
-                n += 1
-        return {b: chr(c) for b, c in zip(bs, cs)}
+        return export_artifacts.byte_level_encoder()
 
     def _build_tokenizer_artifacts(
         self,
-    ) -> tuple[dict[str, int], list[str], dict[str, object]]:
+    ) -> tuple[dict[str, int], list[str], dict[str, object], dict[bytes, int]]:
         byte_encoder = self._bytes_to_unicode()
         token_strings: list[str] = []
         added_tokens: list[dict[str, object]] = []
@@ -4490,7 +4483,16 @@ class GPUBPETrainer(BaseTrainer):
             },
         }
 
-        return vocab, merges, tokenizer_config
+        special_tokens = {
+            entry["content"]
+            for entry in added_tokens
+            if entry.get("special") and isinstance(entry.get("content"), str)
+        }
+        mergeable_ranks = export_artifacts.vocab_to_tiktoken_mergeable_ranks(
+            vocab, skip_tokens=special_tokens
+        )
+
+        return vocab, merges, tokenizer_config, mergeable_ranks
 
     def _write_tokenizer_artifacts(
         self,
@@ -4498,6 +4500,7 @@ class GPUBPETrainer(BaseTrainer):
         vocab: dict[str, int],
         merges: list[str],
         tokenizer_config: dict[str, object],
+        mergeable_ranks: dict[bytes, int],
     ) -> dict[str, str]:
         os.makedirs(out_dir, exist_ok=True)
 
@@ -4505,6 +4508,7 @@ class GPUBPETrainer(BaseTrainer):
         merges_path = os.path.join(out_dir, "merges.txt")
         tokenizer_path = os.path.join(out_dir, "tokenizer.json")
         meta_path = os.path.join(out_dir, "bpe_merges.json")
+        tiktoken_path = os.path.join(out_dir, "merges.tiktoken")
 
         with open(vocab_path, "w", encoding="utf-8") as handle:
             json.dump(vocab, handle, ensure_ascii=False)
@@ -4517,10 +4521,13 @@ class GPUBPETrainer(BaseTrainer):
         with open(tokenizer_path, "w", encoding="utf-8") as handle:
             json.dump(tokenizer_config, handle, ensure_ascii=False)
 
+        export_artifacts.write_tiktoken_bpe(tiktoken_path, mergeable_ranks)
+
         meta = {
             "base_vocab": self.base_vocab,
             "vocab_size": self.vocab_size,
             "merges": self._merges_for_metadata(),
+            "tiktoken_merges_path": tiktoken_path,
         }
         meta["privacy"] = self._privacy_summary()
         if self.privacy_mode:
@@ -4536,35 +4543,38 @@ class GPUBPETrainer(BaseTrainer):
             "merges": merges_path,
             "tokenizer": tokenizer_path,
             "metadata": meta_path,
+            "tiktoken_merges": tiktoken_path,
         }
 
     def export_tokenizer(self, out_dir: str | None = None) -> GPUBPETokenizer:
         """Create a :class:`GPUBPETokenizer` from the current trainer state."""
 
-        vocab, merges, tokenizer_config = self._build_tokenizer_artifacts()
+        vocab, merges, tokenizer_config, mergeable_ranks = self._build_tokenizer_artifacts()
         if out_dir is not None:
-            paths = self._write_tokenizer_artifacts(out_dir, vocab, merges, tokenizer_config)
+            paths = self._write_tokenizer_artifacts(
+                out_dir, vocab, merges, tokenizer_config, mergeable_ranks
+            )
             return GPUBPETokenizer.from_file(paths["tokenizer"])
         if _HFTokenizer is None:
             raise RuntimeError(
                 "The `tokenizers` library is required for in-memory export; "
                 "provide `out_dir` to persist artifacts instead."
-            )
+        )
         return GPUBPETokenizer.from_config(tokenizer_config)
 
     def save_artifacts(self, out_dir: str | os.PathLike[str]) -> dict[str, str]:
         """Persist tokenizer artifacts and return their filesystem paths."""
 
-        vocab, merges, tokenizer_config = self._build_tokenizer_artifacts()
+        vocab, merges, tokenizer_config, mergeable_ranks = self._build_tokenizer_artifacts()
         return self._write_tokenizer_artifacts(
-            os.fspath(out_dir), vocab, merges, tokenizer_config
+            os.fspath(out_dir), vocab, merges, tokenizer_config, mergeable_ranks
         )
 
     def save(self, out_dir: str | os.PathLike[str]) -> None:
         paths = self.save_artifacts(out_dir)
         print(
             "Saved tokenizer artifacts → "
-            f"{paths['vocab']}, {paths['merges']}, {paths['tokenizer']}"
+            f"{paths['vocab']}, {paths['merges']}, {paths['tokenizer']}, {paths['tiktoken_merges']}"
         )
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
@@ -471,7 +472,165 @@ def write_export_package(
     }
 
 
+def _build_byte_level_mappings() -> tuple[dict[int, str], dict[str, int]]:
+    bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    encoder = {b: chr(c) for b, c in zip(bs, cs)}
+    decoder = {v: k for k, v in encoder.items()}
+    return encoder, decoder
+
+
+_BYTE_ENCODER, _BYTE_DECODER = _build_byte_level_mappings()
+
+
+def byte_level_encoder() -> dict[int, str]:
+    """Return the byte→unicode mapping used by ByteLevel BPE tokenizers."""
+
+    return dict(_BYTE_ENCODER)
+
+
+def byte_level_decoder() -> dict[str, int]:
+    """Return the unicode→byte mapping used by ByteLevel BPE tokenizers."""
+
+    return dict(_BYTE_DECODER)
+
+
+def _token_to_bytes(token: str, *, decoder: Mapping[str, int]) -> bytes:
+    try:
+        return bytes(decoder[char] for char in token)
+    except KeyError as exc:  # pragma: no cover - defensive
+        raise ValueError(
+            f"Token contains characters outside the ByteLevel alphabet: {token!r}"
+        ) from exc
+
+
+def vocab_to_tiktoken_mergeable_ranks(
+    vocab: Mapping[str, int],
+    *,
+    skip_tokens: Iterable[str] | None = None,
+    decoder: Mapping[str, int] | None = None,
+) -> dict[bytes, int]:
+    """Convert a vocab mapping into TikToken ``mergeable_ranks`` bytes."""
+
+    decoder_map = dict(decoder or _BYTE_DECODER)
+    skip = {token for token in (skip_tokens or ())}
+    ordered = sorted(vocab.items(), key=lambda item: int(item[1]))
+    mergeable: dict[bytes, int] = {}
+    for token, rank in ordered:
+        if token in skip:
+            continue
+        token_bytes = _token_to_bytes(token, decoder=decoder_map)
+        mergeable[token_bytes] = int(rank)
+    return mergeable
+
+
+def serialize_tiktoken_bpe(mergeable_ranks: Mapping[bytes, int]) -> bytes:
+    """Serialize TikToken ``mergeable_ranks`` to packed bytes."""
+
+    lines: list[bytes] = []
+    for token_bytes, rank in sorted(mergeable_ranks.items(), key=lambda item: int(item[1])):
+        encoded = base64.b64encode(token_bytes)
+        lines.append(encoded + b" " + str(int(rank)).encode("ascii") + b"\n")
+    return b"".join(lines)
+
+
+def write_tiktoken_bpe(
+    path: str | os.PathLike[str], mergeable_ranks: Mapping[bytes, int]
+) -> str:
+    """Write TikToken mergeable ranks to *path* and return the string path."""
+
+    payload = serialize_tiktoken_bpe(mergeable_ranks)
+    with open(path, "wb") as handle:
+        handle.write(payload)
+    return os.fspath(path)
+
+
+def load_tiktoken_bpe(path: str | os.PathLike[str]) -> dict[bytes, int]:
+    """Load TikToken mergeable ranks without requiring optional dependencies."""
+
+    mergeable: dict[bytes, int] = {}
+    with open(path, "rb") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                token_b64, rank_str = line.split()
+            except ValueError as exc:  # pragma: no cover - defensive
+                raise ValueError(f"Malformed TikToken line: {raw_line!r}") from exc
+            token_bytes = base64.b64decode(token_b64)
+            mergeable[token_bytes] = int(rank_str)
+    return mergeable
+
+
+def mergeable_ranks_to_merges(
+    mergeable_ranks: Mapping[bytes, int],
+    *,
+    base_vocab: int | None = None,
+    encoder: Mapping[int, str] | None = None,
+) -> list[tuple[int, int]]:
+    """Reconstruct merge pairs from TikToken ``mergeable_ranks``."""
+
+    encoder_map = dict(encoder or _BYTE_ENCODER)
+    ordered = sorted(mergeable_ranks.items(), key=lambda item: int(item[1]))
+    token_strings: list[str] = [
+        "".join(encoder_map[b] for b in token_bytes) for token_bytes, _rank in ordered
+    ]
+
+    if base_vocab is None:
+        base_vocab = next(
+            (idx for idx, token in enumerate(token_strings) if len(token) > 1),
+            len(token_strings),
+        )
+    base_vocab = int(base_vocab)
+
+    token_to_index = {token: idx for idx, token in enumerate(token_strings)}
+    merges: list[tuple[int, int]] = []
+    for idx in range(base_vocab, len(token_strings)):
+        token = token_strings[idx]
+        if len(token) <= 1:
+            raise ValueError(
+                "Encountered single-character token beyond the base vocabulary while reconstructing merges"
+            )
+        pair: tuple[int, int] | None = None
+        for split in range(1, len(token)):
+            left = token[:split]
+            right = token[split:]
+            left_id = token_to_index.get(left)
+            right_id = token_to_index.get(right)
+            if left_id is None or right_id is None:
+                continue
+            if left_id < idx and right_id < idx:
+                pair = (left_id, right_id)
+                break
+        if pair is None:
+            raise ValueError(
+                f"Unable to decompose TikToken symbol {token!r} at rank {idx} into earlier tokens"
+            )
+        merges.append(pair)
+    return merges
+
+
+def load_tiktoken_merges(
+    path: str | os.PathLike[str],
+    *,
+    base_vocab: int | None = None,
+) -> list[tuple[int, int]]:
+    """Convenience wrapper that loads TikToken bytes and returns merge pairs."""
+
+    mergeable = load_tiktoken_bpe(path)
+    return mergeable_ranks_to_merges(mergeable, base_vocab=base_vocab)
+
+
 __all__ = [
+    "byte_level_decoder",
+    "byte_level_encoder",
     "DedupeResult",
     "ExportManifest",
     "PruneResult",
@@ -479,9 +638,15 @@ __all__ = [
     "build_manifest",
     "dedupe_vocabulary",
     "generate_embedding_matrix",
+    "load_tiktoken_bpe",
+    "load_tiktoken_merges",
     "load_token_stats",
     "load_vocab",
+    "mergeable_ranks_to_merges",
     "prune_vocabulary",
     "resolve_dtype",
+    "serialize_tiktoken_bpe",
+    "vocab_to_tiktoken_mergeable_ranks",
     "write_export_package",
+    "write_tiktoken_bpe",
 ]
