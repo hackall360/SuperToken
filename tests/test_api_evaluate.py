@@ -16,10 +16,11 @@ from gpu_tokenizer.evaluate import EvaluateCLIResult, evaluate_cli  # noqa: E402
 from gpu_tokenizer.morphology import create_plugin  # noqa: E402  pylint: disable=wrong-import-position
 
 
-def _fixture_paths() -> dict[str, Path]:
+def _fixture_paths() -> dict[str, object]:
     data_root = Path("tests/data")
+    corpus_dir = data_root / "evaluate_corpus"
     return {
-        "corpus": data_root / "evaluate_corpus" / "plain.txt",
+        "corpora": sorted(corpus_dir.glob("*.txt")),
         "models": data_root / "models" / "bpe",
         "vocab": data_root / "models" / "bpe" / "vocab.json",
         "merges": data_root / "models" / "bpe" / "merges.json",
@@ -32,7 +33,7 @@ def test_top_level_evaluate_matches_fixture() -> None:
     paths = _fixture_paths()
     plugin = create_plugin("tr", case_markers=True, affix_tags=True)
     report = evaluate(
-        [paths["corpus"]],
+        paths["corpora"],
         vocab_path=paths["vocab"],
         merges_path=paths["merges"],
         tokenizer_path=paths["tokenizer"],
@@ -62,7 +63,7 @@ def test_cli_wrapper_returns_structured_result() -> None:
     paths = _fixture_paths()
     plugin = create_plugin("tr", case_markers=True, affix_tags=True)
     options = EvaluateCLIOptions(
-        data_files=[paths["corpus"]],
+        data_files=paths["corpora"],
         vocab_path=paths["vocab"],
         merges_path=paths["merges"],
         tokenizer_path=paths["tokenizer"],

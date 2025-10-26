@@ -102,11 +102,16 @@ Evaluate exported artifacts against a reference corpus in a single step—the CL
 
 ```bash
 python main.py evaluate \
-  --data tests/data/evaluate_corpus/plain.txt \
+  --data tests/data/evaluate_corpus/*.txt \
   --artifacts tests/data/models/bpe \
   --deterministic \
+  --output reports/evaluate.json \
   --summary-format table
 ```
+
+The bundled fixtures span emoji (including ZWJ sequences), RTL strings, and
+multiple CJK/Indic scripts alongside structured code manifests so regression
+tests keep byte-level handling honest.
 
 Supply `--merges` (or an artifacts directory containing `merges.(json|txt)`) when benchmarking BPE exports. SentencePiece packages expose `unigram.vocab`, so pass `--model-type unigram` or omit `--merges` to let auto-detection switch modes. Change `--summary-format` to `json` or `none` to customise the banner while keeping the JSON payload stable for downstream tooling.
 
