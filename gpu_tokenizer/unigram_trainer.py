@@ -320,6 +320,43 @@ class GPUUnigramTrainer(BaseTrainer):
             self._rebuild_vocab_trie()
         return {"vocab": len(self.id2piece)}
 
+    def import_sentencepiece(
+        self,
+        *,
+        pieces: Mapping[int, bytes],
+        scores: Sequence[float],
+        source: str | None = None,
+    ) -> None:
+        """Import SentencePiece unigram pieces as the active vocabulary."""
+
+        if not pieces:
+            raise ValueError("pieces must contain at least one entry")
+
+        ordered = sorted(((int(idx), bytes(piece)) for idx, piece in pieces.items()), key=lambda item: item[0])
+        id2piece = {idx: piece for idx, piece in ordered}
+        piece2id = {piece: idx for idx, piece in ordered}
+
+        score_list = [float(value) for value in scores]
+        target_len = len(id2piece)
+        if len(score_list) < target_len:
+            fill = score_list[-1] if score_list else -math.log(max(target_len, 1))
+            score_list.extend([fill] * (target_len - len(score_list)))
+        elif len(score_list) > target_len:
+            score_list = score_list[:target_len]
+
+        logp_tensor = torch.tensor(score_list, dtype=torch.float32, device=self.device)
+
+        self.id2piece = id2piece
+        self.piece2id = piece2id
+        self.base_vocab = min(self.base_vocab, len(id2piece))
+        self.target_vocab = max(self.target_vocab, len(id2piece))
+        self.logp = logp_tensor
+        self._completed_epochs = 0
+        self._epoch_history = []
+        self._mark_vocab_dirty()
+        if self.device == "cuda" and torch.cuda.is_available():
+            self._rebuild_vocab_trie()
+
     def metrics(self) -> Mapping[str, TrainerMetricsEWMA]:
         """Expose registered metrics trackers for telemetry consumers."""
 

@@ -2203,6 +2203,54 @@ class GPUBPETrainer(BaseTrainer):
             "source": "ngram",
         }
 
+    def import_merges(
+        self,
+        merges: Sequence[Sequence[int]] | Sequence[tuple[int, int]],
+        *,
+        vocab_size: int | None = None,
+        base_vocab: int | None = None,
+        source: str | None = None,
+        freeze: bool = False,
+    ) -> None:
+        """Import pre-trained merges from external BPE bundles."""
+
+        if merges is None:
+            raise ValueError("merges must be provided when importing external artifacts")
+
+        coerced: list[tuple[int, int]] = []
+        for entry in merges:
+            if not isinstance(entry, Sequence) or len(entry) != 2:
+                raise ValueError("merge entries must contain exactly two token ids")
+            left, right = entry
+            try:
+                coerced.append((int(left), int(right)))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Unable to coerce merge pair {entry!r} to integers") from exc
+
+        base_value = int(base_vocab) if base_vocab is not None else self.base_vocab
+        vocab_value = int(vocab_size) if vocab_size is not None else base_value + len(coerced)
+
+        self.base_vocab = base_value
+        self.vocab_size = vocab_value
+        self.target_merges = max(self.target_merges, len(coerced))
+        self.merges = coerced
+        self._merge_step = len(coerced)
+        self._seed_warm_start_merges = list(coerced)
+        plan = {
+            "merges": [list(map(int, pair)) for pair in coerced],
+            "counts": None,
+            "top_k": len(coerced),
+            "requested_top_k": len(coerced),
+            "order": 2,
+            "histogram_size": len(coerced),
+            "source": source or "import",
+        }
+        self._warm_start_plan = plan
+        self._warm_start_applied = True
+        if freeze:
+            self.freeze_warm_start = True
+        self._reset_histogram_cache()
+
     def _reset_top_pairs(self) -> None:
         self._top_pairs_heap = []
         self._top_pairs_index = {}

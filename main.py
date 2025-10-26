@@ -427,6 +427,66 @@ def _expand_data_patterns(patterns: Sequence[str]) -> list[Path]:
     return files
 
 
+def _resolve_hf_bpe_import(path: Path) -> export_artifacts.HFBPEImport | None:
+    """Attempt to resolve Hugging Face BPE artifacts from *path*."""
+
+    if path.is_dir():
+        tokenizer = path / "tokenizer.json"
+        if tokenizer.exists():
+            return export_artifacts.load_hf_bpe_artifacts(tokenizer_path=tokenizer)
+        vocab = path / "vocab.json"
+        merges = path / "merges.txt"
+        if vocab.exists() and merges.exists():
+            return export_artifacts.load_hf_bpe_artifacts(vocab_path=vocab, merges_path=merges)
+        return None
+
+    name = path.name.lower()
+    suffix = path.suffix.lower()
+    if name == "tokenizer.json" or (suffix == ".json" and "tokenizer" in name):
+        return export_artifacts.load_hf_bpe_artifacts(tokenizer_path=path)
+    if name == "vocab.json" or (suffix == ".json" and name.endswith("vocab.json")):
+        merges = path.with_name("merges.txt")
+        if merges.exists():
+            return export_artifacts.load_hf_bpe_artifacts(vocab_path=path, merges_path=merges)
+    if name == "merges.txt" or name.endswith("merges.txt"):
+        vocab = path.with_name("vocab.json")
+        if vocab.exists():
+            return export_artifacts.load_hf_bpe_artifacts(vocab_path=vocab, merges_path=path)
+    return None
+
+
+def _resolve_sentencepiece_import(
+    path: Path,
+) -> export_artifacts.SentencePieceUnigramImport | None:
+    """Attempt to resolve SentencePiece unigram artifacts from *path*."""
+
+    if path.is_dir():
+        model_candidates = [
+            path / "unigram.model",
+            path / "sp.model",
+            path / "sentencepiece.model",
+        ]
+        for candidate in model_candidates:
+            if candidate.exists():
+                return export_artifacts.load_sentencepiece_unigram(model_path=candidate)
+        vocab_candidates = [
+            path / "unigram.vocab",
+            path / "unigram.prob",
+            path / "sp.vocab",
+        ]
+        for candidate in vocab_candidates:
+            if candidate.exists():
+                return export_artifacts.load_sentencepiece_unigram(vocab_path=candidate)
+        return None
+
+    suffix = path.suffix.lower()
+    if suffix in {".model", ".spm"}:
+        return export_artifacts.load_sentencepiece_unigram(model_path=path)
+    if suffix in {".vocab", ".prob"}:
+        return export_artifacts.load_sentencepiece_unigram(vocab_path=path)
+    return None
+
+
 def _load_warm_start_merges(source: str | None) -> list[tuple[int, int]] | None:
     """Load warm-start merges from a JSON manifest when provided."""
 
@@ -436,6 +496,13 @@ def _load_warm_start_merges(source: str | None) -> list[tuple[int, int]] | None:
     path = Path(source)
     if not path.exists():
         raise SystemExit(f"Warm-start plan not found at {path}")
+
+    try:
+        hf_import = _resolve_hf_bpe_import(path)
+    except ValueError as exc:
+        raise SystemExit(f"Failed to import Hugging Face merges from {path}: {exc}") from exc
+    if hf_import is not None:
+        return hf_import.merges
 
     if path.is_dir():
         candidates = [
@@ -687,6 +754,33 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
     sources: list[dict[str, object]] = []
     morphology_plugin, morphology_config = _resolve_morphology(args)
     augmentation_pipeline = _resolve_augmentation(args)
+    warm_start_summary: dict[str, object] | None = None
+    warm_start_source = getattr(args, "warm_start", None)
+    if warm_start_source:
+        warm_path = Path(warm_start_source)
+        if not warm_path.exists():
+            raise SystemExit(f"Warm-start model not found at {warm_path}")
+        try:
+            sp_bundle = _resolve_sentencepiece_import(warm_path)
+        except (ValueError, RuntimeError) as exc:
+            raise SystemExit(
+                f"Failed to import SentencePiece model from {warm_start_source}: {exc}"
+            ) from exc
+        if sp_bundle is None:
+            raise SystemExit(
+                "--warm-start must reference a SentencePiece .model or .vocab/.prob file"
+            )
+        trainer.import_sentencepiece(pieces=sp_bundle.pieces, scores=sp_bundle.scores)
+        warm_start_summary = {
+            "source": warm_start_source,
+            "pieces": len(sp_bundle.pieces),
+        }
+        if sp_bundle.metadata:
+            warm_start_summary["metadata"] = sp_bundle.metadata
+        source_label = sp_bundle.sources[0] if sp_bundle.sources else warm_start_source
+        print(
+            f"[warm-start] Imported {len(sp_bundle.pieces)} unigram pieces from {source_label}"
+        )
     augmentation_pipeline = _resolve_augmentation(args)
 
     if args.synthetic_docs > 0:
@@ -1231,100 +1325,144 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
         ] | None = None
         resume_stream_state: dict[str, object] | None = None
         if args.resume_from:
-            resume_state = trainer.load_checkpoint(str(args.resume_from))
-            payload_mapping = resume_state.get("payload")
-            if isinstance(payload_mapping, Mapping):
-                checkpoint_payload = CheckpointPayload.from_mapping(payload_mapping)
-            else:
-                legacy_meta = resume_state.get("metadata")
-                if isinstance(legacy_meta, Mapping):
-                    checkpoint_payload = CheckpointPayload.from_legacy_metadata(
-                        legacy_meta
-                    )
-                else:
-                    checkpoint_payload = CheckpointPayload()
-
-            model_section = checkpoint_payload.trainer.get("model")
-            if not isinstance(model_section, Mapping):
-                model_section = checkpoint_payload.trainer
-            merge_step = model_section.get("merge_step")
-            print(
-                f"[checkpoint] Restored checkpoint from {args.resume_from}"
-                + (f" at merge {merge_step}" if merge_step is not None else "")
-            )
-
-            if checkpoint_payload.version != CheckpointPayload.CURRENT_VERSION:
-                print(
-                    "[checkpoint] Warning: checkpoint schema version "
-                    f"{checkpoint_payload.version} differs from expected "
-                    f"{CheckpointPayload.CURRENT_VERSION}",
-                    file=sys.stderr,
-                )
-
-            config_errors: list[str] = []
-            config_warnings: list[str] = []
-            target_merges = model_section.get("target_merges")
+            resume_path = Path(args.resume_from)
             try:
-                target_merges_int = (
-                    int(target_merges) if target_merges is not None else None
-                )
-            except (TypeError, ValueError):
-                target_merges_int = None
-            if target_merges_int is None:
-                merges_list = model_section.get("merges")
-                if isinstance(merges_list, list):
-                    target_merges_int = len(merges_list)
-            if target_merges_int is not None and target_merges_int != int(args.merges):
-                config_errors.append(
-                    "CLI --merges does not match checkpoint target_merges"
-                )
-            base_vocab_val = model_section.get("base_vocab")
-            try:
-                base_vocab_int = (
-                    int(base_vocab_val) if base_vocab_val is not None else None
-                )
-            except (TypeError, ValueError):
-                base_vocab_int = None
-            if base_vocab_int is not None and base_vocab_int != int(args.base_vocab):
-                config_warnings.append(
-                    "CLI --base-vocab does not match checkpoint base_vocab"
-                )
-            for warning in config_warnings:
-                print(f"[checkpoint] Warning: {warning}", file=sys.stderr)
-            if config_errors:
-                for error in config_errors:
-                    print(f"[checkpoint] Error: {error}", file=sys.stderr)
-                raise SystemExit("Checkpoint configuration mismatch")
-
-            dataset_meta = checkpoint_payload.dataset
-            serialized_batches = (
-                dataset_meta.get("batches") if isinstance(dataset_meta, Mapping) else None
-            )
-            if serialized_batches is None:
-                serialized_batches = checkpoint_payload.trainer.get("batches")
-            if isinstance(serialized_batches, dict):
-                restored_bs, restored_iter = _build_serialized_batches(
-                    serialized_batches,
-                    batch_size,
-                )
-                if restored_bs > 0:
-                    batch_size = restored_bs
-                resume_batches = restored_iter
-            if isinstance(dataset_meta, Mapping):
-                stream_offsets = dataset_meta.get("stream_offsets")
-                if isinstance(stream_offsets, Mapping) and stream_offsets:
-                    resume_stream_state = {"stream_offsets": dict(stream_offsets)}
-                stream_batch_size = dataset_meta.get("stream_batch_size")
+                resume_state = trainer.load_checkpoint(str(resume_path))
+            except FileNotFoundError:
                 try:
-                    stream_bs_val = (
-                        int(stream_batch_size) if stream_batch_size is not None else None
+                    hf_bundle = _resolve_hf_bpe_import(resume_path)
+                except ValueError as exc:
+                    raise SystemExit(
+                        f"Failed to import tokenizer artifacts from {args.resume_from}: {exc}"
+                    ) from exc
+                if hf_bundle is None:
+                    raise SystemExit(
+                        "--resume-from must point to a checkpoint directory or a Hugging Face tokenizer bundle"
+                    )
+                vocab_ids = list(hf_bundle.vocab.values())
+                vocab_size = (
+                    max(vocab_ids) + 1
+                    if vocab_ids
+                    else trainer.base_vocab + len(hf_bundle.merges)
+                )
+                base_vocab = (
+                    hf_bundle.base_vocab if hf_bundle.base_vocab > 0 else trainer.base_vocab
+                )
+                trainer.import_merges(
+                    hf_bundle.merges,
+                    vocab_size=vocab_size,
+                    base_vocab=base_vocab,
+                    source="huggingface",
+                )
+                source_label = hf_bundle.sources[0] if hf_bundle.sources else args.resume_from
+                print(
+                    f"[warm-start] Imported {len(hf_bundle.merges)} merges from {source_label}"
+                )
+                resume_state = None
+            if resume_state is not None:
+                payload_mapping = resume_state.get("payload")
+                if isinstance(payload_mapping, Mapping):
+                    checkpoint_payload = CheckpointPayload.from_mapping(payload_mapping)
+                else:
+                    legacy_meta = resume_state.get("metadata")
+                    if isinstance(legacy_meta, Mapping):
+                        checkpoint_payload = CheckpointPayload.from_legacy_metadata(
+                            legacy_meta
+                        )
+                    else:
+                        checkpoint_payload = CheckpointPayload()
+
+                model_section = checkpoint_payload.trainer.get("model")
+                if not isinstance(model_section, Mapping):
+                    model_section = checkpoint_payload.trainer
+                merge_step = model_section.get("merge_step")
+                print(
+                    f"[checkpoint] Restored checkpoint from {args.resume_from}"
+                    + (f" at merge {merge_step}" if merge_step is not None else "")
+                )
+
+                if (
+                    checkpoint_payload.version
+                    != CheckpointPayload.CURRENT_VERSION
+                ):
+                    print(
+                        "[checkpoint] Warning: checkpoint schema version "
+                        f"{checkpoint_payload.version} differs from expected "
+                        f"{CheckpointPayload.CURRENT_VERSION}",
+                        file=sys.stderr,
+                    )
+
+                config_errors: list[str] = []
+                config_warnings: list[str] = []
+                target_merges = model_section.get("target_merges")
+                try:
+                    target_merges_int = (
+                        int(target_merges) if target_merges is not None else None
                     )
                 except (TypeError, ValueError):
-                    stream_bs_val = None
-                if stream_bs_val and stream_bs_val > 0:
-                    if resume_stream_state is None:
-                        resume_stream_state = {}
-                    resume_stream_state["batch_size"] = stream_bs_val
+                    target_merges_int = None
+                if target_merges_int is None:
+                    merges_list = model_section.get("merges")
+                    if isinstance(merges_list, list):
+                        target_merges_int = len(merges_list)
+                if (
+                    target_merges_int is not None
+                    and target_merges_int != int(args.merges)
+                ):
+                    config_errors.append(
+                        "CLI --merges does not match checkpoint target_merges"
+                    )
+                base_vocab_val = model_section.get("base_vocab")
+                try:
+                    base_vocab_int = (
+                        int(base_vocab_val) if base_vocab_val is not None else None
+                    )
+                except (TypeError, ValueError):
+                    base_vocab_int = None
+                if base_vocab_int is not None and base_vocab_int != int(args.base_vocab):
+                    config_warnings.append(
+                        "CLI --base-vocab does not match checkpoint base_vocab"
+                    )
+                for warning in config_warnings:
+                    print(f"[checkpoint] Warning: {warning}", file=sys.stderr)
+                if config_errors:
+                    for error in config_errors:
+                        print(f"[checkpoint] Error: {error}", file=sys.stderr)
+                    raise SystemExit("Checkpoint configuration mismatch")
+
+                dataset_meta = checkpoint_payload.dataset
+                serialized_batches = (
+                    dataset_meta.get("batches")
+                    if isinstance(dataset_meta, Mapping)
+                    else None
+                )
+                if serialized_batches is None:
+                    serialized_batches = checkpoint_payload.trainer.get("batches")
+                if isinstance(serialized_batches, dict):
+                    restored_bs, restored_iter = _build_serialized_batches(
+                        serialized_batches,
+                        batch_size,
+                    )
+                    if restored_bs > 0:
+                        batch_size = restored_bs
+                    resume_batches = restored_iter
+                if isinstance(dataset_meta, Mapping):
+                    stream_offsets = dataset_meta.get("stream_offsets")
+                    if isinstance(stream_offsets, Mapping) and stream_offsets:
+                        resume_stream_state = {"stream_offsets": dict(stream_offsets)}
+                    stream_batch_size = dataset_meta.get("stream_batch_size")
+                    try:
+                        stream_bs_val = (
+                            int(stream_batch_size)
+                            if stream_batch_size is not None
+                            else None
+                        )
+                    except (TypeError, ValueError):
+                        stream_bs_val = None
+                    if stream_bs_val and stream_bs_val > 0:
+                        if resume_stream_state is None:
+                            resume_stream_state = {}
+                        resume_stream_state["batch_size"] = stream_bs_val
         
         streamer = None
         dataset_tracker = None
@@ -1481,6 +1619,8 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
             },
         }
     )
+    if warm_start_summary:
+        config["warm_start"] = warm_start_summary
     config["morphology"] = morphology_config
     _log_resolved_config("train-unigram", config)
     if getattr(args, "dry_run", False):
@@ -1506,24 +1646,48 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
         )
 
     resume_state: dict[str, object] | None = None
+    resume_is_checkpoint = False
     if getattr(args, "resume_from", None):
-        resume_state = trainer.load_checkpoint(str(args.resume_from))
-        payload = resume_state.get("payload") if isinstance(resume_state, Mapping) else None
-        trainer_section = payload.get("trainer") if isinstance(payload, Mapping) else None
-        progress_meta = trainer_section.get("progress") if isinstance(trainer_section, Mapping) else None
-        restored_epochs = getattr(trainer, "completed_epochs", 0)
-        epoch_label = ""
-        if isinstance(progress_meta, Mapping):
-            completed = progress_meta.get("completed_epochs")
+        resume_path = Path(args.resume_from)
+        try:
+            resume_state = trainer.load_checkpoint(str(resume_path))
+            resume_is_checkpoint = True
+        except FileNotFoundError:
             try:
-                completed_int = int(completed) if completed is not None else restored_epochs
-            except (TypeError, ValueError):
-                completed_int = restored_epochs
-            if completed_int:
-                epoch_label = f" at epoch {completed_int}"
-        elif restored_epochs:
-            epoch_label = f" at epoch {restored_epochs}"
-        print(f"[checkpoint] Restored checkpoint from {args.resume_from}{epoch_label}")
+                sp_bundle = _resolve_sentencepiece_import(resume_path)
+            except (ValueError, RuntimeError) as exc:
+                raise SystemExit(
+                    f"Failed to import SentencePiece artifacts from {args.resume_from}: {exc}"
+                ) from exc
+            if sp_bundle is None:
+                raise SystemExit(
+                    "--resume-from must point to a checkpoint directory or a SentencePiece model"
+                )
+            trainer.import_sentencepiece(pieces=sp_bundle.pieces, scores=sp_bundle.scores)
+            source_label = sp_bundle.sources[0] if sp_bundle.sources else args.resume_from
+            print(
+                f"[warm-start] Imported {len(sp_bundle.pieces)} unigram pieces from {source_label}"
+            )
+            resume_state = None
+        if resume_is_checkpoint and resume_state is not None:
+            payload = resume_state.get("payload") if isinstance(resume_state, Mapping) else None
+            trainer_section = payload.get("trainer") if isinstance(payload, Mapping) else None
+            progress_meta = (
+                trainer_section.get("progress") if isinstance(trainer_section, Mapping) else None
+            )
+            restored_epochs = getattr(trainer, "completed_epochs", 0)
+            epoch_label = ""
+            if isinstance(progress_meta, Mapping):
+                completed = progress_meta.get("completed_epochs")
+                try:
+                    completed_int = int(completed) if completed is not None else restored_epochs
+                except (TypeError, ValueError):
+                    completed_int = restored_epochs
+                if completed_int:
+                    epoch_label = f" at epoch {completed_int}"
+            elif restored_epochs:
+                epoch_label = f" at epoch {restored_epochs}"
+            print(f"[checkpoint] Restored checkpoint from {args.resume_from}{epoch_label}")
 
     batches = _build_unigram_batches(
         sequences,
@@ -1533,9 +1697,9 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
     )
     target_epochs = max(int(args.epochs), 0)
     checkpoint_root: Path | None = None
-    checkpoint_dir_value = getattr(args, "checkpoint_dir", None) or getattr(
-        args, "resume_from", None
-    )
+    checkpoint_dir_value = getattr(args, "checkpoint_dir", None)
+    if not checkpoint_dir_value and resume_is_checkpoint:
+        checkpoint_dir_value = getattr(args, "resume_from", None)
     if checkpoint_dir_value:
         checkpoint_root = Path(checkpoint_dir_value)
         checkpoint_root.mkdir(parents=True, exist_ok=True)
@@ -2164,6 +2328,12 @@ def _parser() -> argparse.ArgumentParser:
     train_unigram.add_argument("--batch-size", type=int, default=1024)
     train_unigram.add_argument("--epochs", type=int, default=1)
     train_unigram.add_argument("--out-dir", type=str, default="./unigram_out")
+    train_unigram.add_argument(
+        "--warm-start",
+        type=str,
+        default=None,
+        help="Optional SentencePiece .model or .vocab/.prob file to seed the unigram trainer",
+    )
     train_unigram.add_argument(
         "--checkpoint-dir",
         type=str,
