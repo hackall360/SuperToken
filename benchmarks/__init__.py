@@ -1,16 +1,20 @@
 """Benchmark utilities for SuperToken."""
 
 from .benchmark_runner import (
+    BaselineCorpus,
     BPERunSpec,
     CorpusSummary,
     emit_benchmark_summary,
+    available_baseline_corpora,
     generate_hybrid_runs,
     generate_multi_gpu_runs,
     generate_streaming_compression_runs,
     load_bpe_run_config,
     load_real_corpus,
+    resolve_baseline_corpora,
     run_bpe_benchmark,
     run_bpe_suite,
+    run_reference_tokenizers,
     run_unigram_benchmark,
     serialize_run,
     summarize_corpus,
@@ -19,17 +23,21 @@ from .benchmark_runner import (
 from .schema import BENCHMARK_OUTPUT_SCHEMA, SchemaValidationError, validate_benchmark_output
 
 __all__ = [
+    "BaselineCorpus",
     "BPERunSpec",
     "BENCHMARK_OUTPUT_SCHEMA",
     "CorpusSummary",
     "emit_benchmark_summary",
+    "available_baseline_corpora",
     "generate_hybrid_runs",
     "generate_multi_gpu_runs",
     "generate_streaming_compression_runs",
     "load_bpe_run_config",
     "load_real_corpus",
+    "resolve_baseline_corpora",
     "run_bpe_benchmark",
     "run_bpe_suite",
+    "run_reference_tokenizers",
     "run_unigram_benchmark",
     "serialize_run",
     "SchemaValidationError",

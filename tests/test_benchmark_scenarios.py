@@ -8,6 +8,7 @@ from benchmarks import (
     BENCHMARK_OUTPUT_SCHEMA,
     CorpusSummary,
     SchemaValidationError,
+    emit_benchmark_summary,
     generate_hybrid_runs,
     generate_multi_gpu_runs,
     generate_streaming_compression_runs,
@@ -110,6 +111,23 @@ def test_serialize_run_validates_against_schema(tmp_path: Path) -> None:
             }
         ]
     }
+    baselines = [
+        {
+            "name": "wikitext-103",
+            "description": "sample",
+            "documents": 2,
+            "total_bytes": 128,
+            "tokenizers": {
+                "sentencepiece": {
+                    "wall_time_s": 0.25,
+                    "tokens": 256,
+                    "tokens_per_s": 1024.0,
+                    "bytes_per_token": 0.5,
+                    "loss_per_token": 1.25,
+                }
+            },
+        }
+    ]
     path = serialize_run(
         tmp_path,
         corpus=corpus,
@@ -117,11 +135,13 @@ def test_serialize_run_validates_against_schema(tmp_path: Path) -> None:
         bpe=bpe,
         unigram=unigram,
         bpe_runs=suite,
+        baseline_tokenizers=baselines,
     )
     payload = json.loads(path.read_text(encoding="utf-8"))
     validate_benchmark_output(payload)
     assert payload["timestamp"]
     assert payload["bpe"]["tokens_per_s"] == pytest.approx(819.2)
+    assert payload["baseline_tokenizers"][0]["tokenizers"]["sentencepiece"]["tokens"] == 256
 
 
 def test_schema_validation_detects_missing_section() -> None:
@@ -158,3 +178,33 @@ def test_serialize_run_includes_optional_evaluation(tmp_path: Path) -> None:
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["evaluation"] == evaluation
+
+
+def test_emit_summary_includes_baselines() -> None:
+    corpus = CorpusSummary(sequences=4, tokens=1024, max_length=512, sources=[])
+    bpe, unigram = _build_stub_results()
+    baselines = [
+        {
+            "name": "wikitext-103",
+            "tokenizers": {
+                "sentencepiece": {
+                    "wall_time_s": 0.1,
+                    "tokens": 128,
+                    "tokens_per_s": 1280.0,
+                    "bytes_per_token": 0.75,
+                    "loss_per_token": 1.5,
+                },
+                "huggingface": {
+                    "wall_time_s": 0.2,
+                    "tokens": 160,
+                    "tokens_per_s": 800.0,
+                    "bytes_per_token": 0.64,
+                    "loss_per_token": None,
+                },
+            },
+        }
+    ]
+    summary = emit_benchmark_summary(corpus, bpe, unigram, None, baselines)
+    assert "wikitext-103" in summary
+    assert "sentencepiece" in summary.lower()
+    assert "huggingface" in summary.lower()
