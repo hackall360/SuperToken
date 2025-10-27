@@ -16,6 +16,7 @@ SuperToken is a GPU-accelerated tokenizer toolkit that offers high-throughput by
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Privacy Modes](#privacy-modes)
+- [Threat Model](#threat-model)
 - [Command Reference](#command-reference)
 - [Benchmarking](#benchmarking)
 - [Architecture & API Overview](#architecture--api-overview)
@@ -152,6 +153,20 @@ SuperToken provides an opt-in privacy guard for the merge history produced by th
 - `tie-randomize` – Hash merges **and** randomize tie-break resolution. This deliberately breaks deterministic parity across devices; provide `--tie-seed` to make the stochastic ordering reproducible across runs.
 
 Every exported manifest now includes a `"privacy"` section summarizing the active mode, whether merges were redacted, the effective tie seed, and if a salt was configured. Downstream consumers can inspect this block to detect redactions without reverse engineering trainer configuration. See [docs/cli.md](docs/cli.md#privacy-options) for end-to-end examples.
+
+## Threat Model
+
+SuperToken targets operators that distribute tokenizer artifacts to semi-trusted partners or run training on shared infrastructure. We assume adversaries can inspect any exported manifest, checkpoint, or intermediate merge table that leaves the control plane, and that they can correlate those artifacts with known corpora to recover sensitive domain terminology. We do **not** attempt to defend against an attacker that compromises the training host, reads raw input shards, or tampers with the trainer implementation itself.
+
+The privacy modes focus on limiting how much corpus information leaks through merge histories:
+
+| Mode | Adversary capabilities mitigated | Residual risks and operator actions |
+| --- | --- | --- |
+| `none` | None. Merge tables and tie breaks remain deterministic, enabling exact reconstruction of token orderings. | Only appropriate when all consumers already have access to the source corpus. Treat artifacts as public. |
+| `hash-merges` | Prevents a passive observer from reading merge IDs directly or matching them to common subwords without brute-force enumeration. Salting frustrates precomputed rainbow tables. | Frequency analysis against known vocabularies can still reveal high-probability merges. Keep salts secret and rotate them between releases to slow cross-run correlation. |
+| `tie-randomize` | Inherits `hash-merges` protections and additionally disrupts deterministic tie resolution, reducing an adversary's ability to infer subtle ordering preferences from multiple builds. | Stochastic tie breaks introduce run-to-run variation that may complicate regression diffs. Persist the `--tie-seed` (if used) in a secure location so reruns remain auditable. |
+
+Operators choosing a privacy guard should weigh the sensitivity of merge names, how widely artifacts will be shared, and whether reproducibility is a regulatory requirement. When uncertainty remains, prefer `tie-randomize` with an explicitly managed seed so auditors can replay outputs without exposing raw merge labels.
 
 ## Command Reference
 The CLI is organized into subcommands that share a common set of arguments.

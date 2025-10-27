@@ -1,6 +1,6 @@
 # Hybrid schedule with morphology and privacy in three commands
 
-Hybrid training warm-starts a BPE vocabulary before refining it with unigram updates. The following commands generate a toy corpus, run the schedule, and surface the exported manifest.
+Hybrid training warm-starts a BPE vocabulary before refining it with unigram updates. The following commands generate a toy corpus, run the schedule, and surface the exported manifest. Consult the [threat model](../../README.md#threat-model) before choosing a privacy mode—`tie-randomize` offers the strongest protection against merge reconstruction, while lighter guards keep reproducibility intact for trusted environments.
 
 1. Seed a small bilingual corpus with simple sentences:
    ```bash
@@ -11,7 +11,7 @@ Hybrid training warm-starts a BPE vocabulary before refining it with unigram upd
    good morning istanbul
    TXT
    ```
-2. Launch the hybrid trainer with morphology segmentation and tie-randomised privacy:
+2. Launch the hybrid trainer with morphology segmentation and tie-randomised privacy (suitable when artifacts leave your trust boundary):
    ```bash
    python main.py train-hybrid \
      --data corpus.txt \

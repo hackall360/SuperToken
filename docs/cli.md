@@ -223,13 +223,13 @@ Remember that augmentation parameters combine with `--seed`; supply an explicit 
 
 ## Privacy options
 
-Both the `train-bpe` and `train-hybrid` subcommands accept `--privacy` with three modes:
+Before selecting a guard, review the [threat model in the README](../README.md#threat-model) to align the privacy mode with the adversaries you expect to face. Both the `train-bpe` and `train-hybrid` subcommands accept `--privacy` with three modes:
 
 - `none` *(default)* exports raw merge pairs and preserves deterministic tie-breaks.
 - `hash-merges` replaces merge IDs with salted hashes in `bpe_merges.json`, `state.json`, and `hybrid_manifest.json`. Supply `--privacy-salt` with a hex or UTF-8 value to avoid identical hashes across runs; the salt itself is never written to disk.
 - `tie-randomize` hashes merges and randomizes tie-breaks. This sacrifices deterministic parity across devices; provide `--tie-seed` to reproduce the stochastic ordering when needed.
 
-Every manifest now emits a `privacy` block summarizing the active mode, whether merges were redacted, the effective tie seed, and whether a salt was configured. Downstream tooling should inspect this block instead of inferring privacy status from merge contents. Remember that enabling tie randomization changes merge selection order even when `--tie-seed` is supplied—use this mode only when deterministic parity is not required.
+Every manifest now emits a `privacy` block summarizing the active mode, whether merges were redacted, the effective tie seed, and whether a salt was configured. Downstream tooling should inspect this block instead of inferring privacy status from merge contents. Remember that enabling tie randomization changes merge selection order even when `--tie-seed` is supplied—use this mode only when deterministic parity is not required. Operators should also record the chosen salt and tie seed in a secure change log so audits can confirm the correct threat posture was applied.
 
 ## `export-embeddings`
 
