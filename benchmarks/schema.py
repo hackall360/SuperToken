@@ -118,6 +118,57 @@ BENCHMARK_OUTPUT_SCHEMA: dict[str, Any] = {
                 },
             },
         },
+        "baseline_tokenizers": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": True,
+                "required": ["name", "documents", "total_bytes", "tokenizers"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "documents": {"type": "integer", "minimum": 0},
+                    "total_bytes": {"type": "integer", "minimum": 0},
+                    "tokenizers": {
+                        "type": "object",
+                        "minProperties": 1,
+                        "additionalProperties": {
+                            "type": "object",
+                            "additionalProperties": True,
+                            "required": [
+                                "tokens",
+                                "wall_time_s",
+                                "tokens_per_s",
+                                "bytes_per_token",
+                                "loss_per_token",
+                            ],
+                            "properties": {
+                                "tokens": {"type": "integer", "minimum": 0},
+                                "wall_time_s": {"type": "number"},
+                                "tokens_per_s": {
+                                    "anyOf": [
+                                        {"type": "number"},
+                                        {"type": "null"},
+                                    ]
+                                },
+                                "bytes_per_token": {
+                                    "anyOf": [
+                                        {"type": "number"},
+                                        {"type": "null"},
+                                    ]
+                                },
+                                "loss_per_token": {
+                                    "anyOf": [
+                                        {"type": "number"},
+                                        {"type": "null"},
+                                    ]
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
         "evaluation": {"type": "object"},
     },
 }

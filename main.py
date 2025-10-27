@@ -869,7 +869,49 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
         device=args.device,
         seed=args.seed,
     )
-    print(benchmark_runner.emit_benchmark_summary(corpus, bpe, unigram, bpe_suite))
+    baseline_results: list[dict[str, object]] | None = None
+    baseline_config: dict[str, object] | None = None
+    requested_baselines = [
+        str(name) for name in getattr(args, "baseline_corpus", []) or []
+    ]
+    if requested_baselines:
+        sp_model = getattr(args, "sentencepiece_model", None)
+        hf_tokenizer = getattr(args, "huggingface_tokenizer", None)
+        if not sp_model and not hf_tokenizer:
+            raise SystemExit(
+                "--baseline-corpus requires --sentencepiece-model and/or --huggingface-tokenizer"
+            )
+        try:
+            corpora = benchmark_runner.resolve_baseline_corpora(requested_baselines)
+        except KeyError as exc:
+            available = ", ".join(benchmark_runner.available_baseline_corpora())
+            raise SystemExit(
+                f"Unknown baseline corpus '{exc.args[0]}'. Available corpora: {available}"
+            ) from exc
+        try:
+            baseline_results = benchmark_runner.run_reference_tokenizers(
+                corpora,
+                sentencepiece_model=Path(sp_model).expanduser() if sp_model else None,
+                huggingface_tokenizer=Path(hf_tokenizer).expanduser()
+                if hf_tokenizer
+                else None,
+            )
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+        baseline_config = {
+            "corpora": [corpus.name for corpus in corpora],
+            "sentencepiece_model": sp_model,
+            "huggingface_tokenizer": hf_tokenizer,
+        }
+    print(
+        benchmark_runner.emit_benchmark_summary(
+            corpus,
+            bpe,
+            unigram,
+            bpe_suite,
+            baseline_results,
+        )
+    )
     # Persist full benchmark metadata so checkpointing infrastructure can re-use
     # the exact same corpora, hyper-parameters, and timing metrics in later
     # automation runs.
@@ -888,30 +930,34 @@ def _cmd_benchmark(args: argparse.Namespace) -> None:
                 f"Failed to parse evaluation report {evaluation_path}: {exc}"
             ) from exc
 
+    config_payload = {
+        "seed": args.seed,
+        "device": args.device,
+        "synthetic": {
+            "documents": args.synthetic_docs,
+            "min_length": args.synthetic_min_len,
+            "max_length": args.synthetic_max_len,
+            "vocab_size": args.synthetic_vocab,
+        }
+        if args.synthetic_docs
+        else None,
+        "data": [str(p) for p in real_paths],
+        "max_real_docs": args.max_real_docs,
+        "bpe": bpe["config"],
+        "unigram": unigram["config"],
+        "morphology": morphology_config,
+    }
+    if baseline_config is not None:
+        config_payload["baselines"] = baseline_config
     output_path = benchmark_runner.serialize_run(
         Path(args.output_dir),
         corpus=corpus,
-        config={
-            "seed": args.seed,
-            "device": args.device,
-            "synthetic": {
-                "documents": args.synthetic_docs,
-                "min_length": args.synthetic_min_len,
-                "max_length": args.synthetic_max_len,
-                "vocab_size": args.synthetic_vocab,
-            }
-            if args.synthetic_docs
-            else None,
-            "data": [str(p) for p in real_paths],
-            "max_real_docs": args.max_real_docs,
-            "bpe": bpe["config"],
-            "unigram": unigram["config"],
-            "morphology": morphology_config,
-        },
+        config=config_payload,
         bpe=bpe,
         unigram=unigram,
         bpe_runs=bpe_suite,
         evaluation=evaluation_report,
+        baseline_tokenizers=baseline_results,
     )
     print(f"Saved benchmark metadata → {output_path}")
 
@@ -2420,6 +2466,33 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Optional evaluation JSON report to merge into the benchmark metadata"
+        ),
+    )
+    benchmark.add_argument(
+        "--baseline-corpus",
+        action="append",
+        default=[],
+        help=(
+            "Builtin baseline corpus to benchmark with reference tokenizers. "
+            "Repeat to include multiple corpora."
+        ),
+    )
+    benchmark.add_argument(
+        "--sentencepiece-model",
+        type=str,
+        default=None,
+        help=(
+            "SentencePiece .model file evaluated against baseline corpora when "
+            "--baseline-corpus is supplied"
+        ),
+    )
+    benchmark.add_argument(
+        "--huggingface-tokenizer",
+        type=str,
+        default=None,
+        help=(
+            "Hugging Face tokenizer.json evaluated against baseline corpora when "
+            "--baseline-corpus is supplied"
         ),
     )
 

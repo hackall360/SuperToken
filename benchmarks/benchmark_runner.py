@@ -9,7 +9,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Sequence
 
 import torch
 
@@ -22,9 +22,21 @@ from gpu_tokenizer import (
 )
 from gpu_tokenizer.io import MemoryMappedShard
 
+try:  # pragma: no cover - optional dependency
+    import sentencepiece as _sentencepiece
+except ImportError:  # pragma: no cover - dependency guard
+    _sentencepiece = None
+
+try:  # pragma: no cover - optional dependency
+    from tokenizers import Tokenizer as _HFTokenizer
+except ImportError:  # pragma: no cover - dependency guard
+    _HFTokenizer = None
+
 from .schema import validate_benchmark_output
 
 if TYPE_CHECKING:  # pragma: no cover - typing helper
+    from tokenizers import Tokenizer as HFTokenizer
+
     from gpu_tokenizer.morphology import MorphologyPlugin
 
 @dataclass
@@ -62,6 +74,200 @@ class BPERunSpec:
         if count <= 0:
             return []
         return [1.0] * count
+
+
+@dataclass(frozen=True)
+class BaselineCorpus:
+    """Description of a small baseline corpus used for tokenizer benchmarks."""
+
+    name: str
+    description: str
+    documents: tuple[str, ...]
+
+
+_BASELINE_CORPORA: dict[str, BaselineCorpus] = {
+    "wikitext-103": BaselineCorpus(
+        name="wikitext-103",
+        description="Wikitext-103 validation excerpt",
+        documents=(
+            "= Valkyrie Profile =\nValkyrie Profile is a role-playing video game developed by tri-Ace and published by Enix.",
+            "The story weaves Norse mythology with original characters, following the valkyrie Lenneth as she recruits the souls of fallen warriors to fight in Ragnarok.",
+        ),
+    ),
+    "the-stack-sm": BaselineCorpus(
+        name="the-stack-sm",
+        description="Python snippet inspired by The Stack sample dataset",
+        documents=(
+            "def fibonacci(n: int) -> list[int]:\n    sequence = [0, 1]\n    while len(sequence) < n:\n        sequence.append(sequence[-1] + sequence[-2])\n    return sequence[:n]\n",
+            "class Example:\n    def __init__(self, payload: str) -> None:\n        self.payload = payload\n\n    def render(self) -> str:\n        return f\"Example({self.payload})\"\n",
+        ),
+    ),
+}
+
+
+_BASELINE_ALIASES: dict[str, str] = {
+    "wikitext": "wikitext-103",
+    "wikitext103": "wikitext-103",
+    "the-stack": "the-stack-sm",
+    "stack": "the-stack-sm",
+    "the-stack-python": "the-stack-sm",
+}
+
+
+def available_baseline_corpora() -> list[str]:
+    """Return the sorted list of builtin baseline corpus identifiers."""
+
+    return sorted(_BASELINE_CORPORA.keys())
+
+
+def resolve_baseline_corpora(names: Sequence[str]) -> list[BaselineCorpus]:
+    """Resolve canonical :class:`BaselineCorpus` entries for *names*."""
+
+    resolved: list[BaselineCorpus] = []
+    seen: set[str] = set()
+    for raw_name in names:
+        if not raw_name:
+            continue
+        key = raw_name.lower()
+        canonical = _BASELINE_ALIASES.get(key, key)
+        corpus = _BASELINE_CORPORA.get(canonical)
+        if corpus is None:
+            raise KeyError(canonical)
+        if corpus.name in seen:
+            continue
+        seen.add(corpus.name)
+        resolved.append(corpus)
+    return resolved
+
+
+def _load_sentencepiece_processor(model_path: Path | str | None) -> Any:
+    if model_path is None:
+        return None
+    if _sentencepiece is None:
+        raise RuntimeError(
+            "sentencepiece must be installed to benchmark SentencePiece tokenizers"
+        )
+    processor = _sentencepiece.SentencePieceProcessor()
+    if not processor.Load(str(model_path)):
+        raise RuntimeError(f"Failed to load SentencePiece model from {model_path}")
+    return processor
+
+
+def _load_huggingface_tokenizer(tokenizer_path: Path | str | None) -> Any:
+    if tokenizer_path is None:
+        return None
+    if _HFTokenizer is None:
+        raise RuntimeError(
+            "The `tokenizers` package is required to benchmark Hugging Face tokenizers"
+        )
+    return _HFTokenizer.from_file(str(tokenizer_path))
+
+
+def _benchmark_sentencepiece(
+    processor: Any,
+    documents: Sequence[str],
+    *,
+    total_bytes: int,
+    model_path: str | None,
+) -> dict[str, object]:
+    total_tokens = 0
+    total_loss = 0.0
+    wall_start = time.perf_counter()
+    for text in documents:
+        pieces = processor.encode(text, out_type=int)
+        total_tokens += len(pieces)
+        if pieces:
+            total_loss -= sum(float(processor.get_score(piece)) for piece in pieces)
+    wall = time.perf_counter() - wall_start
+    tokens_per_s: float | None = None
+    if wall > 0 and total_tokens > 0:
+        tokens_per_s = total_tokens / wall
+    bytes_per_token: float | None = None
+    if total_tokens > 0 and total_bytes > 0:
+        bytes_per_token = total_bytes / total_tokens
+    loss_per_token: float | None = None
+    if total_tokens > 0:
+        loss_per_token = total_loss / total_tokens
+    return {
+        "model_path": model_path,
+        "wall_time_s": wall,
+        "tokens": total_tokens,
+        "tokens_per_s": tokens_per_s,
+        "bytes_per_token": bytes_per_token,
+        "loss_per_token": loss_per_token,
+    }
+
+
+def _benchmark_huggingface(
+    tokenizer: Any,
+    documents: Sequence[str],
+    *,
+    total_bytes: int,
+    tokenizer_path: str | None,
+) -> dict[str, object]:
+    total_tokens = 0
+    wall_start = time.perf_counter()
+    for text in documents:
+        encoding = tokenizer.encode(text)
+        total_tokens += len(getattr(encoding, "ids", []) or [])
+    wall = time.perf_counter() - wall_start
+    tokens_per_s: float | None = None
+    if wall > 0 and total_tokens > 0:
+        tokens_per_s = total_tokens / wall
+    bytes_per_token: float | None = None
+    if total_tokens > 0 and total_bytes > 0:
+        bytes_per_token = total_bytes / total_tokens
+    return {
+        "tokenizer_path": tokenizer_path,
+        "wall_time_s": wall,
+        "tokens": total_tokens,
+        "tokens_per_s": tokens_per_s,
+        "bytes_per_token": bytes_per_token,
+        "loss_per_token": None,
+    }
+
+
+def run_reference_tokenizers(
+    corpora: Sequence[BaselineCorpus],
+    *,
+    sentencepiece_model: Path | str | None = None,
+    huggingface_tokenizer: Path | str | None = None,
+) -> list[dict[str, object]]:
+    """Benchmark SentencePiece and Hugging Face tokenizers on *corpora*."""
+
+    processor = _load_sentencepiece_processor(sentencepiece_model)
+    hf_tokenizer = _load_huggingface_tokenizer(huggingface_tokenizer)
+    sp_model_str = str(sentencepiece_model) if sentencepiece_model else None
+    hf_tokenizer_str = str(huggingface_tokenizer) if huggingface_tokenizer else None
+    results: list[dict[str, object]] = []
+    for corpus in corpora:
+        documents = [doc for doc in corpus.documents if doc]
+        total_bytes = sum(len(doc.encode("utf-8")) for doc in documents)
+        tokenizer_stats: dict[str, dict[str, object]] = {}
+        if processor is not None:
+            tokenizer_stats["sentencepiece"] = _benchmark_sentencepiece(
+                processor,
+                documents,
+                total_bytes=total_bytes,
+                model_path=sp_model_str,
+            )
+        if hf_tokenizer is not None:
+            tokenizer_stats["huggingface"] = _benchmark_huggingface(
+                hf_tokenizer,
+                documents,
+                total_bytes=total_bytes,
+                tokenizer_path=hf_tokenizer_str,
+            )
+        results.append(
+            {
+                "name": corpus.name,
+                "description": corpus.description,
+                "documents": len(documents),
+                "total_bytes": total_bytes,
+                "tokenizers": tokenizer_stats,
+            }
+        )
+    return results
 
 
 def generate_streaming_compression_runs(
@@ -926,6 +1132,7 @@ def emit_benchmark_summary(
     bpe_result: dict[str, object],
     unigram_result: dict[str, object],
     bpe_suite: dict[str, object] | None = None,
+    baseline_tokenizers: Sequence[Mapping[str, object]] | None = None,
 ) -> str:
     """Format a human-readable summary of benchmark runs.
 
@@ -937,6 +1144,9 @@ def emit_benchmark_summary(
         Benchmark results dictionary produced by :func:`run_bpe_benchmark`.
     unigram_result:
         Benchmark results dictionary produced by :func:`run_unigram_benchmark`.
+
+    baseline_tokenizers:
+        Optional iterable describing reference tokenizer throughput metrics.
 
     Returns
     -------
@@ -1019,6 +1229,38 @@ def emit_benchmark_summary(
                     ["Run", "Wall (s)", "Tokens/s", "Scaling"],
                 )
             )
+    if baseline_tokenizers:
+        baseline_rows: list[list[str]] = []
+        for record in baseline_tokenizers:
+            if not isinstance(record, Mapping):
+                continue
+            corpus_name = str(record.get("name", ""))
+            tokenizers_meta = record.get("tokenizers")
+            if not isinstance(tokenizers_meta, Mapping):
+                continue
+            for tokenizer_name, stats in tokenizers_meta.items():
+                if not isinstance(stats, Mapping):
+                    continue
+                tokens_per_s = stats.get("tokens_per_s")
+                bytes_per_token = stats.get("bytes_per_token")
+                loss_per_token = stats.get("loss_per_token")
+                baseline_rows.append(
+                    [
+                        corpus_name,
+                        str(tokenizer_name),
+                        f"{float(tokens_per_s):.2f}" if tokens_per_s else "n/a",
+                        f"{float(bytes_per_token):.3f}" if bytes_per_token else "n/a",
+                        f"{float(loss_per_token):.4f}" if loss_per_token else "n/a",
+                    ]
+                )
+        if baseline_rows:
+            summary_lines.append("")
+            summary_lines.append(
+                format_summary_table(
+                    baseline_rows,
+                    ["Corpus", "Tokenizer", "Tokens/s", "Bytes/token", "Loss/token"],
+                )
+            )
     return "\n".join(summary_lines)
 
 
@@ -1031,6 +1273,7 @@ def serialize_run(
     unigram: dict[str, object],
     bpe_runs: dict[str, object] | None = None,
     evaluation: Mapping[str, object] | None = None,
+    baseline_tokenizers: Sequence[Mapping[str, object]] | None = None,
 ) -> Path:
     """Persist benchmark inputs and outputs to JSON for later analysis.
 
@@ -1050,6 +1293,9 @@ def serialize_run(
     evaluation:
         Optional evaluation report payload that will be embedded under the
         ``"evaluation"`` key of the serialized JSON when provided.
+    baseline_tokenizers:
+        Optional iterable of reference tokenizer metrics captured for baseline
+        corpora.
 
     Returns
     -------
@@ -1087,6 +1333,8 @@ def serialize_run(
         payload["bpe_runs"] = bpe_runs.get("runs") if isinstance(bpe_runs, dict) else bpe_runs
     if evaluation is not None:
         payload["evaluation"] = evaluation
+    if baseline_tokenizers:
+        payload["baseline_tokenizers"] = list(baseline_tokenizers)
     validate_benchmark_output(payload)
     path = output_dir / f"benchmark_{timestamp}.json"
     path.write_text(json.dumps(payload, indent=2, default=_json_default), encoding="utf-8")

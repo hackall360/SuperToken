@@ -28,6 +28,28 @@ The resulting `benchmark_*.json` document will include the evaluation payload
 under an `"evaluation"` key, allowing downstream automation to surface
 compression, OOV, and morphology statistics alongside throughput metrics.
 
+## Benchmarking reference tokenizers
+
+Pass one or more `--baseline-corpus` values to benchmark pre-trained
+SentencePiece and Hugging Face tokenizers against built-in corpora:
+
+```bash
+python main.py benchmark \
+  --baseline-corpus wikitext-103 \
+  --baseline-corpus the-stack-sm \
+  --sentencepiece-model path/to/model.model \
+  --huggingface-tokenizer tests/data/models/bpe/tokenizer.json \
+  --synthetic-docs 0 \
+  --output-dir artifacts/benchmarks
+```
+
+The CLI recognises small excerpts from Wikitext-103 and The Stack (Python) out
+of the box. The resulting benchmark JSON embeds a `"baseline_tokenizers"`
+section with per-tokenizer throughput (`tokens_per_s`), compression efficiency
+(`bytes_per_token`), and average loss metrics. The summary table printed to
+stdout mirrors these figures so regression dashboards can surface deltas
+alongside the GPU trainer throughput statistics.
+
 ## Skipping evaluation for local runs
 
 The evaluation CLI honours the `SUPERTOKEN_SKIP_EVALUATION` environment variable.
