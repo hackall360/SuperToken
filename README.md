@@ -288,6 +288,9 @@ Additional guides and API notes can be added under the `docs/` directory as the 
 2. Install development dependencies (see `pyproject.toml` if present).
 3. Format your changes and ensure tests pass via `pytest`.
 4. Open a pull request describing your changes and include benchmark results when appropriate.
+5. The "Tests" GitHub Actions workflow runs syntax linting, evaluation-schema
+   validation, and the full pytest suite on every push and pull request so
+   contributors get immediate feedback.
 
 ## License
 This project is licensed under the [Mozilla Public License 2.0](LICENSE).

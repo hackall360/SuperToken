@@ -1,0 +1,57 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements/ci.txt
+
+      - name: Run lint checks
+        run: |
+          python -m compileall gpu_tokenizer benchmarks tests main.py
+          python -m pip check
+
+      - name: Validate evaluation schema snapshot
+        run: |
+          python - <<'PY'
+import json
+from pathlib import Path
+from gpu_tokenizer.evaluate_report import load_evaluate_report_schema, validate_evaluate_report
+
+schema = load_evaluate_report_schema()
+payload = json.loads(Path("tests/data/expected/evaluate_report.json").read_text(encoding="utf-8"))
+validate_evaluate_report(payload, schema)
+print("Schema validation succeeded for expected payload")
+PY
+
+      - name: Run tests
+        env:
+          PYTORCH_JIT: "0"
+        run: |
+          python - <<'PY'
+import torch
+torch._SUPERTOKEN_TORCH_STUB = True
+import pytest
+raise SystemExit(pytest.main())
+PY
