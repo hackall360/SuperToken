@@ -1,0 +1,9 @@
+pytest
+numpy
+sentencepiece
+tokenizers
+tiktoken
+zstandard
+lz4
+matplotlib
+torch==2.5.1
