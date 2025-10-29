@@ -111,6 +111,8 @@ __all__ = [
 
 # Ensure built-in plugins are registered on import.
 try:  # pragma: no cover - import side effect
+    from . import japanese as _japanese  # noqa: F401
+    from . import korean as _korean  # noqa: F401
     from . import turkish as _turkish  # noqa: F401
 except Exception:  # pragma: no cover - defensive fallback
     pass

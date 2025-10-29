@@ -219,7 +219,14 @@ Run `python main.py --help` for a full list of options.
 SuperToken ships with a small, safe-by-default morphology layer that leaves byte streams untouched unless explicitly enabled.
 Plugins pre-segment text before it reaches the `BytePacker`, which can improve compression ratios for agglutinative languages
 at the cost of changing downstream token statistics. To enable a plugin, pass `--morphology-lang` with one of the advertised
-language codes (for example, `tr` for the bundled Turkish segmenter):
+language codes:
+
+- `tr` – Turkish suffix annotator that optionally tags case markers and productive affixes.
+- `ja` – Japanese script-aware segmenter that preserves contiguous Kanji, Hiragana, Katakana, and ASCII spans.
+- `ko` – Korean script-aware segmenter that groups Hangul runs while leaving Latin digits and punctuation intact.
+
+All bundled plugins are covered by unit tests that assert `presegment`/`recompose` round trips, so the original byte streams are
+reconstructed exactly even when annotations are emitted.
 
 ```bash
 python main.py train-bpe \

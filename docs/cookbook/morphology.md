@@ -13,8 +13,8 @@ from gpu_tokenizer import morphology
 print(morphology.available_plugins())
 ```
 
-The output includes `"tr"` for the Turkish segmenter. Additional plugins can be added at import time via
-`morphology.register_plugin(name, cls)`.
+The output includes `"tr"`, `"ja"`, and `"ko"` for the bundled Turkish, Japanese, and Korean segmenters. Additional plugins can
+be added at import time via `morphology.register_plugin(name, cls)`.
 
 ## 2. Prepare a sample corpus
 
@@ -29,7 +29,8 @@ echo "Kitaplarını öğrencilerine hızla dağıttı." >> turkish.txt
 ## 3. Run a morphology-enabled training dry run
 
 Use `--morphology-lang tr` to activate the plugin. Additional flags toggle opt-in annotations that the Turkish implementation
-understands:
+understands. The Japanese (`ja`) and Korean (`ko`) plugins expose the same CLI surface but focus on script-aware segmentation
+with no extra flags:
 
 ```bash
 python main.py train-bpe \
@@ -50,7 +51,8 @@ perform full training once you are comfortable with the configuration.
 ## 4. Verify reconstruction fidelity
 
 Before integrating morphology into large-scale training, validate that segmentation and recomposition round-trip without loss.
-The following snippet uses the same plugin instance as the CLI and checks that the original bytes match the recomposed output:
+All bundled plugins ship with unit tests that assert this property. The following snippet uses the same plugin instance as the
+CLI and checks that the original bytes match the recomposed output:
 
 ```python
 from gpu_tokenizer.morphology import create_plugin
