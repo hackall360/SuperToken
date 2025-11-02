@@ -1671,6 +1671,36 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
         raise SystemExit("train-unigram requires at least one --data glob pattern")
     data_files = _expand_data_patterns(data_patterns)
     trainer, trainer_config = _build_unigram_trainer(args)
+
+    # Handle warm-start from existing SentencePiece model
+    warm_start_summary: dict[str, object] | None = None
+    warm_start_source = getattr(args, "warm_start", None)
+    if warm_start_source:
+        warm_path = Path(warm_start_source)
+        if not warm_path.exists():
+            raise SystemExit(f"Warm-start model not found at {warm_path}")
+        try:
+            sp_bundle = _resolve_sentencepiece_import(warm_path)
+        except (ValueError, RuntimeError) as exc:
+            raise SystemExit(
+                f"Failed to import SentencePiece model from {warm_start_source}: {exc}"
+            ) from exc
+        if sp_bundle is None:
+            raise SystemExit(
+                "--warm-start must reference a SentencePiece .model or .vocab/.prob file"
+            )
+        trainer.import_sentencepiece(pieces=sp_bundle.pieces, scores=sp_bundle.scores)
+        warm_start_summary = {
+            "source": warm_start_source,
+            "pieces": len(sp_bundle.pieces),
+        }
+        if sp_bundle.metadata:
+            warm_start_summary["metadata"] = sp_bundle.metadata
+        source_label = sp_bundle.sources[0] if sp_bundle.sources else warm_start_source
+        print(
+            f"[warm-start] Imported {len(sp_bundle.pieces)} unigram pieces from {source_label}"
+        )
+
     code_langs = _normalize_code_languages(getattr(args, "code_langs", None))
     code_mode_active = bool(getattr(args, "code_mode", False))
     code_mode_config: dict[str, object] = {
