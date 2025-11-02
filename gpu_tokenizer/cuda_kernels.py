@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import warnings
 from functools import lru_cache
 
 import torch
@@ -19,8 +22,121 @@ except Exception:  # pragma: no cover - fallback to CUDA implementation only
         return False
 
 
+# Detect if CUDA compilation is available on Windows
+_CUDA_COMPILATION_AVAILABLE = True
+_CUDA_COMPILATION_ERROR: Exception | None = None
+
+if os.name == "nt":  # Windows
+    if shutil.which("cl") is None:  # MSVC compiler not found
+        _CUDA_COMPILATION_AVAILABLE = False
+        warnings.warn(
+            "MSVC compiler (cl.exe) not found on Windows. "
+            "CUDA kernel compilation is unavailable. Using PyTorch fallback implementations. "
+            "For better performance, install Visual Studio with C++ build tools.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
+def _apply_merge_pytorch_fallback(
+    tokens: torch.Tensor,
+    valid: torch.Tensor,
+    prefix_workspace: torch.Tensor,
+    pair_workspace: torch.Tensor,
+    a_id: int,
+    b_id: int,
+    new_id: int,
+) -> None:
+    """
+    Pure PyTorch implementation of apply_merge_and_compact.
+
+    Used as fallback when CUDA compilation is unavailable (e.g., Windows without MSVC).
+    This implementation provides identical functionality to the CUDA kernel but runs
+    on any PyTorch-supported device (CPU or CUDA).
+
+    Args:
+        tokens: Token IDs tensor (B, L) - modified in-place
+        valid: Validity mask (B, L) - modified in-place
+        prefix_workspace: Output for sequence lengths (B,) - written to
+        pair_workspace: Workspace for pair matching (B, L-1) - written to
+        a_id: First token ID of the pair to merge
+        b_id: Second token ID of the pair to merge
+        new_id: New token ID to replace the pair
+    """
+    B, L = tokens.shape
+    width = max(L - 1, 0)
+
+    if B == 0:
+        prefix_workspace.zero_()
+        if pair_workspace.numel() > 0:
+            pair_workspace.zero_()
+        return
+
+    # Process each sequence in the batch
+    for row in range(B):
+        row_tokens = tokens[row]
+        row_valid = valid[row]
+
+        # Find and mark matching pairs
+        if width > 0:
+            row_mask = pair_workspace[row]
+            for col in range(width):
+                left_valid = row_valid[col].item() != 0
+                right_valid = row_valid[col + 1].item() != 0
+                match = (
+                    left_valid
+                    and right_valid
+                    and row_tokens[col].item() == a_id
+                    and row_tokens[col + 1].item() == b_id
+                )
+                row_mask[col] = match
+
+            # Apply merges
+            for col in range(width):
+                if row_mask[col].item():
+                    row_tokens[col] = new_id
+                    row_valid[col + 1] = 0
+                    row_tokens[col + 1] = 0
+
+        # Compact the sequence (remove invalid positions)
+        length = 0
+        for col in range(L):
+            if row_valid[col].item() != 0:
+                row_tokens[length] = row_tokens[col]
+                row_valid[length] = 1
+                if length != col:
+                    row_tokens[col] = 0
+                    row_valid[col] = 0
+                length += 1
+            else:
+                row_tokens[col] = 0
+                row_valid[col] = 0
+
+        # Zero out remaining positions
+        for col in range(length, L):
+            row_tokens[col] = 0
+            row_valid[col] = 0
+
+        # Store the final sequence length
+        if prefix_workspace.dtype == torch.int32:
+            prefix_workspace[row] = length
+        else:  # torch.uint16
+            max_val = 65535
+            prefix_workspace[row] = min(length, max_val)
+
+
 @lru_cache(maxsize=1)
-def _load_module() -> torch._C.ScriptModule:
+def _load_module() -> torch._C.ScriptModule | None:
+    """
+    Load CUDA kernels via JIT compilation.
+
+    Returns None if compilation fails (e.g., on Windows without MSVC).
+    """
+    global _CUDA_COMPILATION_AVAILABLE, _CUDA_COMPILATION_ERROR
+
+    if not _CUDA_COMPILATION_AVAILABLE:
+        return None
+
     cuda_src = r"""
     #include <math.h>
     #include <stdint.h>
@@ -422,20 +538,32 @@ def _load_module() -> torch._C.ScriptModule:
         }
     }
     """
-    return load_inline(
-        name="gpu_trie_kernels",
-        cpp_sources="",
-        cuda_sources=cuda_src,
-        functions=[
-            "traverse_trie",
-            "forward_logz",
-            "backward_logz",
-            "accumulate_expectations",
-            "apply_merge_and_compact_u32",
-            "apply_merge_and_compact_u32_u16",
-        ],
-        extra_cuda_cflags=["-lineinfo"],
-    )
+    try:
+        return load_inline(
+            name="gpu_trie_kernels",
+            cpp_sources="",
+            cuda_sources=cuda_src,
+            functions=[
+                "traverse_trie",
+                "forward_logz",
+                "backward_logz",
+                "accumulate_expectations",
+                "apply_merge_and_compact_u32",
+                "apply_merge_and_compact_u32_u16",
+            ],
+            extra_cuda_cflags=["-lineinfo"],
+        )
+    except Exception as e:
+        _CUDA_COMPILATION_AVAILABLE = False
+        _CUDA_COMPILATION_ERROR = e
+        warnings.warn(
+            f"Failed to compile CUDA kernels: {e}. "
+            "Falling back to PyTorch implementation for apply_merge_and_compact. "
+            "Other CUDA-only operations will raise errors.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
 
 
 def traverse_trie(
@@ -451,6 +579,11 @@ def traverse_trie(
     if not sequences.is_cuda:
         raise RuntimeError("trie traversal requires CUDA tensors")
     module = _load_module()
+    if module is None:
+        raise RuntimeError(
+            "CUDA kernel compilation failed. traverse_trie requires compiled CUDA kernels. "
+            f"Error: {_CUDA_COMPILATION_ERROR}"
+        )
     threads = 128
     blocks = B
     module.traverse_trie(
@@ -479,6 +612,11 @@ def forward_logz(
     if not sequences.is_cuda:
         raise RuntimeError("forward_logz expects CUDA tensors")
     module = _load_module()
+    if module is None:
+        raise RuntimeError(
+            "CUDA kernel compilation failed. forward_logz requires compiled CUDA kernels. "
+            f"Error: {_CUDA_COMPILATION_ERROR}"
+        )
     B, L = sequences.shape
     forward = torch.empty((B, L + 1), device=sequences.device, dtype=torch.float32)
     threads = 128
@@ -513,6 +651,11 @@ def backward_logz(
     if not sequences.is_cuda:
         raise RuntimeError("backward_logz expects CUDA tensors")
     module = _load_module()
+    if module is None:
+        raise RuntimeError(
+            "CUDA kernel compilation failed. backward_logz requires compiled CUDA kernels. "
+            f"Error: {_CUDA_COMPILATION_ERROR}"
+        )
     B, L = sequences.shape
     backward = torch.empty((B, L + 1), device=sequences.device, dtype=torch.float32)
     threads = 128
@@ -551,6 +694,11 @@ def accumulate_expectations(
     if not sequences.is_cuda:
         raise RuntimeError("accumulate_expectations expects CUDA tensors")
     module = _load_module()
+    if module is None:
+        raise RuntimeError(
+            "CUDA kernel compilation failed. accumulate_expectations requires compiled CUDA kernels. "
+            f"Error: {_CUDA_COMPILATION_ERROR}"
+        )
     B, L = sequences.shape
     V = out.size(1)
     threads = 128
@@ -632,6 +780,19 @@ def apply_merge_and_compact(
         raise RuntimeError("workspaces must be contiguous")
 
     module = _load_module()
+
+    # Use PyTorch fallback if CUDA compilation is unavailable
+    if module is None:
+        _apply_merge_pytorch_fallback(
+            tokens,
+            valid,
+            prefix_workspace,
+            pair_workspace,
+            a_id,
+            b_id,
+            new_id,
+        )
+        return
 
     if B == 0:
         prefix_workspace.zero_()

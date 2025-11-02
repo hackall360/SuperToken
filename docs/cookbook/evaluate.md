@@ -22,6 +22,7 @@ python main.py evaluate \
   --data tests/data/evaluate_corpus/*.txt \
   --artifacts tests/data/models/bpe \
   --morphology-lang tr \
+  --output reports/evaluate.json \
   --deterministic \
   --output reports/evaluate.json \
   --summary-format table

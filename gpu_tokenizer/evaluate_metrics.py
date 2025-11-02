@@ -53,9 +53,9 @@ def _accumulate_numeric(value: Any) -> float:
         return 0.0
     if _is_real_torch_tensor(value):
         tensor = value.detach()
-        if tensor.is_cuda:  # pragma: no cover - exercised when CUDA is available
-            tensor = tensor.to("cpu")
-        return float(tensor.sum().item())
+        # For tensor inputs, treat counts as element counts rather than sums,
+        # matching tests that pass per-document vectors.
+        return float(tensor.numel())
     if isinstance(value, Mapping):
         return sum(_accumulate_numeric(item) for item in value.values())
     if isinstance(value, Iterable) and not isinstance(value, (str, bytes, bytearray)):

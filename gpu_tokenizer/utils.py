@@ -366,29 +366,34 @@ def compact_tokens_inplace(
         return
 
     rows = torch.arange(B, device=tokens.device, dtype=torch.int64)
-    prefix_workspace.zero_()
+    # Use a Long accumulator to avoid UInt16 index_put/index limitations on some builds
+    prefix_long = prefix_workspace.to(torch.int64)
+    prefix_long.zero_()
     if overflow_workspace is not None:
         if overflow_workspace.numel() != B:
             raise RuntimeError("overflow_workspace shape mismatch")
         overflow_workspace.zero_()
 
+    # Reset outputs once to avoid stomping destinations as we iterate
+    orig_valid = valid.to(torch.bool).clone()
+    orig_tokens = tokens.clone()
+    tokens.zero_()
+    valid.zero_()
     for col in range(L):
-        keep_col = valid[:, col].to(torch.bool)
-        src_vals = tokens[:, col]
-        tokens[:, col] = 0
-        valid[:, col] = 0
+        keep_col = orig_valid[:, col]
+        src_vals = orig_tokens[:, col]
         if keep_col.any():
             row_ids = rows[keep_col]
-            dst_long = prefix_workspace[row_ids].to(torch.long)
+            # Some PyTorch builds lack advanced indexing kernels for UInt16;
+            # gather indices on a Long view to avoid dtype limitations.
+            dst_long = prefix_long[row_ids]
             tokens[row_ids, dst_long] = src_vals[keep_col]
             valid[row_ids, dst_long] = 1
             next_counts = dst_long + 1
-            if prefix_workspace.dtype == torch.uint16:
-                max_val = 65535
-                next_counts = torch.clamp_max(next_counts, max_val)
-            prefix_workspace[row_ids] = next_counts.to(prefix_workspace.dtype)
+            # Track counts in long; clamp later when materializing lengths
+            prefix_long[row_ids] = next_counts
 
-    prefix_values = prefix_workspace.to(torch.int64)
+    prefix_values = prefix_long
     if lengths.dtype == torch.uint16:
         max_val = 65535
         clipped = torch.clamp_max(prefix_values, max_val)

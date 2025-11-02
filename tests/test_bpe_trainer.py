@@ -376,6 +376,7 @@ def test_autoscaler_cpu_fallback_feedback(monkeypatch):
     assert scaler.state.batch_size <= 512
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_gpu_batch_record_flags_overflow_for_uint16_lengths():
     width = 65535
     tokens = torch.zeros((1, width), dtype=torch.int32)

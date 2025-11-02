@@ -246,6 +246,15 @@ class AutoScaler:
         used = max(0, total - free)
         self._record_metrics(step_time_s, used, total)
         if len(self._vram_fracs) < max(3, self._window_size // 2):
+            # Even if we don't have enough samples to tune, surface the updated
+            # cpu_fallback_rate immediately to reflect recent routing behavior.
+            if fallback_rate != self.state.cpu_fallback_rate:
+                self.state = ScaleState(
+                    batch_size=self.state.batch_size,
+                    cpu_workers=self.state.cpu_workers,
+                    h2d_mb=self.state.h2d_mb,
+                    cpu_fallback_rate=fallback_rate,
+                )
             return self.state, self._window_snapshot()
         mean_vram, var_vram = self._stats(self._vram_fracs)
         mean_step, _ = self._stats(self._step_times)

@@ -1118,7 +1118,7 @@ class GPUUnigramTrainer(BaseTrainer):
             piece.type = sp_pb2.ModelProto.SentencePiece.NORMAL
 
         model_path.write_bytes(model.SerializeToString())
-        print(f"Saved SentencePiece model → {model_path}")
+        print(f"Saved SentencePiece model -> {model_path}")
         return model_path
 
 

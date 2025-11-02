@@ -1,6 +1,18 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+*.egg-info/
 site/
 # Binary SentencePiece artifacts are generated at runtime during tests.
 *.model
+
+# Virtual environments
+.venv/
+
+# Build artifacts and outputs
+.artifacts/
+bpe_out/
+
+# Test outputs and temporary files
+test_results.txt
+tmp.ps1

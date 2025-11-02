@@ -86,6 +86,17 @@ def _should_skip_evaluation(force: bool = False) -> bool:
     return _env_flag(SKIP_EVALUATION_ENV)
 
 
+def _resolve_checkpoint_pause_seconds() -> float:
+    """Delay after checkpoint writes so subsequent readers observe files."""
+
+    raw = os.getenv("SUPERTOKEN_CHECKPOINT_PAUSE_MS", "100")
+    try:
+        pause_ms = float(raw)
+    except (TypeError, ValueError):
+        pause_ms = 100.0
+    return max(0.0, pause_ms / 1000.0)
+
+
 def _format_human_evaluate_summary(summary: Mapping[str, object]) -> str:
     """Render a compact table describing key evaluation metrics."""
 
@@ -1189,6 +1200,18 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
         SystemExit: If no ``--data`` globs are supplied or none yield readable
             shard files.
     """
+
+    class _StaticDatasetTracker:
+        def __init__(self, state: Mapping[str, object]) -> None:
+            self._state: dict[str, object] = dict(state)
+
+        def stream_state_dict(self) -> dict[str, object]:
+            return dict(self._state)
+
+        def load_stream_state(self, state: Mapping[str, object]) -> None:
+            if isinstance(state, Mapping):
+                self._state = dict(state)
+
     data_patterns = getattr(args, "data", None)
     if not data_patterns:
         raise SystemExit("train-bpe requires at least one --data glob pattern")
@@ -1204,7 +1227,8 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
         code_mode_config["languages"] = sorted(code_langs)
     morphology_plugin, morphology_config = _resolve_morphology(args)
     augmentation_pipeline = _resolve_augmentation(args)
-
+    checkpoint_pause_s = _resolve_checkpoint_pause_seconds()
+    tie_seed = getattr(args, "tie_seed", None)
     config = dict(trainer_config)
     config.update(
         {
@@ -1231,7 +1255,7 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
     config["trainer"].setdefault("privacy", {}).update(
         {
             "mode": str(getattr(args, "privacy", "none") or "none").lower(),
-            "tie_seed": int(args.tie_seed) if args.tie_seed is not None else None,
+            "tie_seed": int(tie_seed) if tie_seed is not None else None,
             "salt_configured": bool(getattr(args, "privacy_salt", None)),
         }
     )
@@ -1512,6 +1536,9 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
         
         streamer = None
         dataset_tracker = None
+        restored_offset_count = 0
+        if resume_stream_state and isinstance(resume_stream_state.get("stream_offsets"), Mapping):
+            restored_offset_count = len(resume_stream_state["stream_offsets"])
         if resume_batches is None:
             restore_offsets = None
             if resume_stream_state and isinstance(
@@ -1536,6 +1563,12 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
         else:
             batches = resume_batches
             dataset_tracker = None
+            if resume_stream_state:
+                dataset_tracker = _StaticDatasetTracker(resume_stream_state)
+            if restored_offset_count > 0:
+                print(
+                    f"[checkpoint] Restored dataset cursor for {restored_offset_count} shard(s)"
+                )
 
     current_batch_size = batch_size
 
@@ -1577,9 +1610,13 @@ def _cmd_train_bpe(args: argparse.Namespace) -> None:
         if args.checkpoint_dir:
             original_save_checkpoint = trainer.save_checkpoint
 
-            def _save_checkpoint_with_log(self, path: str, *cargs, **ckwargs):
+            def _save_checkpoint_with_log(
+                self, path: str, *cargs, _pause_s: float = checkpoint_pause_s, **ckwargs
+            ):
                 state = original_save_checkpoint(path, *cargs, **ckwargs)
                 print(f"[checkpoint] Saved checkpoint → {path}")
+                if _pause_s > 0:
+                    time.sleep(_pause_s)
                 return state
 
             trainer.save_checkpoint = types.MethodType(_save_checkpoint_with_log, trainer)
@@ -1644,6 +1681,7 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
         code_mode_config["languages"] = sorted(code_langs)
     morphology_plugin, morphology_config = _resolve_morphology(args)
     augmentation_pipeline = _resolve_augmentation(args)
+    checkpoint_pause_s = _resolve_checkpoint_pause_seconds()
     config = dict(trainer_config)
     config.update(
         {
@@ -1751,9 +1789,13 @@ def _cmd_train_unigram(args: argparse.Namespace) -> None:
         checkpoint_root.mkdir(parents=True, exist_ok=True)
         original_save_checkpoint = trainer.save_checkpoint
 
-        def _save_checkpoint_with_log(self, path: str, *cargs, **ckwargs):
+        def _save_checkpoint_with_log(
+            self, path: str, *cargs, _pause_s: float = checkpoint_pause_s, **ckwargs
+        ):
             state = original_save_checkpoint(path, *cargs, **ckwargs)
             print(f"[checkpoint] Saved checkpoint → {path}")
+            if _pause_s > 0:
+                time.sleep(_pause_s)
             return state
 
         trainer.save_checkpoint = types.MethodType(_save_checkpoint_with_log, trainer)
@@ -1973,9 +2015,14 @@ def _cmd_train_hybrid(args: argparse.Namespace) -> None:
         checkpoint_path.mkdir(parents=True, exist_ok=True)
         original_save_checkpoint = trainer.save_checkpoint
 
-        def _hybrid_checkpoint_with_log(self, path: str, *cargs, **ckwargs):
+        checkpoint_pause_s: float = 0.0
+        def _hybrid_checkpoint_with_log(
+            self, path: str, *cargs, _pause_s: float = checkpoint_pause_s, **ckwargs
+        ):
             state = original_save_checkpoint(path, *cargs, **ckwargs)
             print(f"[checkpoint] Saved checkpoint → {path}")
+            if _pause_s > 0:
+                time.sleep(_pause_s)
             return state
 
         trainer.save_checkpoint = types.MethodType(_hybrid_checkpoint_with_log, trainer)

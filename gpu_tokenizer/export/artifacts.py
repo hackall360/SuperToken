@@ -91,7 +91,7 @@ def load_vocab(path: str | os.PathLike[str]) -> dict[str, int]:
     with open(path, "r", encoding="utf-8") as handle:
         payload = json.load(handle)
     if not isinstance(payload, Mapping):  # pragma: no cover - defensive
-        raise TypeError("Vocabulary JSON must contain a mapping of token→id")
+        raise TypeError("Vocabulary JSON must contain a mapping of token->id")
     vocab: dict[str, int] = {}
     for token, value in payload.items():
         try:
@@ -135,7 +135,7 @@ def load_token_stats(path: str | os.PathLike[str]) -> dict[str, TokenStats]:
     if isinstance(payload, Mapping) and "tokens" in payload:
         payload = payload["tokens"]
     if not isinstance(payload, Mapping):  # pragma: no cover - defensive
-        raise TypeError("Token statistics must be a mapping of token→metadata")
+        raise TypeError("Token statistics must be a mapping of token->metadata")
     stats: dict[str, TokenStats] = {}
     for token, value in payload.items():
         stats[str(token)] = _coerce_stats_entry(value)

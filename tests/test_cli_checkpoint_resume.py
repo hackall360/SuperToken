@@ -68,6 +68,7 @@ def test_train_bpe_resume_cli(tmp_path):
     ]
 
     env = os.environ.copy()
+    print(f"Running command: {' '.join(base_cmd)}")
     proc = subprocess.Popen(
         base_cmd,
         cwd=repo_root,
@@ -86,6 +87,8 @@ def test_train_bpe_resume_cli(tmp_path):
         proc.kill()
         proc.wait(timeout=5)
     partial_stdout, partial_stderr = proc.communicate()
+    print(f"Partial stdout:\n{partial_stdout}")
+    print(f"Partial stderr:\n{partial_stderr}")
 
     def _extract_merges(payload: Mapping[str, object]) -> list[object]:
         trainer = payload.get("trainer") if isinstance(payload, Mapping) else None
@@ -103,6 +106,7 @@ def test_train_bpe_resume_cli(tmp_path):
 
     with state_path.open("r", encoding="utf-8") as f:
         partial_state = json.load(f)
+    print(f"Partial state:\n{json.dumps(partial_state, indent=2)}")
     dataset_section = partial_state.get("dataset") if isinstance(partial_state, Mapping) else None
     assert isinstance(dataset_section, Mapping)
     stream_offsets = dataset_section.get("stream_offsets")
@@ -112,6 +116,7 @@ def test_train_bpe_resume_cli(tmp_path):
     assert len(partial_merges) < merges
 
     resume_cmd = base_cmd + ["--resume-from", str(checkpoint_dir)]
+    print(f"Running command: {' '.join(resume_cmd)}")
     completed = subprocess.run(
         resume_cmd,
         cwd=repo_root,
@@ -121,6 +126,8 @@ def test_train_bpe_resume_cli(tmp_path):
         check=True,
         env=env,
     )
+    print(f"Resume stdout:\n{completed.stdout}")
+    print(f"Resume stderr:\n{completed.stderr}")
 
     assert "Restored checkpoint" in completed.stdout
     assert "Restored dataset cursor" in completed.stdout

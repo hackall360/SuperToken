@@ -10,6 +10,21 @@ from pathlib import Path
 import pytest
 
 
+def _snapshot_torch_modules() -> dict[str, object]:
+    return {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "torch" or name.startswith("torch.")
+    }
+
+
+def _restore_torch_modules(snapshot: dict[str, object]) -> None:
+    for name in list(sys.modules):
+        if name == "torch" or name.startswith("torch."):
+            sys.modules.pop(name, None)
+    sys.modules.update(snapshot)
+
+
 def _install_package_stub() -> None:
     if "gpu_tokenizer" in sys.modules:
         return
@@ -168,15 +183,35 @@ def _install_torch_stub() -> None:
     sys.modules["torch.utils.cpp_extension"] = cpp_stub
 
 
-_install_package_stub()
-_install_metrics_stub()
-_install_torch_stub()
+_TORCH_SNAPSHOT = _snapshot_torch_modules()
+TrainerMetricsEWMA = None  # type: ignore[assignment]
+ChunkSpec = None  # type: ignore[assignment]
+make_chunker = None  # type: ignore[assignment]
 
-from gpu_tokenizer.trainers.metrics import TrainerMetricsEWMA
-from gpu_tokenizer.io import ChunkSpec, make_chunker
+
+@pytest.fixture(scope="module", autouse=True)
+def _torch_stub_env():
+    global TrainerMetricsEWMA, ChunkSpec, make_chunker
+    _install_package_stub()
+    _install_metrics_stub()
+    _install_torch_stub()
+    from gpu_tokenizer.trainers.metrics import TrainerMetricsEWMA as _Metrics
+    from gpu_tokenizer.io import ChunkSpec as _ChunkSpec, make_chunker as _make_chunker
+
+    TrainerMetricsEWMA = _Metrics
+    ChunkSpec = _ChunkSpec
+    make_chunker = _make_chunker
+    try:
+        yield
+    finally:
+        TrainerMetricsEWMA = None
+        ChunkSpec = None
+        make_chunker = None
+        _restore_torch_modules(_TORCH_SNAPSHOT)
 
 
 def test_make_chunker_validates_inputs() -> None:
+    assert make_chunker is not None
     with pytest.raises(ValueError):
         make_chunker(0.0, 128, None)
     with pytest.raises(ValueError):
@@ -184,6 +219,8 @@ def test_make_chunker_validates_inputs() -> None:
 
 
 def test_make_chunker_without_metrics() -> None:
+    assert make_chunker is not None
+    assert ChunkSpec is not None
     chunker = make_chunker(50.0, 256, None)
     spec = next(chunker)
     assert isinstance(spec, ChunkSpec)
@@ -195,6 +232,9 @@ def test_make_chunker_without_metrics() -> None:
 
 
 def test_make_chunker_with_metrics_updates() -> None:
+    assert TrainerMetricsEWMA is not None
+    assert make_chunker is not None
+    assert ChunkSpec is not None
     metrics = TrainerMetricsEWMA(alpha=1.0, enabled=True)
     metrics.record_tokens(tokens=1_000, duration_s=1.0)
 

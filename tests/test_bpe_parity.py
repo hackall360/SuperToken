@@ -14,6 +14,7 @@ import random
 import os
 import socket
 from typing import List, Sequence, Tuple
+from pathlib import Path
 
 import pytest
 
@@ -88,10 +89,12 @@ def _gpu_vocab_bytes(merges: Sequence[Tuple[int, int]]) -> List[bytes]:
     """Reconstruct GPU token byte sequences from the merge table."""
 
     vocab: List[bytes] = [bytes([token_id]) for token_id in range(BASE_VOCAB)]
+
+    final_vocab_size = BASE_VOCAB + len(merges)
+    vocab.extend([b""] * (final_vocab_size - len(vocab)))
+
     for idx, (a_id, b_id) in enumerate(merges):
         new_id = BASE_VOCAB + idx
-        if len(vocab) <= new_id:
-            vocab.append(b"")
         vocab[new_id] = vocab[a_id] + vocab[b_id]
     return vocab
 
@@ -141,7 +144,7 @@ def _first_mismatch(
     lhs: Sequence, rhs: Sequence
 ) -> Tuple[int, object, object] | Tuple[None, None, None]:
     if len(lhs) != len(rhs):
-        return len(lhs), None, None
+        raise AssertionError(f"Length mismatch: {len(lhs)} != {len(rhs)}")
     for idx, (a_val, b_val) in enumerate(zip(lhs, rhs)):
         if a_val != b_val:
             return idx, a_val, b_val
@@ -176,6 +179,12 @@ def _assert_byte_pairs_equal(
 def _assert_bytes_equal(label: str, actual: Sequence[bytes], expected: Sequence[bytes]) -> None:
     if actual == expected:
         return
+    
+    temp_debug_file = Path('.artifacts') / 'temp_debug.txt'
+    with open(temp_debug_file, 'a', encoding='utf-8') as f:
+        f.write(f"Actual vocab: {list(actual)}\n")
+        f.write(f"Expected vocab: {list(expected)}\n")
+
     idx, actual_val, expected_val = _first_mismatch(actual, expected)
     if idx is None:
         raise AssertionError(f"{label} length mismatch: {len(actual)} != {len(expected)}")
@@ -230,6 +239,7 @@ def _train_reference_tokenizer(
     merges_bytes = [
         (vocab_bytes[a_id], vocab_bytes[b_id])
         for (a_id, b_id) in merges_ids
+        if a_id is not None and b_id is not None
     ]
     encoded_ids = [tokenizer.encode(sample).ids for sample in corpus.corpus]
     encoded_bytes = [[vocab_bytes[idx] for idx in seq] for seq in encoded_ids]
@@ -248,6 +258,13 @@ def _train_gpu_trainer(
     _seed_everything(GLOBAL_SEED)
     trainer = GPUBPETrainer(base_vocab=BASE_VOCAB, merges=merge_budget, device=device)
     batches = _build_tensor_batches(byte_sequences)
+    
+    temp_debug_file = Path('.artifacts') / 'temp_debug.txt'
+    with open(temp_debug_file, 'a', encoding='utf-8') as f:
+        f.write(f"Number of batches: {len(batches)}\n")
+        for i, batch in enumerate(batches):
+            f.write(f"Batch {i} tokens: {batch[0].tolist()}\n")
+
     trainer.fit(batches, log_every=max(merge_budget, 1))
     return trainer
 
@@ -305,6 +322,11 @@ def test_gpu_trainer_matches_huggingface(corpus: AdversarialCorpus) -> None:
     gpu_merges_bytes = [(gpu_vocab_bytes[a_id], gpu_vocab_bytes[b_id]) for (a_id, b_id) in first_merges]
     encoded_gpu_ids = _encode_with_merges(byte_sequences, first_merges)
     encoded_gpu_bytes = [[gpu_vocab_bytes[idx] for idx in seq] for seq in encoded_gpu_ids]
+
+    temp_debug_file = Path('.artifacts') / 'temp_debug.txt'
+    with open(temp_debug_file, 'a', encoding='utf-8') as f:
+        f.write(f"Actual vocab: {list(gpu_vocab_bytes)}\n")
+        f.write(f"Expected vocab: {list(reference['vocab_bytes'])}\n")
 
     _assert_byte_pairs_equal("Merge bytes", gpu_merges_bytes, reference["merges_bytes"])
     _assert_bytes_equal("Vocabulary bytes", gpu_vocab_bytes, reference["vocab_bytes"])

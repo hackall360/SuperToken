@@ -511,13 +511,21 @@ def evaluate(
     else:
         code_mode_summary.setdefault("reduction", 0.0)
 
+    def _posix(p: Path | None) -> str | None:
+        if p is None:
+            return None
+        try:
+            return p.as_posix()
+        except Exception:
+            return str(p).replace("\\", "/")
+
     report = {
         "artifacts": {
-            "vocab": str(vocab_path),
+            "vocab": _posix(vocab_path),
             "vocab_size": len(vocab),
-            "merges": str(merges_path) if merges_path else None,
+            "merges": _posix(merges_path) if merges_path else None,
             "merge_rules": len(merges),
-            "tokenizer": str(tokenizer_path) if tokenizer_path else None,
+            "tokenizer": _posix(tokenizer_path) if tokenizer_path else None,
             "model_type": resolved_model,
         },
         "corpus": {

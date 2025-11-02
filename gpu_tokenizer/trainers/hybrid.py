@@ -69,7 +69,7 @@ def _build_piece_tables(
 
 
 def _bytes_to_unicode() -> dict[int, str]:
-    """Mirror the byte→unicode mapping used by Hugging Face BPE tokenizers."""
+    """Mirror the byte->unicode mapping used by Hugging Face BPE tokenizers."""
 
     return export_artifacts.byte_level_encoder()
 
@@ -867,7 +867,7 @@ class HybridTrainer(BaseTrainer):
             combined["unigram_model"] = os.fspath(sp_path)
 
         printed_paths = ", ".join(sorted(combined.values()))
-        print(f"Saved hybrid artifacts → {printed_paths}")
+        print(f"Saved hybrid artifacts -> {printed_paths}")
         return combined
 
     # ------------------------------------------------------------------

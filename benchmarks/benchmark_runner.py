@@ -1191,7 +1191,7 @@ def emit_benchmark_summary(
     )
     headers = ["Trainer", "Wall time (s)", "Tokens/s", "Final vocab"]
     summary_lines = [
-        f"Corpus → {corpus.sequences} sequences, {corpus.tokens} tokens (max len {corpus.max_length})",
+        f"Corpus -> {corpus.sequences} sequences, {corpus.tokens} tokens (max len {corpus.max_length})",
         format_summary_table(rows, headers),
     ]
     if bpe_suite and isinstance(bpe_suite.get("runs"), list):

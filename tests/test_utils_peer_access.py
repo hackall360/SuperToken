@@ -2,12 +2,28 @@
 
 from __future__ import annotations
 
+import importlib
 import importlib.machinery
 import sys
 import types
 from pathlib import Path
 
 import pytest
+
+
+def _snapshot_torch_modules() -> dict[str, object]:
+    return {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "torch" or name.startswith("torch.")
+    }
+
+
+def _restore_torch_modules(snapshot: dict[str, object]) -> None:
+    for name in list(sys.modules):
+        if name == "torch" or name.startswith("torch."):
+            sys.modules.pop(name, None)
+    sys.modules.update(snapshot)
 
 
 def _install_package_stub() -> None:
@@ -224,16 +240,29 @@ def _install_torch_stub() -> None:
     sys.modules["torch.utils.cpp_extension"] = cpp_stub
 
 
-_install_package_stub()
-_install_metrics_stub()
-_install_torch_stub()
-sys.modules.pop("gpu_tokenizer.utils", None)
+_TORCH_SNAPSHOT = _snapshot_torch_modules()
+utils: types.ModuleType | None = None
 
-import gpu_tokenizer.utils as utils
+
+@pytest.fixture(scope="module", autouse=True)
+def _torch_stub_env():
+    global utils
+    _install_package_stub()
+    _install_metrics_stub()
+    _install_torch_stub()
+    sys.modules.pop("gpu_tokenizer.utils", None)
+    utils = importlib.import_module("gpu_tokenizer.utils")
+    try:
+        yield
+    finally:
+        utils = None
+        sys.modules.pop("gpu_tokenizer.utils", None)
+        _restore_torch_modules(_TORCH_SNAPSHOT)
 
 
 @pytest.fixture(autouse=True)
 def _clear_peer_cache() -> None:
+    assert utils is not None
     utils._clear_cached_peer_access()
 
 

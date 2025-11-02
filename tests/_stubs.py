@@ -23,10 +23,43 @@ def install_package_stub() -> None:
 
 
 def install_torch_stub() -> None:
-    """Provide a very small ``torch`` stub for CPU-only environments."""
+    """Provide a very small ``torch`` stub for CPU-only environments.
+
+    If a real PyTorch installation is available on the system, prefer it over
+    the stub to avoid poisoning the test environment for GPU-enabled tests.
+    """
 
     if "torch" in sys.modules:
+        try:
+            Path('.artifacts').mkdir(exist_ok=True)
+            (Path('.artifacts')/ 'stub_log.txt').write_text('torch present in sys.modules\n', encoding='utf-8')
+        except Exception:
+            pass
         return
+    # Prefer importing the real library if it is present and importable.
+    try:  # pragma: no cover - exercised across environments
+        import torch as _real_torch  # type: ignore
+        # If the import succeeded, do not install the stub
+        if hasattr(_real_torch, "__version__"):
+            try:
+                Path('.artifacts').mkdir(exist_ok=True)
+                (Path('.artifacts')/ 'stub_log.txt').write_text('import torch ok\n', encoding='utf-8')
+            except Exception:
+                pass
+            return
+    except Exception:
+        # If import fails, try a lightweight spec probe; otherwise fall back to stub
+        try:
+            import importlib.util as _ilus
+            if _ilus.find_spec("torch") is not None:  # type: ignore[attr-defined]
+                try:
+                    Path('.artifacts').mkdir(exist_ok=True)
+                    (Path('.artifacts')/ 'stub_log.txt').write_text('find_spec torch ok\n', encoding='utf-8')
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
 
     torch_stub = types.ModuleType("torch")
 
@@ -140,6 +173,11 @@ def install_torch_stub() -> None:
     sys.modules["torch.utils"] = utils_stub
     sys.modules["torch.utils.cpp_extension"] = cpp_stub
     sys.modules.setdefault("torch.multiprocessing", types.ModuleType("torch.multiprocessing"))
+    try:
+        Path('.artifacts').mkdir(exist_ok=True)
+        (Path('.artifacts')/ 'stub_log.txt').write_text('installed stub torch\n', encoding='utf-8')
+    except Exception:
+        pass
 
 
 __all__ = ["install_package_stub", "install_torch_stub"]

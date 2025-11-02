@@ -6,6 +6,21 @@ from pathlib import Path
 import pytest
 
 
+def _snapshot_torch_modules() -> dict[str, object]:
+    return {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "torch" or name.startswith("torch.")
+    }
+
+
+def _restore_torch_modules(snapshot: dict[str, object]) -> None:
+    for name in list(sys.modules):
+        if name == "torch" or name.startswith("torch."):
+            sys.modules.pop(name, None)
+    sys.modules.update(snapshot)
+
+
 def _install_package_stub() -> None:
     package_name = "gpu_tokenizer"
     if package_name in sys.modules:
@@ -126,8 +141,17 @@ def _reload_dist_runtime():
     return importlib.import_module("gpu_tokenizer.dist_runtime")
 
 
-_install_package_stub()
-_install_torch_stub()
+_TORCH_SNAPSHOT = _snapshot_torch_modules()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _torch_stub_env():
+    _install_package_stub()
+    _install_torch_stub()
+    try:
+        yield
+    finally:
+        _restore_torch_modules(_TORCH_SNAPSHOT)
 
 
 def test_enable_peer_access_invokes_peer_enable(monkeypatch: pytest.MonkeyPatch) -> None:
